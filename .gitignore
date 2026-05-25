@@ -1,6 +1,7 @@
 # Claude
 CLAUDE.md
 .claude/
+.agents/
 
 # Node / Electron
 node_modules/
