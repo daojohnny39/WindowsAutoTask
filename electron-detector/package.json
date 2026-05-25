@@ -1,0 +1,17 @@
+{
+  "name": "electron-detector",
+  "version": "1.0.0",
+  "description": "Detect and list all running Electron apps",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "package": "electron-packager . electron-detector --platform=win32 --arch=x64 --out=dist --overwrite --icon=icon.ico --asar"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-packager": "^17.1.2"
+  },
+  "dependencies": {
+    "katex": "^0.17.0"
+  }
+}
