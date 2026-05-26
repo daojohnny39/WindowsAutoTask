@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('agent', {
 contextBridge.exposeInMainWorld('chat', {
   send: (payload) => ipcRenderer.invoke('chat:send', payload),
   reset: (exe) => ipcRenderer.invoke('chat:reset', exe),
+  stop: (exe) => ipcRenderer.invoke('chat:stop', exe),
   onChunk: (callback) => {
     ipcRenderer.on('chat:chunk', (_e, data) => callback(data));
   },
@@ -50,5 +51,39 @@ contextBridge.exposeInMainWorld('chat', {
     ipcRenderer.removeAllListeners('chat:tool');
     ipcRenderer.removeAllListeners('chat:tool-result');
     ipcRenderer.removeAllListeners('chat:thinking');
+  },
+});
+
+contextBridge.exposeInMainWorld('automation', {
+  create: (payload) => ipcRenderer.invoke('automation:create', payload),
+  cancelCreate: (jobId) => ipcRenderer.invoke('automation:cancel-create', jobId),
+  list: (exe) => ipcRenderer.invoke('automation:list', exe),
+  save: (payload) => ipcRenderer.invoke('automation:save', payload),
+  update: (payload) => ipcRenderer.invoke('automation:update', payload),
+  editStep: (payload) => ipcRenderer.invoke('automation:edit-step', payload),
+  addStep: (payload) => ipcRenderer.invoke('automation:add-step', payload),
+  rename: (payload) => ipcRenderer.invoke('automation:rename', payload),
+  remove: (payload) => ipcRenderer.invoke('automation:delete', payload),
+  run: (payload) => ipcRenderer.invoke('automation:run', payload),
+  stop: (runId) => ipcRenderer.send('automation:stop', { runId }),
+  onCodexProgress: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('automation:codex-progress', handler);
+    return () => ipcRenderer.removeListener('automation:codex-progress', handler);
+  },
+  onRunStart: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('automation:run-start', handler);
+    return () => ipcRenderer.removeListener('automation:run-start', handler);
+  },
+  onRunStep: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('automation:run-step', handler);
+    return () => ipcRenderer.removeListener('automation:run-step', handler);
+  },
+  onRunDone: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('automation:run-done', handler);
+    return () => ipcRenderer.removeListener('automation:run-done', handler);
   },
 });
