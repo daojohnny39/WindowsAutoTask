@@ -13,7 +13,7 @@
     after reboot.
 
     Caveats:
-      * The app is killed and relaunched — unsaved state is lost.
+      * The app is killed and relaunched - unsaved state is lost.
       * Some production builds (Slack, Teams, signed Microsoft Electron apps)
         strip or block --remote-debugging-port and will silently ignore it.
       * Each app gets its own port; CDP traffic is per-app, not shared.
@@ -38,7 +38,7 @@
 
 .PARAMETER Kill
     When restarting, force-kill all processes sharing the exe path (including
-    orphaned renderer children). On by default — pass -Kill:$false to skip.
+    orphaned renderer children). On by default - pass -Kill:$false to skip.
 
 .PARAMETER Enable
     Persistent CDP toggle ON. Restarts all running Electron apps with CDP,
@@ -51,7 +51,17 @@
 
 .PARAMETER Restore
     Internal. Called by the logon scheduled task. Waits for tracked apps
-    to appear, then restarts them with CDP.
+    to appear, then restarts them with CDP. Legacy one-shot poll; -Watch
+    is the current mechanism.
+
+.PARAMETER Watch
+    Internal. Resident, event-driven watcher started by the logon task.
+    Subscribes to process-creation events and, whenever a tracked app's
+    main process starts WITHOUT --remote-debugging-port, relaunches it with
+    the flag. Catches every launch (boot, Start menu, manual) with no time
+    window. Matches tracked apps by exe basename so it survives self-update
+    path changes; relaunches using the live exe path. Single-instance via a
+    named mutex. Runs in the user session so the relaunched window is visible.
 
 .PARAMETER Status
     Show whether persistent CDP is enabled and which apps are tracked.
@@ -78,6 +88,7 @@ param(
     [switch]$Enable,
     [switch]$Disable,
     [switch]$Restore,
+    [switch]$Watch,
     [switch]$Status
 )
 
@@ -267,7 +278,7 @@ if ($Enable) {
         Write-Host "[$($app.Name)]"
 
         if ($app.DebugEnabled) {
-            Write-Host "  Already has CDP on port $($app.DebugPort) — keeping as-is"
+            Write-Host "  Already has CDP on port $($app.DebugPort) - keeping as-is"
             $results += [PSCustomObject]@{
                 Name = $app.Name
                 Exe  = $app.Exe
@@ -384,6 +395,134 @@ if ($Restore) {
     Save-CdpState -Enabled $true -Apps $results
     Write-Host ""
     Write-Host "CDP restored for $($results.Count) app(s) after logon."
+    return
+}
+
+# ---------- Watch (resident, event-driven) ----------
+if ($Watch) {
+    # Single-instance guard so re-running the logon task / on-demand starts
+    # don't stack multiple watchers.
+    $createdNew = $false
+    $mutex = New-Object System.Threading.Mutex($true, 'Global\ElectronCdpWatcher', [ref]$createdNew)
+    if (-not $createdNew) {
+        Write-Host "Watcher already running. Exiting."
+        return
+    }
+
+    # Tracked-app basenames (lowercase) from current state. Re-read each event
+    # so newly selected/deselected apps are picked up without a restart.
+    function Get-TrackedBasenames {
+        $st = Get-CdpState
+        if (-not $st -or -not $st.enabled) { return @{} }
+        $map = @{}
+        foreach ($a in $st.apps) {
+            $bn = [IO.Path]::GetFileName($a.exe)
+            if ($bn) { $map[$bn.ToLower()] = $true }
+        }
+        return $map
+    }
+
+    # Kill the exe's whole process group and relaunch it with CDP on a free
+    # port, then record the live path + port in state. Uses the live path so
+    # self-update folder changes are absorbed automatically.
+    $script:lastReflag = @{}
+    function Invoke-Reflag {
+        param([string]$ExePath)
+        if (-not $ExePath) { return }
+        $key = $ExePath.ToLower()
+        # Anti-thrash: skip if we just relaunched this exe.
+        if ($script:lastReflag.ContainsKey($key)) {
+            if (((Get-Date) - $script:lastReflag[$key]).TotalSeconds -lt 10) { return }
+        }
+        $script:lastReflag[$key] = Get-Date
+
+        $name = [IO.Path]::GetFileNameWithoutExtension($ExePath)
+        Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -eq $ExePath } catch { $false }
+        } | Stop-Process -Force -ErrorAction SilentlyContinue
+        $deadline = (Get-Date).AddSeconds(5)
+        while ((Get-Date) -lt $deadline) {
+            $still = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+                try { $_.Path -eq $ExePath } catch { $false }
+            }
+            if (-not $still) { break }
+            Start-Sleep -Milliseconds 200
+        }
+
+        $port = Get-NextFreePort -Start $StartPort
+        Write-Host "Re-flagging $name -> --remote-debugging-port=$port"
+        Start-Process -FilePath $ExePath -ArgumentList "--remote-debugging-port=$port"
+
+        # Persist live path + port (replace any prior entry with same basename).
+        $st = Get-CdpState
+        if ($st) {
+            $bn = [IO.Path]::GetFileName($ExePath)
+            $kept = @($st.apps | Where-Object { [IO.Path]::GetFileName($_.exe) -ne $bn })
+            $newApps = @()
+            foreach ($k in $kept) { $newApps += @{ name = $k.name; exe = $k.exe; port = $k.port } }
+            $newApps += @{ name = $name; exe = $ExePath; port = $port }
+            $out = @{
+                enabled   = $true
+                startPort = $StartPort
+                apps      = $newApps
+                updatedAt = (Get-Date -Format 'o')
+            }
+            $out | ConvertTo-Json -Depth 3 | Set-Content $StatePath -Encoding utf8
+        }
+    }
+
+    # Decide whether a Win32_Process snapshot is a tracked MAIN process that
+    # is missing the CDP flag (so a child renderer or an already-flagged main
+    # is ignored - that is the loop guard).
+    function Test-NeedsReflag {
+        param($Proc, $Tracked)
+        if (-not $Proc) { return $false }
+        $exe = $Proc.ExecutablePath
+        if (-not $exe) { return $false }
+        $bn = [IO.Path]::GetFileName($exe).ToLower()
+        if (-not $Tracked.ContainsKey($bn)) { return $false }
+        $cmd = $Proc.CommandLine
+        if ($cmd -and $cmd -match '--type=') { return $false }              # child process
+        if ($cmd -and $cmd -match '--remote-debugging-port') { return $false } # already flagged
+        return $true
+    }
+
+    Write-Host "ElectronCDP watcher starting..."
+
+    # Initial sweep: any tracked main already running without the flag gets
+    # relaunched now (covers apps that auto-started before the watcher did).
+    foreach ($app in (Find-RunningElectronApps)) {
+        $tracked = Get-TrackedBasenames
+        $bn = [IO.Path]::GetFileName($app.Exe).ToLower()
+        if ($tracked.ContainsKey($bn) -and -not $app.DebugEnabled) {
+            Invoke-Reflag -ExePath $app.Exe
+        }
+    }
+
+    $query = "SELECT * FROM __InstanceCreationEvent WITHIN 3 WHERE TargetInstance ISA 'Win32_Process'"
+    Register-CimIndicationEvent -Query $query -SourceIdentifier 'ElectronCdpProcWatch' | Out-Null
+    Write-Host "Watching for tracked Electron app launches."
+
+    try {
+        while ($true) {
+            $evt = Wait-Event -SourceIdentifier 'ElectronCdpProcWatch'
+            try {
+                $proc = $evt.SourceEventArgs.NewEvent.TargetInstance
+                $tracked = Get-TrackedBasenames
+                if ($tracked.Count -eq 0) { continue }
+                if (Test-NeedsReflag -Proc $proc -Tracked $tracked) {
+                    Invoke-Reflag -ExePath $proc.ExecutablePath
+                }
+            } catch {
+                Write-Host "Watch handler error: $($_.Exception.Message)"
+            } finally {
+                Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
+            }
+        }
+    } finally {
+        Unregister-Event -SourceIdentifier 'ElectronCdpProcWatch' -ErrorAction SilentlyContinue
+        $mutex.ReleaseMutex()
+    }
     return
 }
 

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:">
   <title>Windows Autobot</title>
   <link rel="stylesheet" href="styles.css">
   <link rel="stylesheet" href="./node_modules/katex/dist/katex.min.css">
@@ -240,6 +240,22 @@
       <div class="auto-modal-foot">
         <button class="ghost-btn" id="auto-run-stop">Stop</button>
         <button class="ghost-btn primary" id="auto-run-done" style="display:none">Close</button>
+      </div>
+
+      <!-- Completion overlay (popped in when the run finishes) -->
+      <div class="run-complete" id="auto-run-complete" aria-hidden="true">
+        <div class="run-complete-card">
+          <div class="run-complete-badge" id="auto-run-complete-badge">
+            <svg class="run-complete-check" viewBox="0 0 52 52" aria-hidden="true">
+              <circle class="run-complete-ring" cx="26" cy="26" r="24" fill="none"/>
+              <path class="run-complete-mark run-complete-mark-ok" fill="none" d="M14 27 l8 8 l16 -18"/>
+              <path class="run-complete-mark run-complete-mark-fail" fill="none" d="M18 18 L34 34 M34 18 L18 34"/>
+            </svg>
+          </div>
+          <div class="run-complete-title" id="auto-run-complete-title">Automation complete</div>
+          <div class="run-complete-sub" id="auto-run-complete-sub"></div>
+          <button class="ghost-btn primary" id="auto-run-complete-btn">Done</button>
+        </div>
       </div>
     </div>
   </div>

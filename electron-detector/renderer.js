@@ -401,11 +401,16 @@ function workspaceCard(app, type, i) {
         : `<span class="app-status"><span class="dot live"></span>live · ${app.DebugPort}</span>`)
     : `<span class="app-status"><span class="dot live"></span>Win32</span>`;
 
+  const iconHtml = app.Icon
+    ? `<img class="app-icon" src="${app.Icon}" alt="" />`
+    : `<div class="app-icon app-icon-fallback">${escapeHtml((app.Name || '?').trim().charAt(0).toUpperCase() || '?')}</div>`;
+
   return `
     <div class="app-card ${cls}"
          data-exe="${escapeHtml(app.Exe)}"
          data-name="${escapeHtml(app.Name)}"
          style="--row-i:${i}">
+      ${iconHtml}
       <div class="app-info">
         <div class="app-name">${escapeHtml(app.Name || 'Unknown')}</div>
         <div class="app-meta-row">
@@ -1062,6 +1067,7 @@ window.chat.onThinking((data) => {
 
 window.chat.onTool((data) => {
   if (data.exe !== chatCurrentExe) return;
+  if (data.name === 'ask_user') return; // rendered as a clarify card, not a tool line
   hideThinking();
   thinkingFallback = `running ${data.name}…`;
   const summary = formatToolCall(data.name, data.args);
@@ -1070,6 +1076,7 @@ window.chat.onTool((data) => {
 
 window.chat.onToolResult((data) => {
   if (data.exe !== chatCurrentExe) return;
+  if (data.name === 'ask_user') return; // card already reflects the answer
   const ok = data.result && data.result.ok;
   const err = data.result && data.result.error;
   let msg, fallback;
@@ -1105,8 +1112,98 @@ window.chat.onToolResult((data) => {
   showThinking(fallback);
 });
 
+// Clarifying-question card (mid-turn). Appended directly to the message list like
+// tool lines — transient until chat:done re-renders, after which the Q&A persists
+// via the turn trail (ask_user shows there). Answering does NOT call renderChat.
+window.chat.onAsk((data) => {
+  if (data.exe !== chatCurrentExe) return;
+  hideThinking();
+
+  const old = document.getElementById('chat-clarify-card');
+  if (old) old.remove();
+
+  const exe = data.exe;
+  const card = document.createElement('div');
+  card.className = 'chat-clarify-card';
+  card.id = 'chat-clarify-card';
+
+  const q = document.createElement('div');
+  q.className = 'chat-clarify-question';
+  q.textContent = data.question || 'Which option do you want?';
+  card.appendChild(q);
+
+  const opts = Array.isArray(data.options) ? data.options : [];
+  if (opts.length) {
+    const optsRow = document.createElement('div');
+    optsRow.className = 'chat-clarify-options';
+    opts.forEach((opt) => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'chat-clarify-chip';
+      chip.textContent = opt;
+      chip.addEventListener('click', () => answerClarify(card, opt));
+      optsRow.appendChild(chip);
+    });
+    card.appendChild(optsRow);
+  }
+
+  const customRow = document.createElement('div');
+  customRow.className = 'chat-clarify-custom';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'chat-clarify-input';
+  input.placeholder = opts.length ? 'Or type a custom answer…' : 'Type your answer…';
+  const sendBtn = document.createElement('button');
+  sendBtn.type = 'button';
+  sendBtn.className = 'chat-clarify-send';
+  sendBtn.innerHTML = CHAT_SEND_ICON;
+  sendBtn.disabled = true;
+  const sync = () => { sendBtn.disabled = !input.value.trim(); };
+  input.addEventListener('input', sync);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); if (input.value.trim()) answerClarify(card, input.value); }
+  });
+  sendBtn.addEventListener('click', () => { if (input.value.trim()) answerClarify(card, input.value); });
+  customRow.appendChild(input);
+  customRow.appendChild(sendBtn);
+  card.appendChild(customRow);
+
+  chatMessagesEl.appendChild(card);
+  scrollChatToBottom();
+  // Let the user answer via the card; main composer stays disabled (busy).
+  setTimeout(() => { try { input.focus(); } catch {} }, 0);
+
+  card._exe = exe;
+});
+
+function answerClarify(card, answer) {
+  const text = (answer || '').trim();
+  if (!text || card.classList.contains('answered')) return;
+  const exe = card._exe || chatCurrentExe;
+  window.chat.answer({ exe, answer: text });
+  card.classList.add('answered');
+  card.querySelectorAll('.chat-clarify-chip').forEach((c) => {
+    c.disabled = true;
+    if (c.textContent === text) c.classList.add('chosen');
+  });
+  const input = card.querySelector('.chat-clarify-input');
+  const sendBtn = card.querySelector('.chat-clarify-send');
+  if (input) { input.disabled = true; if (!card.querySelector('.chat-clarify-chip.chosen')) input.value = text; }
+  if (sendBtn) sendBtn.disabled = true;
+  // Model resumes the turn.
+  thinkingFallback = 'thinking…';
+  thinkingBuffer = '';
+  showThinking(thinkingFallback);
+}
+
 function renderTrailPills(trail) {
   return trail.map(t => {
+    if (t.name === 'ask_user') {
+      const q = (t.args && t.args.question) ? String(t.args.question) : 'clarifying question';
+      const r = t.result || {};
+      const ans = r.answer !== undefined ? `→ "${String(r.answer)}"` : (r.aborted ? '→ (cancelled)' : (r.error ? '→ (no answer)' : ''));
+      return `<div class="chat-tool-line">❓ ${escapeHtml(q)} ${escapeHtml(ans)}</div>`;
+    }
     const callLine = `<div class="chat-tool-line">⚙ ${formatToolCall(t.name, t.args)}</div>`;
     const r = t.result || {};
     let resultLine;
@@ -1424,6 +1521,10 @@ const autoRunLog         = document.getElementById('auto-run-log');
 const autoRunError       = document.getElementById('auto-run-error');
 const autoRunStop        = document.getElementById('auto-run-stop');
 const autoRunDone        = document.getElementById('auto-run-done');
+const autoRunComplete      = document.getElementById('auto-run-complete');
+const autoRunCompleteTitle = document.getElementById('auto-run-complete-title');
+const autoRunCompleteSub   = document.getElementById('auto-run-complete-sub');
+const autoRunCompleteBtn   = document.getElementById('auto-run-complete-btn');
 
 let pendingAutomation = null;     // { meta, userMsg, finalReply, trail }
 let activeCodexJob    = null;     // jobId for cancel
@@ -1465,9 +1566,9 @@ function summariseResult(r) {
 
 const AUTO_TOOLS_CDP = new Set([
   'cdp_find', 'cdp_click', 'cdp_type', 'cdp_paste', 'cdp_press_key',
-  'cdp_get_text', 'cdp_get_tree', 'cdp_get_messages',
+  'cdp_get_text', 'cdp_get_tree', 'cdp_get_messages', 'cdp_react',
   'cdp_scroll_to_message', 'cdp_scroll_messages', 'cdp_scroll',
-  'cdp_get_search_results', 'cdp_jump_to_search_result',
+  'cdp_get_search_results', 'cdp_set_search_sort', 'cdp_jump_to_search_result',
 ]);
 const AUTO_TOOLS_UIA = new Set(['uia_invoke', 'uia_set_value', 'uia_get_tree']);
 
@@ -1509,6 +1610,7 @@ function humanizeStep(step, steps) {
     case 'cdp_press_key': return `Press ${a.key || 'a key'}`;
     case 'cdp_get_text': return 'Read the text shown';
     case 'cdp_get_messages': return `Read the ${a.limit ? `latest ${a.limit} ` : ''}messages`;
+    case 'cdp_react': return a.emoji ? `React with :${a.emoji}:` : 'React to that message';
     case 'cdp_scroll_to_message': return 'Scroll to that message';
     case 'cdp_scroll_messages':
     case 'cdp_scroll': return 'Scroll the list';
@@ -2063,21 +2165,57 @@ async function handleAutomationAction(act, id) {
 }
 
 let runStepTexts = [];   // plain-English label per step for the active run
+let runCursor    = null; // moving outline that tracks the current step
+let runStepCount = 0;    // total steps in the active run (for completion copy)
+
+// Slide the outline box over row `i`. State drives its color: 'running'
+// (in flight), 'done' (succeeded), 'failed' (errored). Pass null to hide it.
+function moveRunCursor(i, state) {
+  if (!runCursor) return;
+  if (i == null) {
+    runCursor.classList.remove('visible', 'running', 'done', 'failed');
+    return;
+  }
+  const row = document.getElementById(`auto-run-row-${i}`);
+  if (!row) return;
+  runCursor.style.top    = `${row.offsetTop}px`;
+  runCursor.style.height = `${row.offsetHeight}px`;
+  runCursor.classList.add('visible');
+  runCursor.classList.remove('running', 'done', 'failed');
+  if (state) runCursor.classList.add(state);
+  // Don't follow every step. Only scroll once the active row gets within
+  // ~2 steps of the bottom edge, then reveal it with 2 steps of lookahead.
+  const stride        = row.offsetHeight + 4;            // row height + flex gap
+  const lookahead     = 2 * stride;
+  const rowBottom     = row.offsetTop + row.offsetHeight;
+  const visibleBottom = autoRunLog.scrollTop + autoRunLog.clientHeight;
+  if (rowBottom + lookahead > visibleBottom) {
+    const maxScroll = autoRunLog.scrollHeight - autoRunLog.clientHeight;
+    const target    = Math.max(0, Math.min(maxScroll, rowBottom + lookahead - autoRunLog.clientHeight));
+    autoRunLog.scrollTo({ top: target, behavior: 'smooth' });
+  }
+}
 
 function runAutomation(entry, meta) {
   autoRunTitle.textContent = `Running: ${entry.name}`;
   autoRunLog.innerHTML = '';
   autoRunError.textContent = '';
   autoRunError.classList.remove('visible');
+  autoRunComplete.classList.remove('show', 'failed');
   autoRunStop.style.display = '';
   autoRunDone.style.display = 'none';
   autoRunClose.style.display = 'none';
   showAutoModal(autoRunModal);
   // Pre-fill rows so user sees the plan, in plain English
   runStepTexts = entry.steps.map((s) => stepText(s, entry.steps));
+  runStepCount = entry.steps.length;
   entry.steps.forEach((s, i) => {
     appendRunRow(i, runStepTexts[i], '', 'pending');
   });
+  // One reusable outline element, layered behind the rows' text
+  runCursor = document.createElement('div');
+  runCursor.className = 'auto-modal-runlog-cursor';
+  autoRunLog.appendChild(runCursor);
   window.automation.run({ exe: meta.exe, id: entry.id, meta })
     .then((r) => {
       // run-done event will fire via SSE
@@ -2116,10 +2254,9 @@ function appendRunRow(i, name, argsDesc, status, detail) {
   row.querySelector('.auto-modal-runlog-name').textContent = name;
   const statusEl = row.querySelector('.auto-modal-runlog-status');
   statusEl.className = `auto-modal-runlog-status ${status}`;
-  statusEl.textContent = status === 'pending' ? '…' : status === 'start' ? '▶' : status === 'ok' ? '✓' : status === 'error' ? '✕' : status === 'stopped' ? '◼' : '';
+  statusEl.textContent = status === 'pending' ? '…' : status === 'start' ? '▶' : status === 'ok' ? '✓' : status === 'error' ? '✕' : status === 'stopped' ? '◼' : status === 'retry' ? '⟳' : '';
   const detailEl = row.querySelector('.auto-modal-runlog-detail');
   detailEl.textContent = detail !== undefined ? detail : argsDesc;
-  autoRunLog.scrollTop = autoRunLog.scrollHeight;
 }
 
 window.automation.onRunStart((data) => {
@@ -2130,11 +2267,27 @@ window.automation.onRunStep((data) => {
   if (!data) return;
   const detail = data.status === 'error'
     ? `error: ${data.error || ''}`
-    : data.status === 'ok' && data.result
-      ? summariseResult(data.result)
-      : summariseArgs(data.args || {});
+    : data.status === 'retry'
+      ? `waiting for UI to update… (retry ${data.attempt || 1})`
+      : data.status === 'ok' && data.result
+        ? summariseResult(data.result)
+        : summariseArgs(data.args || {});
   const label = runStepTexts[data.i] || data.name;
   appendRunRow(data.i, label, '', data.status, detail);
+
+  // Drive the moving outline + row emphasis off the step status
+  const row = document.getElementById(`auto-run-row-${data.i}`);
+  if (data.status === 'start' || data.status === 'retry') {
+    document.querySelectorAll('.auto-modal-runlog-row.active')
+      .forEach((r) => { r.classList.remove('active'); r.classList.add('is-done'); });
+    if (row) { row.classList.add('active'); row.classList.remove('is-done'); }
+    moveRunCursor(data.i, 'running');
+  } else if (data.status === 'ok') {
+    moveRunCursor(data.i, 'done');
+  } else if (data.status === 'error') {
+    if (row) row.classList.remove('active');
+    moveRunCursor(data.i, 'failed');
+  }
 });
 
 window.automation.onRunDone((data) => {
@@ -2142,11 +2295,33 @@ window.automation.onRunDone((data) => {
   autoRunStop.style.display = 'none';
   autoRunDone.style.display = '';
   autoRunClose.style.display = '';
-  if (data && data.ok === false) {
+  document.querySelectorAll('.auto-modal-runlog-row.active')
+    .forEach((r) => r.classList.remove('active'));
+
+  const ok = !(data && data.ok === false);
+  if (!ok) {
     autoRunError.textContent = data.error || 'failed';
     autoRunError.classList.add('visible');
+    moveRunCursor(null);
   }
+  showRunComplete(ok, data && data.error);
 });
+
+// Pop the success/failure card over the run modal once the script ends.
+function showRunComplete(ok, errMsg) {
+  autoRunComplete.classList.toggle('failed', !ok);
+  if (ok) {
+    autoRunCompleteTitle.textContent = 'Automation complete';
+    autoRunCompleteSub.textContent =
+      runStepCount ? `All ${runStepCount} step${runStepCount === 1 ? '' : 's'} finished.` : 'Done.';
+  } else {
+    autoRunCompleteTitle.textContent = 'Automation failed';
+    autoRunCompleteSub.textContent = errMsg || 'A step did not complete.';
+  }
+  // Force a reflow so the SVG draw animations restart on every run
+  void autoRunComplete.offsetWidth;
+  autoRunComplete.classList.add('show');
+}
 
 autoRunStop.addEventListener('click', () => {
   if (activeRunId) window.automation.stop(activeRunId);
@@ -2154,6 +2329,11 @@ autoRunStop.addEventListener('click', () => {
 });
 autoRunClose.addEventListener('click', () => { hideAutoModal(autoRunModal); });
 autoRunDone.addEventListener('click', () => { hideAutoModal(autoRunModal); });
+autoRunCompleteBtn.addEventListener('click', () => {
+  // Only dismiss the overlay — leave the run log (and any error) visible
+  // underneath. The foot Close button is what exits the modal.
+  autoRunComplete.classList.remove('show');
+});
 
 // Reset name input disable state when reopening
 autoReviewModal.addEventListener('animationstart', () => {

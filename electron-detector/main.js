@@ -72,7 +72,7 @@ const SNAPSHOT_ELEMENT_CAP = 500;
 const AUTOMATIONS_DIR = path.join(__dirname, '..', 'automations');
 const AUTOMATION_TOOLS_CDP = new Set([
   'cdp_find', 'cdp_click', 'cdp_type', 'cdp_paste', 'cdp_press_key',
-  'cdp_get_text', 'cdp_get_tree', 'cdp_get_messages',
+  'cdp_get_text', 'cdp_get_tree', 'cdp_get_messages', 'cdp_react',
   'cdp_scroll_to_message', 'cdp_scroll_messages',
   'cdp_scroll',
   'cdp_get_search_results', 'cdp_set_search_sort', 'cdp_jump_to_search_result',
@@ -191,9 +191,14 @@ function saveCdpState(state) {
 
 function registerLogonTask() {
   return new Promise((resolve) => {
-    const scriptPath = PS_SCRIPT_PATH.replace(/'/g, "''");
+    // Wrap the script path in double quotes (escaped backtick-quote inside the
+    // PS double-quoted -Argument string). The path contains spaces, and
+    // powershell.exe -File does NOT strip single quotes — single-quoting a
+    // spaced path makes the logon task fail with "Processing -File failed".
+    // Windows paths cannot contain a literal '"', so no further escaping needed.
+    const scriptPath = PS_SCRIPT_PATH;
     const cmd = `
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File '${scriptPath}' -Restore"
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \`"${scriptPath}\`" -Watch"
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 $existing = Get-ScheduledTask -TaskName '${TASK_NAME}' -ErrorAction SilentlyContinue
@@ -217,6 +222,67 @@ if ($existing) { Unregister-ScheduledTask -TaskName '${TASK_NAME}' -Confirm:$fal
   });
 }
 
+// Launch the resident -Watch process now (detached) so newly selected apps are
+// guarded in the current session without waiting for the next logon. The
+// script's named mutex makes a second instance exit immediately, so calling
+// this when a watcher already runs is a no-op.
+function ensureWatcherRunning() {
+  return new Promise((resolve) => {
+    const scriptPath = PS_SCRIPT_PATH;
+    // -ArgumentList MUST be a single string: PS 5.1 Start-Process does not
+    // quote array elements containing spaces, which mangles the spaced script
+    // path. Double-quote the path inside the single string so CreateProcess
+    // parses it correctly.
+    const cmd = `
+$running = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match '-Watch' -and $_.CommandLine -match 'Start-ElectronDebug\\.ps1' }
+if (-not $running) {
+    Start-Process powershell.exe -ArgumentList '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${scriptPath}" -Watch' -WindowStyle Hidden
+}`;
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd],
+      { timeout: 15000 }, () => resolve());
+  });
+}
+
+// Stop the resident watcher (used when the last tracked app is deselected).
+function stopWatcher() {
+  return new Promise((resolve) => {
+    const cmd = `
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match '-Watch' -and $_.CommandLine -match 'Start-ElectronDebug\\.ps1' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd],
+      { timeout: 15000 }, () => resolve());
+  });
+}
+
+// Per-exe icon cache. Icons don't change between runs of the same binary, and
+// app.getFileIcon does a disk read + shell call, so cache by lowercased path.
+const _iconCache = new Map(); // exe(lowercase) -> dataURL ('' = no icon)
+
+async function getAppIcon(exe) {
+  if (!exe) return '';
+  const key = exe.toLowerCase();
+  if (_iconCache.has(key)) return _iconCache.get(key);
+  let url = '';
+  try {
+    const img = await app.getFileIcon(exe, { size: 'normal' }); // ~32px
+    if (img && !img.isEmpty()) url = img.toDataURL();
+  } catch {}
+  _iconCache.set(key, url);
+  return url;
+}
+
+// Attach an `Icon` data-URL to each app in place (renderer shows it left of the
+// name). Resolves in parallel; misses fall back to '' so the renderer can chip.
+async function attachIcons(apps) {
+  if (!Array.isArray(apps)) return apps;
+  await Promise.all(apps.map(async (a) => {
+    if (a && a.Exe) a.Icon = await getAppIcon(a.Exe);
+  }));
+  return apps;
+}
+
 function detectElectronApps() {
   return new Promise((resolve, reject) => {
     execFile('powershell.exe', [
@@ -225,7 +291,7 @@ function detectElectronApps() {
       if (err) return reject(err);
       try {
         const apps = JSON.parse(stdout.trim());
-        resolve(apps);
+        resolve(attachIcons(apps));
       } catch (e) {
         resolve([]);
       }
@@ -240,7 +306,7 @@ function detectUiaApps() {
     ], { timeout: 30000 }, (err, stdout) => {
       if (err) return reject(err);
       try {
-        resolve(JSON.parse(stdout.trim()));
+        resolve(attachIcons(JSON.parse(stdout.trim())));
       } catch {
         resolve([]);
       }
@@ -919,9 +985,41 @@ function debugLog(msg) {
   fs.appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`, 'utf8');
 }
 
+// Per-session chat transcript logging, toggled in config.json (see chat-logger.js).
+const chatLogger = require('./chat-logger');
+const chatLogSessions = new Map(); // exe -> { file, id, startedAt, turnCount }
+
+// Settle window between scrolling an off-screen click target into view and
+// reading its FINAL coordinates. Discord's virtual scrollers (server rail,
+// channel list) re-render asynchronously after a programmatic scroll, so a
+// click dispatched at coords measured in the same tick lands on a stale
+// position — see CLICK_SETTLE_MS usage in cdpClickReal / buildCdpClickScript.
+const CLICK_SETTLE_MS = 350;
+
+// Coordinate resolver shared by the native (cdpClickReal) and PowerShell
+// (buildCdpClickScript) click paths. Walks up from the matched element to the
+// nearest clickable ancestor, then:
+//   - if that target is NOT fully inside the viewport, scrolls it to the
+//     VERTICAL center (block:'center', inline:'nearest') and returns
+//     scrolled:true so the caller settles + re-reads before the click.
+//     block:'center' is load-bearing: 'nearest' parks an off-screen rail/list
+//     item flush against the scroller's clipped top/bottom edge, where its
+//     center coordinate hit-tests to the scroller padding/fade overlay rather
+//     than the item — the click then misses and the navigation no-ops
+//     (verified by live elementFromPoint probe). inline stays 'nearest' to
+//     avoid the horizontal layout shift that inline:'center' caused — see the
+//     2026-05-25 "Click pre-scroll shifts Discord viewport" incident.
+//   - if it is already fully visible, returns scrolled:false and the caller
+//     clicks immediately (fast path, no extra delay).
+// Returns JSON: {x,y,tag,walked,scrolled} or {error:...}.
+function buildClickCoordsExpr(selector) {
+  return `(function(){var sel=${JSON.stringify(selector)};var el=document.querySelector(sel);if(!el)return JSON.stringify({error:'element_not_found'});var svgLike={svg:1,path:1,g:1,circle:1,rect:1,polygon:1,line:1,use:1,polyline:1};var target=el;var hops=0;while(target&&target!==document.body&&hops<8){var tg=(target.tagName||'').toLowerCase();var r=target.getAttribute&&target.getAttribute('role');if(tg==='button'||tg==='a'||tg==='input'||tg==='label')break;if(r&&/^(button|link|menuitem|menuitemcheckbox|menuitemradio|tab|treeitem|option|checkbox|radio|switch)$/.test(r))break;if(target.onclick)break;if(svgLike[tg]||(target.getAttribute&&target.getAttribute('aria-hidden')==='true')){target=target.parentElement;hops++;continue;}break;}if(!target)target=el;var rect=target.getBoundingClientRect();var ih=window.innerHeight||0,iw=window.innerWidth||0;var inView=rect.top>=0&&rect.left>=0&&rect.bottom<=ih&&rect.right<=iw;var scrolled=false;if(!inView){try{target.scrollIntoView({block:'center',inline:'nearest'});scrolled=true;}catch(e){}rect=target.getBoundingClientRect();}if(rect.width===0&&rect.height===0)return JSON.stringify({error:'zero_size'});return JSON.stringify({x:Math.round(rect.left+rect.width/2),y:Math.round(rect.top+rect.height/2),tag:target.tagName,walked:target!==el,scrolled:scrolled});})()`;
+}
+
 function buildCdpClickScript(port, selector) {
-  const coordsJs = `(function(){var sel=${JSON.stringify(selector)};var el=document.querySelector(sel);if(!el)return JSON.stringify({error:'element_not_found'});var svgLike={svg:1,path:1,g:1,circle:1,rect:1,polygon:1,line:1,use:1,polyline:1};var target=el;var hops=0;while(target&&target!==document.body&&hops<8){var tg=(target.tagName||'').toLowerCase();var r=target.getAttribute&&target.getAttribute('role');if(tg==='button'||tg==='a'||tg==='input'||tg==='label')break;if(r&&/^(button|link|menuitem|menuitemcheckbox|menuitemradio|tab|treeitem|option|checkbox|radio|switch)$/.test(r))break;if(target.onclick)break;if(svgLike[tg]||(target.getAttribute&&target.getAttribute('aria-hidden')==='true')){target=target.parentElement;hops++;continue;}break;}if(!target)target=el;try{target.scrollIntoView({block:'nearest',inline:'nearest'});}catch(e){}var rect=target.getBoundingClientRect();if(rect.width===0&&rect.height===0)return JSON.stringify({error:'zero_size'});return JSON.stringify({x:Math.round(rect.left+rect.width/2),y:Math.round(rect.top+rect.height/2),tag:target.tagName,walked:target!==el});})()`;
+  const coordsJs = buildClickCoordsExpr(selector);
   const jsBase64 = Buffer.from(coordsJs, 'utf8').toString('base64');
+  const settleMs = CLICK_SETTLE_MS;
   return `
 function Send-Cmd { param($ws, $cts, $cmd)
     $bytes = [Text.Encoding]::UTF8.GetBytes($cmd)
@@ -969,6 +1067,19 @@ try {
         Write-Output ($coords | ConvertTo-Json -Compress)
         try { $ws.Dispose() } catch {}; exit
     }
+    # If the target had to be scrolled into view, the scroller is still
+    # re-rendering — settle, then re-read FINAL coords before clicking so the
+    # native mouse event doesn't land on a stale position (see CLICK_SETTLE_MS).
+    if ($coords.scrolled) {
+        Start-Sleep -Milliseconds ${settleMs}
+        $cmd1b = (@{ id=5; method='Runtime.evaluate'; params=@{ expression=$js; returnByValue=$true } } | ConvertTo-Json -Compress -Depth 5)
+        Send-Cmd $ws $cts $cmd1b
+        $resp1b = Recv-Id $ws $cts 5
+        if ($resp1b -and $resp1b.result -and $resp1b.result.result -and $resp1b.result.result.value) {
+            $coords2 = $resp1b.result.result.value | ConvertFrom-Json
+            if (-not $coords2.error) { $coords = $coords2 }
+        }
+    }
     $x = [double]$coords.x
     $y = [double]$coords.y
     $cmd2 = (@{ id=2; method='Input.dispatchMouseEvent'; params=@{ type='mouseMoved'; x=$x; y=$y; button='none' } } | ConvertTo-Json -Compress -Depth 5)
@@ -998,17 +1109,25 @@ async function cdpClickReal(port, selector) {
   }
   debugLog(`[cdpClick native] port=${port} sel=${selector.slice(0, 100)}`);
   try {
-    // Step 1: Runtime.evaluate to get coords of the clickable element.
-    const coordsJs = `(function(){var sel=${JSON.stringify(selector)};var el=document.querySelector(sel);if(!el)return JSON.stringify({error:'element_not_found'});var svgLike={svg:1,path:1,g:1,circle:1,rect:1,polygon:1,line:1,use:1,polyline:1};var target=el;var hops=0;while(target&&target!==document.body&&hops<8){var tg=(target.tagName||'').toLowerCase();var r=target.getAttribute&&target.getAttribute('role');if(tg==='button'||tg==='a'||tg==='input'||tg==='label')break;if(r&&/^(button|link|menuitem|menuitemcheckbox|menuitemradio|tab|treeitem|option|checkbox|radio|switch)$/.test(r))break;if(target.onclick)break;if(svgLike[tg]||(target.getAttribute&&target.getAttribute('aria-hidden')==='true')){target=target.parentElement;hops++;continue;}break;}if(!target)target=el;try{target.scrollIntoView({block:'nearest',inline:'nearest'});}catch(e){}var rect=target.getBoundingClientRect();if(rect.width===0&&rect.height===0)return JSON.stringify({error:'zero_size'});return JSON.stringify({x:Math.round(rect.left+rect.width/2),y:Math.round(rect.top+rect.height/2),tag:target.tagName,walked:target!==el});})()`;
-    const [evalRes] = await cdpNativeWsSession(port, [
-      { method: 'Runtime.evaluate', params: { expression: coordsJs, returnByValue: true } },
-    ]);
-    if (!evalRes || !evalRes.result || evalRes.result.value === undefined) {
-      return { error: 'eval_no_value' };
-    }
-    let coords;
-    try { coords = JSON.parse(evalRes.result.value); } catch { return { error: 'parse_failed' }; }
+    // Step 1: Runtime.evaluate to get coords of the clickable element. If the
+    // element was off-screen, buildClickCoordsExpr centers it and reports
+    // scrolled:true; we then settle and re-read so the click below lands on
+    // the FINAL position, not a coordinate measured mid-scroll.
+    const coordsJs = buildClickCoordsExpr(selector);
+    const readCoords = async () => {
+      const [evalRes] = await cdpNativeWsSession(port, [
+        { method: 'Runtime.evaluate', params: { expression: coordsJs, returnByValue: true } },
+      ]);
+      if (!evalRes || !evalRes.result || evalRes.result.value === undefined) return { error: 'eval_no_value' };
+      try { return JSON.parse(evalRes.result.value); } catch { return { error: 'parse_failed' }; }
+    };
+    let coords = await readCoords();
     if (coords.error) return coords;
+    if (coords.scrolled) {
+      await new Promise(r => setTimeout(r, CLICK_SETTLE_MS));
+      const settled = await readCoords();
+      if (!settled.error) coords = settled;
+    }
     const x = Number(coords.x), y = Number(coords.y);
     // Step 2: dispatch mouse events in sequence. Bundled in one WS session
     // so the native fast-path is one round-trip per click.
@@ -1350,6 +1469,167 @@ function cdpPasteRealPS(port, selector, text, clearFirst) {
   });
 }
 
+// Discord reaction in ONE step. The "Add Reaction" button only renders while
+// the message row is hovered, and the emoji picker is a portal popout — neither
+// appears in the snapshot, so the snapshot+cdp_click path cannot react. This
+// reproduces the human flow at the CDP mouse/keyboard layer:
+//   hover row → click Add Reaction → focus picker search → type name → click match → verify.
+async function cdpReactReal(port, messageId, emojiName) {
+  const idRaw = String(messageId || '').trim();
+  const name = String(emojiName || '').trim().replace(/^:+|:+$/g, ''); // strip colons
+  if (!idRaw) return { error: 'missing_message_id' };
+  if (!name) return { error: 'missing_emoji' };
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+  const evalOne = async (expr) => {
+    const [res] = await cdpNativeWsSession(port, [{ method: 'Runtime.evaluate', params: { expression: expr, returnByValue: true } }]);
+    if (!res || !res.result || res.result.value === undefined) throw new Error('eval_no_value');
+    return JSON.parse(res.result.value);
+  };
+  const click = (x, y) => cdpNativeWsSession(port, [
+    { method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x, y, button: 'none' } },
+    { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: 'left', clickCount: 1 } },
+    { method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 } },
+  ]);
+  const hover = (x, y) => cdpNativeWsSession(port, [{ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x, y, button: 'none' } }]);
+  const esc = () => cdpNativeWsSession(port, [
+    { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', windowsVirtualKeyCode: 27, code: 'Escape', key: 'Escape' } },
+    { method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', windowsVirtualKeyCode: 27, code: 'Escape', key: 'Escape' } },
+  ]).catch(() => {});
+
+  try {
+    // 1) locate + scroll message into view; compute a safe hover point on the row
+    const loc = await evalOne(`(function(){
+      var raw=${JSON.stringify(idRaw)};
+      var el=document.getElementById(raw);
+      if(!el){var m=raw.match(/(\\d{5,})$/);if(m){var all=document.querySelectorAll('li[id^="chat-messages-"]');for(var i=0;i<all.length;i++){if(all[i].id.indexOf(m[1])!==-1){el=all[i];break;}}}}
+      if(!el)return JSON.stringify({error:'message_not_found'});
+      el.scrollIntoView({block:'center'});
+      var r=el.getBoundingClientRect();
+      if(r.width===0&&r.height===0)return JSON.stringify({error:'message_zero_size'});
+      return JSON.stringify({ok:true,id:el.id,x:Math.round(r.left+90),y:Math.round(r.top+14)});
+    })()`);
+    if (loc.error) return loc;
+    const mid = loc.id;
+
+    // 2) hover to reveal the floating message toolbar
+    await hover(loc.x, loc.y);
+    await wait(380);
+
+    // 3) find the "Add Reaction" button inside the hovered row
+    let rb = await evalOne(`(function(){
+      var el=document.getElementById(${JSON.stringify(mid)});
+      if(!el)return JSON.stringify({error:'message_gone'});
+      var btn=el.querySelector('[aria-label="Add Reaction" i],[aria-label^="Add Reaction" i]');
+      if(!btn){var bs=el.querySelectorAll('[role="button"],button');for(var i=0;i<bs.length;i++){var l=(bs[i].getAttribute('aria-label')||'').toLowerCase();if(l.indexOf('add reaction')!==-1||l.indexOf('react')===0){btn=bs[i];break;}}}
+      if(!btn)return JSON.stringify({error:'react_button_not_found'});
+      var r=btn.getBoundingClientRect();
+      if(r.width===0&&r.height===0)return JSON.stringify({error:'react_button_hidden'});
+      return JSON.stringify({ok:true,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),aria:btn.getAttribute('aria-label')||''});
+    })()`);
+    if (rb.error) { await hover(loc.x, loc.y); await wait(300); // one re-hover retry
+      rb = await evalOne(`(function(){var el=document.getElementById(${JSON.stringify(mid)});if(!el)return JSON.stringify({error:'message_gone'});var btn=el.querySelector('[aria-label="Add Reaction" i],[aria-label^="Add Reaction" i]');if(!btn)return JSON.stringify({error:'react_button_not_found'});var r=btn.getBoundingClientRect();if(r.width===0&&r.height===0)return JSON.stringify({error:'react_button_hidden'});return JSON.stringify({ok:true,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),aria:btn.getAttribute('aria-label')||''});})()`);
+    }
+    if (rb.error) return Object.assign({ stage: 'react_button', id: mid }, rb);
+
+    // 4) click Add Reaction → opens the emoji picker popout
+    await click(rb.x, rb.y);
+    await wait(650);
+
+    // 5) find + focus the picker search input. The popout renders async after
+    // the Add Reaction click, so poll a few times instead of one-shot.
+    const siExpr = `(function(){
+      var inp=document.querySelector('input[placeholder*="emoji" i],input[placeholder*="reaction" i],input[aria-label*="emoji" i]');
+      if(!inp){var dlg=document.querySelector('[role="dialog"]');if(dlg)inp=dlg.querySelector('input[type="text"],input');}
+      if(!inp){var all=document.querySelectorAll('input[type="text"]');inp=all[all.length-1];}
+      if(!inp)return JSON.stringify({error:'search_input_not_found'});
+      inp.scrollIntoView({block:'nearest'});
+      var r=inp.getBoundingClientRect();
+      if(r.width===0&&r.height===0)return JSON.stringify({error:'search_input_hidden'});
+      return JSON.stringify({ok:true,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});
+    })()`;
+    let si = { error: 'search_input_not_found' };
+    for (let a = 0; a < 6; a++) {
+      si = await evalOne(siExpr);
+      if (!si.error) break;
+      await wait(350);
+    }
+    if (si.error) { await esc(); return Object.assign({ stage: 'picker_search', id: mid }, si); }
+    // focus the input
+    await click(si.x, si.y);
+    await wait(120);
+
+    // 6) type a search term + click the first matching emoji. Discord emoji
+    // names use separators like ~ (e.g. "example-emoji") that the user often
+    // writes as "-" or "_". So we (a) match on the ALPHANUMERIC-NORMALIZED name
+    // (separators ignored) and (b) fall back to looser search terms if the
+    // exact term surfaces no results.
+    const norm = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const terms = Array.from(new Set([
+      name,
+      name.replace(/[-_~\s]+/g, ''),          // collapse separators
+      name.replace(/[-_~\s]*\d+\s*$/, ''),      // drop trailing "<sep><digits>" -> family search
+    ].map(t => t.trim()).filter(Boolean)));
+    const findEmojiExpr = `(function(){
+      var needle=${JSON.stringify(norm)};
+      function nz(s){return (s||'').toLowerCase().replace(/[^a-z0-9]/g,'');}
+      var scope=document.querySelector('[role="dialog"]')||document;
+      var cand=null;
+      var byName=scope.querySelectorAll('[data-name]');
+      for(var i=0;i<byName.length;i++){var dn=nz(byName[i].getAttribute('data-name'));if(dn===needle){cand=byName[i];break;}}
+      if(!cand){for(var k=0;k<byName.length;k++){var dn2=nz(byName[k].getAttribute('data-name'));if(dn2.indexOf(needle)===0){cand=byName[k];break;}}}
+      if(!cand){var imgs=scope.querySelectorAll('img[alt],img[aria-label]');for(var j=0;j<imgs.length;j++){var al=nz(imgs[j].getAttribute('alt')||imgs[j].getAttribute('aria-label'));if(al===needle){cand=imgs[j];break;}}}
+      if(!cand)return JSON.stringify({error:'emoji_not_found',needle:needle,seen:Array.from(byName).slice(0,12).map(function(e){return e.getAttribute('data-name');})});
+      var clk=cand.closest('[role="button"],button,li,[role="gridcell"]')||cand;
+      clk.scrollIntoView({block:'center'});
+      var r=clk.getBoundingClientRect();
+      if(r.width===0&&r.height===0)return JSON.stringify({error:'emoji_zero_size'});
+      return JSON.stringify({ok:true,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),name:(cand.getAttribute('data-name')||cand.getAttribute('alt')||'')});
+    })()`;
+    let em = { error: 'emoji_not_found' };
+    for (const term of terms) {
+      // clear input (Ctrl+A + Delete) then type this term
+      await cdpNativeWsSession(port, [
+        { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', windowsVirtualKeyCode: 65, code: 'KeyA', key: 'a', modifiers: 2 } },
+        { method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', windowsVirtualKeyCode: 65, code: 'KeyA', key: 'a', modifiers: 2 } },
+        { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', windowsVirtualKeyCode: 46, code: 'Delete', key: 'Delete' } },
+        { method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', windowsVirtualKeyCode: 46, code: 'Delete', key: 'Delete' } },
+        { method: 'Input.insertText', params: { text: term } },
+      ]);
+      await wait(650);
+      em = await evalOne(findEmojiExpr);
+      if (!em.error) break;
+    }
+    if (em.error) { await esc(); return Object.assign({ stage: 'emoji_pick', id: mid, triedTerms: terms }, em); }
+    await click(em.x, em.y);
+    await wait(550);
+
+    // 7) verify the reaction landed on the message
+    let v;
+    try {
+      v = await evalOne(`(function(){
+        var el=document.getElementById(${JSON.stringify(mid)});
+        if(!el)return JSON.stringify({error:'verify_message_gone'});
+        var needle=${JSON.stringify(norm)};
+        function nz(s){return (s||'').toLowerCase().replace(/[^a-z0-9]/g,'');}
+        var pills=Array.from(el.querySelectorAll('[class*="reaction_"],[class*="reactionMe_"]'));
+        for(var i=0;i<pills.length;i++){
+          var img=pills[i].querySelector('img[alt],img[aria-label]');
+          var emj=nz(img?(img.getAttribute('alt')||img.getAttribute('aria-label')):'');
+          var lblRaw=(pills[i].getAttribute('aria-label')||'').toLowerCase();
+          var cn=typeof pills[i].className==='string'?pills[i].className:'';
+          var me=/reactionMe/i.test(cn)||/\\bremove\\b/i.test(lblRaw);
+          if(emj===needle||emj.indexOf(needle)===0||nz(lblRaw).indexOf(needle)!==-1)return JSON.stringify({added:true,me:!!me,emoji:emj});
+        }
+        return JSON.stringify({added:false});
+      })()`);
+    } catch (e) { v = { added: 'unknown', detail: String(e.message || e) }; }
+    return { ok: v.added === true, id: mid, emoji: name, picked: em.name, added: v.added, me: v.me };
+  } catch (err) {
+    await esc();
+    return { error: 'react_failed', detail: String(err.message || err) };
+  }
+}
+
 // Native CDP WebSocket transport — bypasses PowerShell shellout entirely.
 //
 // Why: every PowerShell `execFile` call is a `CreateProcess` against
@@ -1586,8 +1866,9 @@ ipcMain.handle('enable-cdp-app', async (_event, exe) => {
 
   const enabledApp = apps.find(a => a.Exe === exe);
   if (enabledApp && enabledApp.DebugEnabled) {
+    const bn = path.basename(enabledApp.Exe).toLowerCase();
     const state = loadCdpState();
-    state.apps = (state.apps || []).filter(a => a.exe !== exe);
+    state.apps = (state.apps || []).filter(a => path.basename(a.exe).toLowerCase() !== bn);
     state.apps.push({
       name: enabledApp.Name,
       exe: enabledApp.Exe,
@@ -1596,26 +1877,30 @@ ipcMain.handle('enable-cdp-app', async (_event, exe) => {
     state.enabled = true;
     saveCdpState(state);
     await registerLogonTask();
+    await ensureWatcherRunning();
   }
 
   return apps;
 });
 
 ipcMain.handle('disable-cdp-app', async (_event, exe) => {
-  await restartSingleApp(exe, false);
-  const apps = await detectElectronApps();
-
+  // Untrack BEFORE relaunching without the flag, otherwise the resident
+  // watcher sees the no-flag launch and re-flags it back on.
+  const bn = path.basename(exe).toLowerCase();
   const state = loadCdpState();
-  state.apps = (state.apps || []).filter(a => a.exe !== exe);
-  if (state.apps.length === 0) {
-    state.enabled = false;
-    saveCdpState(state);
+  state.apps = (state.apps || []).filter(a => path.basename(a.exe).toLowerCase() !== bn);
+  const noneLeft = state.apps.length === 0;
+  state.enabled = !noneLeft;
+  saveCdpState(state);
+
+  await restartSingleApp(exe, false);
+
+  if (noneLeft) {
+    await stopWatcher();
     await unregisterLogonTask();
-  } else {
-    saveCdpState(state);
   }
 
-  return apps;
+  return await detectElectronApps();
 });
 
 ipcMain.handle('check-cdp-alive', async (_event, port) => {
@@ -2291,6 +2576,7 @@ function buildAutoBlock(meta) {
 - **cdp_get_tree(region?)** — refresh the snapshot. Optional \`region\` ("servers", "channels", "composer", "messages" for Discord, or any CSS selector) narrows the scope and cuts 500 rows to ~30-100.
 - **cdp_find(query, limit?)** — search the DOM by substring (text/aria-label/id) and return only matching refs (f1..fN). Use this INSTEAD of cdp_get_tree when you know what you want to click — far cheaper than a 500-row snapshot.
 - **cdp_get_messages(limit?)** — Discord only: return the last N messages with author, text, image URLs and reaction emoji+counts. Use this instead of \`cdp_get_tree\` when the task is to read message content, find a post by reactions, count something across messages, etc. Much cheaper than a full DOM snapshot.
+- **cdp_react(message_id, emoji)** — Discord only: add an emoji reaction to a message in ONE step (emoji name without colons, e.g. \`"example-emoji-typo"\`). This is the ONLY reliable way to react — the "Add Reaction" button is hover-only and never shows up in a snapshot, so \`cdp_click\` cannot reach it. **Recipe for "react X to the last N <pictures/messages>":** call \`cdp_get_messages\` ONCE, pick the N target ids (e.g. filter \`images.length>0\` for "pictures", take the last N), then call \`cdp_react(id, "X")\` once per id. Do NOT \`cdp_get_tree\` or hunt for a reaction button between reactions — that wastes rounds and misclicks the image lightbox. Check \`added:true\` in each result; if a call returns \`added:false\` or an error \`stage\`, retry that one id once.
 - **cdp_scroll_to_message(message_id)** — Discord only: scroll the chat viewport so a specific message is centered. Pass the \`id\` from \`cdp_get_messages\`. **Required** whenever the user says "scroll to", "show me", "jump to", "take me to", or "find" a specific message — \`cdp_get_messages\` only reads the DOM, it does not move the scroll position.
 - **cdp_scroll_messages(direction, pages?)** — Discord only: scroll the chat message list to load older or newer messages. \`direction\` is \`"up"\` (default, load older), \`"down"\` (newer), \`"top"\` (oldest history), or \`"bottom"\` (latest). \`pages\` defaults to 3 viewport heights. Use when the target message is not in the current \`cdp_get_messages\` window — never ask the user to scroll manually. Re-call \`cdp_get_messages\` after each scroll to see newly mounted rows. Stop when the result says \`atTop: true\` and \`firstChanged: false\`.
 - **cdp_get_search_results(limit?)** — Discord only: scrape the channel-header **Search Results** panel and return structured rows (\`{ messageId, author, authorId, time, text, images, guildId, channelId }\`) plus \`sortMode\`, \`order\` (\`"ascending"\` = oldest-first, \`"descending"\` = newest-first), \`firstTime\`/\`lastTime\`, and \`pages\`. **REQUIRED** for the search-bar flow — \`cdp_get_tree\` drops the \`<li role="listitem">\` rows from snapshots so the model can never see ids. Pair with \`cdp_jump_to_search_result\`.
@@ -2330,6 +2616,7 @@ go stale once the UI mutates.
 ## Tools
 
 ${toolList}
+- **ask_user(question, options?)** — pause the task and ask the user ONE clarifying question when the request is ambiguous or destructive. Supply 2-4 short \`options\` the user can click (they can also type a custom answer). The answer returns as the tool result and you continue the same turn. Use this instead of guessing or asking in plain text.
 
 ## Snapshot legend
 
@@ -2340,7 +2627,7 @@ tools above. Refs are only valid for the most recent snapshot.
 ${appSpecificPlaybook(meta)}## Working style
 
 1. Read the user's request and locate the relevant ref(s) in the snapshot.
-2. If you are confident, call the tool. If not, ask a clarifying question.
+2. If you are confident, call the tool. If not, call **ask_user** with a concise question and 2-4 short options — do not guess on ambiguous or destructive requests.
 3. After acting, refresh the snapshot if the UI changed, then verify the
    result before reporting back.
 4. Never describe tool calls in chat text — call the tool directly.
@@ -2556,6 +2843,23 @@ ipcMain.handle('agent:ensure', (_event, meta) => {
 const activeChats = new Map();
 const chatAbortFlags = new Map();
 const chatRefMaps = new Map();
+const chatPendingAsks = new Map(); // exe -> { resolve } for an in-flight ask_user clarification
+
+// Suspend the tool loop until the renderer replies via chat:answer (or stop/reset
+// aborts). No socket is open while waiting, so the streamOneRound timeouts do not
+// apply — chat:stop / chat:reset MUST call resolvePendingAsk to unblock the loop.
+function waitForUserAnswer(exe) {
+  return new Promise((resolve) => {
+    const prior = chatPendingAsks.get(exe);
+    if (prior) prior.resolve({ aborted: true }); // replace any stale waiter
+    chatPendingAsks.set(exe, { resolve });
+  });
+}
+function resolvePendingAsk(exe, value) {
+  const p = chatPendingAsks.get(exe);
+  if (p) { chatPendingAsks.delete(exe); p.resolve(value); return true; }
+  return false;
+}
 
 const CDP_TOOLS = [
   { type: 'function', name: 'cdp_click', description: 'Click a DOM element by ref from the live snapshot table.', parameters: { type: 'object', properties: { ref: { type: 'string', description: 'Element ref like e12 from the snapshot table.' } }, required: ['ref'], additionalProperties: false } },
@@ -2564,6 +2868,7 @@ const CDP_TOOLS = [
   { type: 'function', name: 'cdp_get_tree', description: 'Re-inspect the DOM and return a fresh element snapshot table with new refs. Use after the UI changes. Optional region narrows the scope and slashes snapshot size.', parameters: { type: 'object', properties: { region: { type: 'string', description: 'Optional scope to narrow the snapshot. Discord-aware keys: "servers" (left rail), "channels" (channel sidebar), "composer" (message input area), "messages" (chat scroller). Or pass any CSS selector to scope manually. Omit for full document.' } }, additionalProperties: false } },
   { type: 'function', name: 'cdp_find', description: 'Search the live DOM for elements matching a substring (case-insensitive across text/aria-label/id/role) and return a small focused snapshot with new refs (f1..fN). Much cheaper than cdp_get_tree — prefer this when you know what you are looking for (e.g. "example-channel", "Send", "Direct Messages"). Returns up to 20 matches by default, max 50.', parameters: { type: 'object', properties: { query: { type: 'string', description: 'Substring to match against element text/aria-label/id/role. Case-insensitive.' }, limit: { type: 'integer', description: 'Max matches to return (1-50, default 20).' } }, required: ['query'], additionalProperties: false } },
   { type: 'function', name: 'cdp_get_messages', description: 'Discord-aware: return { currentUser, count, messages[] } for the last N visible chat messages. currentUser is the logged-in Discord username from the bottom-left panel (use it to filter "my last upload"-style requests by author). Each message has { id, author, time, text, images, reactions, reactionTotal }. Much cheaper than cdp_get_tree for content-reading tasks.', parameters: { type: 'object', properties: { limit: { type: 'integer', description: 'Number of most-recent messages to return (1-100, default 25).' } }, additionalProperties: false } },
+  { type: 'function', name: 'cdp_react', description: 'Discord-only: add an emoji reaction to a specific message in ONE atomic step. Pass message_id (the "id" field from cdp_get_messages, e.g. "chat-messages-<chan>-<msg>", or just the trailing message snowflake) and emoji (the name WITHOUT colons, e.g. "example-emoji-typo"). This is the ONLY reliable way to react: the per-message "Add Reaction" button is hover-only and never appears in cdp_get_tree/cdp_find snapshots, so cdp_click cannot reach it. The tool hovers the row at the CDP mouse layer, clicks Add Reaction, types the name into the picker search, clicks the first matching emoji, and verifies. Returns { ok, added, id, picked, me }. ok/added=true means the reaction is on the message. To react to N messages, get their ids from cdp_get_messages once, then call cdp_react once per id — do NOT cdp_get_tree between reactions.', parameters: { type: 'object', properties: { message_id: { type: 'string', description: 'Message id from cdp_get_messages "id" (full "chat-messages-..." id or the trailing numeric snowflake).' }, emoji: { type: 'string', description: 'Emoji name without colons, e.g. "example-emoji-typo", "fire", "thumbsup".' } }, required: ['message_id', 'emoji'], additionalProperties: false } },
   { type: 'function', name: 'cdp_scroll_to_message', description: 'Discord-aware: scroll the chat viewport so a specific message is centered in view. REQUIRED whenever the user asks you to "scroll to", "show me", "take me to", "jump to", or "find" a specific message — reading the DOM via cdp_get_messages does NOT move the viewport. Pass the full message id from cdp_get_messages (looks like "chat-messages-<channel>-<message>"). Returns { ok, id, top, visible } after a synchronous scrollIntoView, with a brief outline flash on the target.', parameters: { type: 'object', properties: { message_id: { type: 'string', description: 'Full DOM id of the message li (from cdp_get_messages "id" field), e.g. "chat-messages-000000000000000000-1374...". The trailing numeric message id alone is also accepted as a fallback.' } }, required: ['message_id'], additionalProperties: false } },
   { type: 'function', name: 'cdp_scroll', description: 'Generic scroll for any app. Auto-detects the largest scrollable container (or use `container` selector) and scrolls up/down/top/bottom. **Required for any "first / earliest / oldest / original" query on a lazy-loaded conversation (ChatGPT, Slack, etc.)** — the conversation is virtualized and the DOM only contains messages near the current scroll position, so cdp_find / cdp_get_tree see a partial view. Recipe: cdp_scroll("top") repeatedly until {atTop:true, heightChanged:false}, then cdp_find / cdp_get_tree to enumerate. For "latest / newest" use cdp_scroll("bottom") first. For Discord specifically, prefer cdp_scroll_messages (it knows Discord\'s message list selector). Returns {ok, direction, scrollTopBefore, scrollTopAfter, scrollHeightBefore, scrollHeightAfter, atTop, atBottom, heightChanged, topChanged, containerTag, containerClass}.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'], description: '"up" loads older content (most common for history dives), "down" newer, "top" jumps to the very top to force-load earliest history, "bottom" jumps to latest. Default "up".' }, pages: { type: 'integer', description: 'Viewport heights to scroll (1-50, default 3). Ignored for top/bottom.' }, container: { type: 'string', description: 'Optional CSS selector for the scroll container. Omit to auto-detect the largest visible scrollable on the page.' } }, additionalProperties: false } },
   { type: 'function', name: 'cdp_scroll_messages', description: 'Discord-aware: scroll the message list to load older/newer messages. Use this INSTEAD of asking the user to scroll. After scrolling, re-call cdp_get_messages to read the newly mounted rows. Returns { ok, direction, scrollTopBefore, scrollTopAfter, loadedMessages, loadedBefore, firstChanged, atTop, atBottom }. Loop: call cdp_scroll_messages("up", 3) → cdp_get_messages → check for target → repeat until found OR atTop is true (already at oldest message in channel).', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'], description: '"up" loads older messages (most common), "down" newer, "top" jumps to the very top to load earliest history, "bottom" jumps to latest. Default "up".' }, pages: { type: 'integer', description: 'How many viewport heights to scroll (1-20, default 3). Larger values cover more history per call but may overshoot a target. Ignored for top/bottom.' } }, additionalProperties: false } },
@@ -2580,10 +2885,14 @@ const UIA_TOOLS = [
   { type: 'function', name: 'uia_get_tree', description: 'Re-inspect the UIA tree and return a fresh element snapshot table with new refs. Use after the UI changes.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
 ];
 
+// Backend-agnostic. Available for every app (incl. read-only / no-backend) so the
+// model can pause and clarify instead of guessing or asking in plain prose.
+const ASK_USER_TOOL = { type: 'function', name: 'ask_user', description: 'Ask the user ONE clarifying question when the request is ambiguous, underspecified, or destructive/irreversible and you must confirm before acting. Provide 2-4 short suggested answers in `options`; the user can click one OR type a custom answer. Use this INSTEAD of guessing, and INSTEAD of replying with a question in plain text — a plain-text question ends your turn, but ask_user pauses, collects the answer, and lets you continue the same task. After the answer returns as the tool result, keep going. Do not use this for trivia you can resolve yourself from the live snapshot.', parameters: { type: 'object', properties: { question: { type: 'string', description: 'The single, concise question to ask the user.' }, options: { type: 'array', items: { type: 'string' }, description: '2-4 short suggested answers (each a few words). The user may still type a custom answer instead of picking one.' } }, required: ['question'], additionalProperties: false } };
+
 function toolsForBackend(backend) {
-  if (backend === 'cdp') return CDP_TOOLS;
-  if (backend === 'uia') return UIA_TOOLS;
-  return [];
+  if (backend === 'cdp') return [...CDP_TOOLS, ASK_USER_TOOL];
+  if (backend === 'uia') return [...UIA_TOOLS, ASK_USER_TOOL];
+  return [ASK_USER_TOOL];
 }
 
 async function executeTool(name, args, meta, refMapHolder) {
@@ -2652,6 +2961,11 @@ async function executeTool(name, args, meta, refMapHolder) {
     const currentUser = Array.isArray(parsed) ? '' : (parsed && parsed.currentUser) || '';
     const currentUserId = Array.isArray(parsed) ? '' : (parsed && parsed.currentUserId) || '';
     return { count: messages.length, currentUser, currentUserId, messages };
+  }
+  if (name === 'cdp_react') {
+    if (!args || !args.message_id) return { error: 'missing_message_id', hint: 'Pass message_id from cdp_get_messages "id".' };
+    if (!args.emoji) return { error: 'missing_emoji', hint: 'Pass the emoji name without colons, e.g. "example-emoji-typo".' };
+    return cdpReactReal(meta.port, args.message_id, args.emoji);
   }
   if (name === 'cdp_scroll_to_message') {
     const raw = await cdpEvalRaw(meta.port, buildScrollToMessageExpr(args.message_id));
@@ -2747,6 +3061,8 @@ ipcMain.handle('chat:reset', (_event, exe) => {
     req.destroy();
     activeChats.delete(exe);
   }
+  resolvePendingAsk(exe, { aborted: true }); // unblock a loop waiting on ask_user
+  chatLogSessions.delete(exe); // "New chat" → next message opens a fresh log file
 });
 
 ipcMain.handle('chat:stop', (_event, exe) => {
@@ -2757,6 +3073,15 @@ ipcMain.handle('chat:stop', (_event, exe) => {
     try { req.destroy(); } catch {}
     activeChats.delete(exe);
   }
+  resolvePendingAsk(exe, { aborted: true }); // unblock a loop waiting on ask_user
+  return { ok: true };
+});
+
+ipcMain.handle('chat:answer', (_event, payload) => {
+  const exe = payload && payload.exe;
+  if (!exe) return { ok: false };
+  const answer = String((payload && payload.answer) ?? '').slice(0, 2000);
+  resolvePendingAsk(exe, { answered: true, answer });
   return { ok: true };
 });
 
@@ -2839,7 +3164,7 @@ async function sendResponsesRequestWithRetry(opts, { retries = 3, baseDelayMs = 
   throw new Error('Exhausted retries');
 }
 
-async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, partial }) {
+async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, partial, reasoningSink }) {
   return new Promise((resolve, reject) => {
     if (res.statusCode === 401 || res.statusCode === 403) {
       let body = '';
@@ -2941,7 +3266,10 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
         t === 'response.reasoning.delta'
       ) {
         const delta = parsed.delta;
-        if (delta) sender.send('chat:thinking', { exe: meta.exe, delta, kind: 'reasoning' });
+        if (delta) {
+          if (reasoningSink) reasoningSink.text += delta;
+          sender.send('chat:thinking', { exe: meta.exe, delta, kind: 'reasoning' });
+        }
       } else if (
         t === 'response.reasoning_summary_part.added' ||
         t === 'response.reasoning_summary_text.added'
@@ -3014,6 +3342,7 @@ function synthesiseDoneReply(trail) {
     if (name === 'cdp_click' && r.ok) return 'Clicked. (ChatGPT did not send a closing message — the task may not be complete. Try regenerating.)';
     if (name === 'cdp_type' && r.ok) return 'Typed the text.';
     if (name === 'cdp_get_messages') return `Read ${r.count || 0} messages.`;
+    if (name === 'cdp_react') return r.added ? 'Added the reaction.' : 'Tried to react but could not confirm it landed.';
     if (name === 'cdp_get_text' && r.text !== undefined) return `Read text: ${String(r.text).slice(0, 200)}`;
     if (name === 'cdp_scroll_messages' && r.ok) return r.atTop ? 'Scrolled to the top of the channel history.' : 'Scrolled the message list.';
     if (name === 'cdp_scroll' && r.ok) {
@@ -3033,7 +3362,7 @@ function synthesiseDoneReply(trail) {
   return 'ChatGPT stopped without sending a reply. Try regenerating.';
 }
 
-ipcMain.handle('chat:send', async (event, payload) => {
+async function runChatSend(event, payload) {
   const { token, accountId, apiKey } = getCodexAuth();
   if (!token) throw new Error('Not logged in. Click "Login with ChatGPT" first.');
   const useDirectApi = !!apiKey;
@@ -3046,6 +3375,31 @@ ipcMain.handle('chat:send', async (event, payload) => {
   const exe = meta.exe;
   chatAbortFlags.delete(exe);
 
+  // Transcript logging (toggled in config.json). Start a new per-session file
+  // on a fresh conversation; otherwise append to the running session's file.
+  const cfg = chatLogger.loadConfig(debugLog);
+  let logSession = null;
+  if (cfg.logging.enabled) {
+    const priorTurns = messages.filter(m => m.role === 'user' || m.role === 'assistant').length;
+    const freshConvo = priorTurns <= 1;
+    logSession = chatLogSessions.get(exe) || null;
+    if (freshConvo || !logSession) {
+      logSession = chatLogger.startChatLogSession(
+        { key: appKey(exe), name: meta.name, pid: meta.pid, exe: meta.exe, type: meta.type },
+        cfg,
+        debugLog,
+      );
+      chatLogSessions.set(exe, logSession);
+    }
+  } else {
+    chatLogSessions.delete(exe);
+  }
+  let lastUserMsg = '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') { lastUserMsg = messages[i].content; break; }
+  }
+  const reasoningSink = { text: '' };
+
   const snap = await buildLiveSnapshot(meta);
   chatRefMaps.set(exe, snap.refMap);
   const refMapHolder = { current: snap.refMap };
@@ -3053,15 +3407,18 @@ ipcMain.handle('chat:send', async (event, payload) => {
   const scopeGuard = `You are an assistant scoped to a single running application: **${meta.name}** (pid ${meta.pid || 'unknown'}, exe \`${meta.exe}\`). You may only reason about this app and may only act on this app via the provided tools. If the user asks about anything else, briefly explain you are scoped to ${meta.name} and refuse.`;
   const agentBody = loadAgentForPrompt(meta);
   const toolGuide = snap.backend === 'cdp'
-    ? 'Tools available: cdp_click, cdp_type, cdp_paste, cdp_press_key, cdp_get_text, cdp_get_tree, cdp_find, cdp_get_messages, cdp_scroll_to_message, cdp_scroll_messages, cdp_scroll, cdp_get_search_results, cdp_jump_to_search_result. Use refs (e.g. e12 from cdp_get_tree, f1..fN from cdp_find) from the snapshot table when calling click/type/paste/get_text. Prefer cdp_find("name") for targeted lookups when you already know what you want to click (e.g. a server, channel, or button label) — it returns ~5-20 rows instead of 500. Use cdp_get_tree(region) with a Discord-aware region ("servers", "channels", "composer", "messages") or any CSS selector to narrow scope; reserve a no-arg cdp_get_tree() for cases where you truly need a full snapshot. After actions that change the DOM, call cdp_get_tree (or cdp_find) to refresh refs before continuing. For reading Discord message content (text, images, reactions) prefer cdp_get_messages — it returns structured data without a DOM snapshot. When the user asks you to scroll to / show / jump to / find a specific Discord message, you MUST call cdp_scroll_to_message after locating its id — reading the DOM does not move the viewport, and saying "done" without scrolling is a failure. For ANY app whose conversation is lazy-loaded (ChatGPT, Slack, web chats): any "first / earliest / oldest / original" or "latest / newest" query MUST start with cdp_scroll("top") or cdp_scroll("bottom") looped until {atTop:true, heightChanged:false} (or {atBottom:true, heightChanged:false}) before searching with cdp_find / cdp_get_tree — the virtualized DOM only contains messages near the current viewport. For text input: cdp_type is the fast JS path for plain inputs/textareas and the Discord message composer. For rich-text editors that ignore JS events (Discord channel-header SEARCH BAR, ChatGPT composer when it misbehaves, any DraftJS/Slate/Lexical/Quill editor), use cdp_paste — it focuses the element via real CDP mouse clicks and dispatches Input.insertText at CDP layer. Use cdp_press_key("Enter") to submit forms / searches and cdp_press_key("Escape") only to dismiss an overlay that is actively BLOCKING your next step — never as cleanup after you have surfaced the user\'s target. Escape closes the topmost layer, so it dismisses the lightbox / detail view / jumped-to result you just opened (the thing the user asked to see) instead of the harmless panel behind it. Once the target is visible, the task is done: reply, do not "tidy up". When a search-style task is feasible, USE THE APP\'S OWN SEARCH (server / channel / global search bar) instead of scrolling history — it is faster, more accurate, and the only way to reach content older than the loaded scrollback. For Discord specifically, after submitting a query in the channel-header search bar, you MUST read results via cdp_get_search_results (cdp_get_tree drops search-result rows from the snapshot because they are role="listitem") and you MUST navigate to a chosen result via cdp_jump_to_search_result(messageId) — never cdp_click on a search-result row child, the Jump button is hover-only and clicking inner divs/images opens the lightbox or does nothing, burning tool rounds. When a tool returns an error, a tool reports ok but the next snapshot shows no change, or you exhaust your normal recipe, do not silently give up — try an alternate path (a different selector, the search bar instead of scrolling, cdp_paste instead of cdp_type, etc.). If you genuinely cannot proceed, reply to the user with what you tried, what blocked you, and what you would try next — never report partial completion as success.'
+    ? 'Tools available: cdp_click, cdp_type, cdp_paste, cdp_press_key, cdp_get_text, cdp_get_tree, cdp_find, cdp_get_messages, cdp_scroll_to_message, cdp_scroll_messages, cdp_scroll, cdp_get_search_results, cdp_jump_to_search_result. Use refs (e.g. e12 from cdp_get_tree, f1..fN from cdp_find) from the snapshot table when calling click/type/paste/get_text. Prefer cdp_find("name") for targeted lookups when you already know what you want to click (e.g. a server, channel, or button label) — it returns ~5-20 rows instead of 500. Use cdp_get_tree(region) with a Discord-aware region ("servers", "channels", "composer", "messages") or any CSS selector to narrow scope; reserve a no-arg cdp_get_tree() for cases where you truly need a full snapshot. After actions that change the DOM, call cdp_get_tree (or cdp_find) to refresh refs before continuing. For reading Discord message content (text, images, reactions) prefer cdp_get_messages — it returns structured data without a DOM snapshot. To ADD an emoji reaction to a Discord message, you MUST use cdp_react(message_id, emoji) — the Add Reaction button is hover-only and never appears in a snapshot, so cdp_click/cdp_get_tree can NOT react. For "react X to the last N pictures/messages": call cdp_get_messages once, pick the N target ids (filter images for "pictures"), then call cdp_react once per id; do not snapshot between reactions. When the user asks you to scroll to / show / jump to / find a specific Discord message, you MUST call cdp_scroll_to_message after locating its id — reading the DOM does not move the viewport, and saying "done" without scrolling is a failure. For ANY app whose conversation is lazy-loaded (ChatGPT, Slack, web chats): any "first / earliest / oldest / original" or "latest / newest" query MUST start with cdp_scroll("top") or cdp_scroll("bottom") looped until {atTop:true, heightChanged:false} (or {atBottom:true, heightChanged:false}) before searching with cdp_find / cdp_get_tree — the virtualized DOM only contains messages near the current viewport. For text input: cdp_type is the fast JS path for plain inputs/textareas and the Discord message composer. For rich-text editors that ignore JS events (Discord channel-header SEARCH BAR, ChatGPT composer when it misbehaves, any DraftJS/Slate/Lexical/Quill editor), use cdp_paste — it focuses the element via real CDP mouse clicks and dispatches Input.insertText at CDP layer. Use cdp_press_key("Enter") to submit forms / searches and cdp_press_key("Escape") only to dismiss an overlay that is actively BLOCKING your next step — never as cleanup after you have surfaced the user\'s target. Escape closes the topmost layer, so it dismisses the lightbox / detail view / jumped-to result you just opened (the thing the user asked to see) instead of the harmless panel behind it. Once the target is visible, the task is done: reply, do not "tidy up". When a search-style task is feasible, USE THE APP\'S OWN SEARCH (server / channel / global search bar) instead of scrolling history — it is faster, more accurate, and the only way to reach content older than the loaded scrollback. For Discord specifically, after submitting a query in the channel-header search bar, you MUST read results via cdp_get_search_results (cdp_get_tree drops search-result rows from the snapshot because they are role="listitem") and you MUST navigate to a chosen result via cdp_jump_to_search_result(messageId) — never cdp_click on a search-result row child, the Jump button is hover-only and clicking inner divs/images opens the lightbox or does nothing, burning tool rounds. When a tool returns an error, a tool reports ok but the next snapshot shows no change, or you exhaust your normal recipe, do not silently give up — try an alternate path (a different selector, the search bar instead of scrolling, cdp_paste instead of cdp_type, etc.). If you genuinely cannot proceed, reply to the user with what you tried, what blocked you, and what you would try next — never report partial completion as success.'
     : snap.backend === 'uia'
       ? 'Tools available: uia_invoke, uia_set_value, uia_get_tree. Use refs (e.g. u47) from the snapshot table when calling them. After actions that change the UI, call uia_get_tree to refresh refs before continuing.'
       : 'No automation backend available for this app. You can only describe actions to the user in plain language.';
+
+  const clarifyGuide = `## Clarifying questions\n\nWhen a request is ambiguous, underspecified, or destructive/irreversible (e.g. "delete that", "send it" without a clear target, multiple plausible targets), call the **ask_user** tool instead of guessing or asking the question in plain text. Plain-text questions end your turn; ask_user pauses, collects the answer, and lets you continue the SAME task. Give a single concise \`question\` plus 2-4 short \`options\` the user can click — the user can also type a custom answer. The answer comes back as the tool result; proceed from there. Prefer acting on a confident interpretation when the snapshot makes the intent clear — reserve ask_user for genuine ambiguity, not trivia you can resolve yourself.`;
 
   const instructions = [
     scopeGuard,
     agentBody,
     `## Tool usage\n\n${toolGuide}`,
+    clarifyGuide,
     `## Live element snapshot (${new Date().toISOString()}, backend: ${snap.backend})\n\n${snap.text}`,
   ].join('\n\n');
 
@@ -3113,7 +3470,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
         { retries: 3, baseDelayMs: 1000, onRetry: notifyRetry },
       );
       mainPartial.text = '';
-      const { textContent, toolCalls } = await streamOneRound({ req, res, meta, sender: event.sender, partial: mainPartial });
+      const { textContent, toolCalls } = await streamOneRound({ req, res, meta, sender: event.sender, partial: mainPartial, reasoningSink });
       fullContent += textContent;
       mainPartial.text = '';
       lastRoundToolCount = toolCalls.length;
@@ -3125,6 +3482,32 @@ ipcMain.handle('chat:send', async (event, payload) => {
         try { parsedArgs = JSON.parse(tc.args || '{}'); } catch { parsedArgs = {}; }
         debugLog(`[tool] ${tc.name} ${JSON.stringify(parsedArgs)}`);
         event.sender.send('chat:tool', { exe, name: tc.name, args: parsedArgs });
+
+        // Clarification: suspend the loop, render a question card in the renderer,
+        // and resume this same turn once the user clicks a choice or types an answer.
+        if (tc.name === 'ask_user') {
+          const opts = Array.isArray(parsedArgs.options)
+            ? parsedArgs.options.slice(0, 4).map(o => String(o).replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 120)).filter(Boolean)
+            : [];
+          const question = String(parsedArgs.question || '').replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 1000);
+          event.sender.send('chat:ask', { exe, callId: tc.call_id, question, options: opts });
+          const ans = await Promise.race([
+            waitForUserAnswer(exe),
+            new Promise((r) => setTimeout(() => r({ timedOut: true }), 10 * 60_000)), // zombie guard
+          ]);
+          chatPendingAsks.delete(exe);
+          let askResult;
+          if (ans.aborted || chatAbortFlags.get(exe)) askResult = { aborted: true };
+          else if (ans.timedOut) askResult = { error: 'no_answer', hint: 'User did not answer in time. Proceed with a safe default or stop and explain what you need.' };
+          else askResult = { answer: ans.answer };
+          event.sender.send('chat:tool-result', { exe, name: tc.name, result: askResult });
+          turnTrail.push({ name: tc.name, args: parsedArgs, result: askResult, refInfo: null });
+          input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
+          input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(askResult) });
+          if (ans.aborted || chatAbortFlags.get(exe)) break; // exit toolCalls loop; round loop sees abort flag
+          continue;
+        }
+
         // Snapshot the target element BEFORE the call. cdp_get_tree / cdp_find
         // overwrite refMapHolder.current, so this is the only chance to capture
         // what the ref pointed to. Recipe generator uses this to write specific
@@ -3223,10 +3606,22 @@ ipcMain.handle('chat:send', async (event, payload) => {
     chatAbortFlags.delete(exe);
     activeChats.delete(exe);
     if (aborted) errorReason = 'Stopped by user';
+    if (logSession) {
+      chatLogger.logChatTurn(logSession, {
+        userMsg: lastUserMsg,
+        reasoning: reasoningSink.text,
+        reply: fullContent,
+        trail: turnTrail,
+        error: errorReason,
+        backend: snap.backend,
+      }, debugLog);
+    }
     event.sender.send('chat:done', { exe, error: errorReason, trail: turnTrail, content: fullContent });
   }
-  return { content: fullContent, error: errorReason, trail: turnTrail };
-});
+  return { content: fullContent, error: errorReason, trail: turnTrail, roundsUsed };
+}
+
+ipcMain.handle('chat:send', runChatSend);
 
 // ── Automations: per-app JSON recipes generated by Codex ──
 
@@ -3362,7 +3757,7 @@ function replyAdmitsFailure(reply) {
 function buildCodexPrompt({ meta, backend, userMsg, finalReply, trail }) {
   const toolList = backend === 'uia'
     ? '`uia_invoke`, `uia_set_value`, `uia_get_tree`'
-    : '`cdp_find`, `cdp_click`, `cdp_type`, `cdp_paste`, `cdp_press_key`, `cdp_get_text`, `cdp_get_tree`, `cdp_get_messages`, `cdp_scroll_to_message`, `cdp_scroll_messages`, `cdp_scroll`, `cdp_get_search_results`, `cdp_set_search_sort`, `cdp_jump_to_search_result`';
+    : '`cdp_find`, `cdp_click`, `cdp_type`, `cdp_paste`, `cdp_press_key`, `cdp_get_text`, `cdp_get_tree`, `cdp_get_messages`, `cdp_react`, `cdp_scroll_to_message`, `cdp_scroll_messages`, `cdp_scroll`, `cdp_get_search_results`, `cdp_set_search_sort`, `cdp_jump_to_search_result`';
   const refRule = backend === 'uia'
     ? 'Refs (u1, u47, ...) expire between UIA snapshots. Insert a `uia_get_tree` step before each `uia_invoke` / `uia_set_value` that needs a fresh ref, and reference the element by `automationId` or `name` in the args.'
     : 'Refs (e12, f3, ...) expire between snapshots. Replace ref-based clicks with a `cdp_find` step that captures the lookup, then reference `$<capture-name>.fN` in later steps. Prefer `cdp_find` over `cdp_get_tree` for targeted lookups.';
@@ -3392,7 +3787,7 @@ OUTPUT REQUIREMENTS
 - Each step shape: { "tool": "<name>", "args": { ... }, "capture"?: "<name>", "description": "<plain English>" }.
 - Allowed tools: ${toolList}.
 - ${refRule}
-- Drop redundant tool calls. The recipe should be the MINIMUM steps to accomplish the user's goal — skip retries, exploratory snapshots, and dead ends present in the trail.
+- Drop redundant tool calls. The recipe should be the MINIMUM steps to accomplish the user's goal — skip retries, exploratory snapshots, and dead ends present in the trail. (A lookup that LOCATED a destination the task must reach is NOT a dead end even when no click followed it — see PORTABILITY below.)
 - If the user asked to read or scroll to content, end the recipe with the relevant read/scroll step (e.g. cdp_get_messages, cdp_scroll_to_message, cdp_get_text).
 - Do NOT include any \`capture\` field on tools that don't produce ref maps (clicks, types, pastes, scrolls, key presses). Only \`cdp_find\` (and rarely \`cdp_get_tree\`) should be captured.
 
@@ -3413,13 +3808,22 @@ CHOOSING cdp_find QUERIES (load-bearing — most recipe failures come from gener
 - After a \`cdp_find\` returns multiple matches, look at the corresponding step's \`result_summary.matches\` table to choose the \`.fN\` whose label matches \`targetElement\`. If the original click landed on the second row, use \`.f2\`, not \`.f1\`.
 
 OTHER RULES
+- For \`cdp_react\` steps: set the \`emoji\` arg to \`result_summary.picked\` (the emoji Discord actually applied), NOT the \`emoji\` the trail step requested. The user often types an approximate name and the runtime fuzzy-matches it to the real custom-emoji name (requested "example-emoji-typo" → applied "example-emoji"). Hard-code the resolved \`picked\` value so the saved script targets the real emoji directly and never has to replay the fuzzy correction. When \`picked\` differs from the requested \`emoji\`, \`picked\` is authoritative — the requested name was a typo for it.
 - Never embed a literal newline (\\n) or carriage return inside a \`cdp_type\` / \`cdp_paste\` \`text\` argument to submit a form. Use a separate \`cdp_press_key\` step with \`{"key":"Enter"}\` after the typing step.
 - For rich-text editors (DraftJS / Slate / Lexical / contenteditable comboboxes — including Discord's channel-header search bar), use \`cdp_paste\` instead of \`cdp_type\`. \`cdp_type\` silently no-ops on these.
 - If the trail submitted a search and clicked a result row, emit the full search recipe: \`cdp_find\` → \`cdp_click\` (focus) → \`cdp_paste\` (query) → \`cdp_press_key("Enter")\` → \`cdp_find\` (result row) → \`cdp_click\`. Don't collapse it into a single click.
 - If the task required scrolling a lazy-loaded list to the top/bottom (any "first/earliest/oldest" or "latest/newest" query), include the \`cdp_scroll\` / \`cdp_scroll_messages\` loop step(s) — do not assume the target is in the initial DOM.
 
+PORTABILITY — the recipe must replay from a COLD START (load-bearing — the single most common reason a "correct" recipe fails on replay)
+- Replay starts from whatever state the app is in right now (some OTHER server / channel / DM / view / tab may be open from a previous task) — NOT the state the live run happened to start in. The live run often began with the target already on screen and so skipped the navigation to reach it. The recipe CANNOT rely on that; it has no idea where the app will be when it runs.
+- The recipe MUST include every navigation step needed to reach each destination the user's request names — server, channel, DM, thread, tab, view, panel — EVEN WHEN the trail performed no click to get there because that destination was already open/focused.
+- How to detect "already open" (the trail skipped a navigation the recipe still needs): the user's request names a destination, AND the trail contains a \`cdp_find\` / \`cdp_get_tree\` that LOCATED it — a row whose label/aria/href/text matches it (e.g. the channel's \`<a>\` link \`"<name> (text channel)"\`, or a \`"Message #<channel>"\` composer textbox, or a "<server> ... " treeitem) — but NO \`cdp_click\` navigated to it. That located element IS the navigation target you are missing.
+- When you detect this, EMIT the missing navigation: a \`cdp_find\` (query + \`.fN\` built from that lookup's \`result_summary.matches\` / \`targetElement\`, same rules as any click target above) → \`cdp_click\`. Place it in cold-start order: open server → open channel → scroll/read → act. Prefer the actual navigable element (the channel \`<a>\` link, the server treeitem) over a composer/header match.
+- This is NOT "inventing a step" (see below). The destination's identity is proven by a real lookup in the trail; you are only materializing the click that the pre-existing UI state made unnecessary. Inventing means emitting a step for a control the trail NEVER located. Materializing means adding the click for a target the trail DID locate but didn't need to click.
+- Worked example — user asked "go to the Example Community B server and go to #test, react to the last 10 pictures." Trail: \`cdp_find("Example Community B")\` → \`cdp_click\`(server) → \`cdp_find("test")\` returns the #test channel link AND a "Message #test" composer (so #test was already open — no click followed) → \`cdp_scroll_messages(bottom)\` → \`cdp_react\` ×10. The PORTABLE recipe inserts the channel open between the server open and the scroll: cdp_find(server)→cdp_click, cdp_find("test (text channel)")→cdp_click, cdp_scroll_messages(bottom), cdp_react×10. Without that inserted channel-open step the recipe reacts in whatever channel happens to be open at replay time.
+
 DO NOT INVENT STEPS (load-bearing — second-most common recipe failure)
-- The output recipe MUST be derived from the trail. Every emitted step must correspond to a tool call that actually fired in the trail. Do NOT add navigation steps that never happened — no "click next page", "go to page N", "scroll to load more", "click Jump" etc. unless those exact tool calls appear in the trail.
+- The output recipe MUST be derived from the trail. Every emitted step must correspond to a tool call that actually fired in the trail — WITH ONE NARROW EXCEPTION: navigation to a destination the user's request explicitly names, whose identity the trail LOCATED via a \`cdp_find\` / \`cdp_get_tree\` lookup but never clicked because it was already open (see PORTABILITY above). That click is supported by trail evidence (the lookup), so emitting it is materializing, not inventing. Do NOT add navigation steps that never happened — no "click next page", "go to page N", "scroll to load more", "click Jump" etc. — unless those exact tool calls appear in the trail. The forbidden case is a step targeting a control the trail NEVER located at all; the allowed case is the click for a destination the trail DID locate.
 - If a trail \`cdp_find\` returned \`result_summary.count: 0\`, treat that as a dead-end probe — do NOT emit it (and do NOT emit any downstream step that depended on its capture). The recipe should reflect what worked, not what the model tried and abandoned.
 - If the final assistant reply admits failure or partial completion ("couldn't", "wasn't clickable", "before the session ended", "had to stop", "ran out of rounds", "partial"), the task did NOT complete. Output an empty array \`[]\` — NEVER guess the missing steps. An empty recipe surfaces "this turn isn't replayable" cleanly; a fabricated recipe wastes the user's time and corrupts their automation library.
 
@@ -3448,7 +3852,7 @@ Produce the recipe now. Output the JSON ARRAY ONLY:`;
 function buildStepEditPrompt({ meta, backend, steps, index, instruction }) {
   const toolList = backend === 'uia'
     ? '`uia_invoke`, `uia_set_value`, `uia_get_tree`'
-    : '`cdp_find`, `cdp_click`, `cdp_type`, `cdp_paste`, `cdp_press_key`, `cdp_get_text`, `cdp_get_tree`, `cdp_get_messages`, `cdp_scroll_to_message`, `cdp_scroll_messages`, `cdp_scroll`, `cdp_get_search_results`, `cdp_set_search_sort`, `cdp_jump_to_search_result`';
+    : '`cdp_find`, `cdp_click`, `cdp_type`, `cdp_paste`, `cdp_press_key`, `cdp_get_text`, `cdp_get_tree`, `cdp_get_messages`, `cdp_react`, `cdp_scroll_to_message`, `cdp_scroll_messages`, `cdp_scroll`, `cdp_get_search_results`, `cdp_set_search_sort`, `cdp_jump_to_search_result`';
   const refRule = backend === 'uia'
     ? 'Refs (u1, u47, ...) expire between UIA snapshots. Insert a `uia_get_tree` step before each `uia_invoke` / `uia_set_value` that needs a fresh ref, and reference the element by `automationId` or `name` in the args.'
     : 'Refs (e12, f3, ...) expire between snapshots. Do not emit raw eN/fN refs. To act on an element, emit a `cdp_find` step that captures the lookup, then reference `$<capture-name>.fN` in the following step. To reuse an element a previous step already captured, reference its existing `$<capture-name>.fN`.';
@@ -3496,7 +3900,7 @@ Output the replacement step(s) as a JSON ARRAY only:`;
 function buildStepAddPrompt({ meta, backend, steps, index, instruction }) {
   const toolList = backend === 'uia'
     ? '`uia_invoke`, `uia_set_value`, `uia_get_tree`'
-    : '`cdp_find`, `cdp_click`, `cdp_type`, `cdp_paste`, `cdp_press_key`, `cdp_get_text`, `cdp_get_tree`, `cdp_get_messages`, `cdp_scroll_to_message`, `cdp_scroll_messages`, `cdp_scroll`, `cdp_get_search_results`, `cdp_set_search_sort`, `cdp_jump_to_search_result`';
+    : '`cdp_find`, `cdp_click`, `cdp_type`, `cdp_paste`, `cdp_press_key`, `cdp_get_text`, `cdp_get_tree`, `cdp_get_messages`, `cdp_react`, `cdp_scroll_to_message`, `cdp_scroll_messages`, `cdp_scroll`, `cdp_get_search_results`, `cdp_set_search_sort`, `cdp_jump_to_search_result`';
   const refRule = backend === 'uia'
     ? 'Refs (u1, u47, ...) expire between UIA snapshots. Insert a `uia_get_tree` step before each `uia_invoke` / `uia_set_value` that needs a fresh ref, and reference the element by `automationId` or `name` in the args.'
     : 'Refs (e12, f3, ...) expire between snapshots. Do not emit raw eN/fN refs. To act on an element, emit a `cdp_find` step that captures the lookup, then reference `$<capture-name>.fN` in the following step. To reuse an element a previous step already captured, reference its existing `$<capture-name>.fN`.';
@@ -3562,6 +3966,14 @@ function summariseResult(r) {
   if (Array.isArray(r.messages)) return { count: r.count, currentUser: r.currentUser, sample: r.messages.slice(0, 2).map(m => ({ id: m.id, author: m.author, text: (m.text || '').slice(0, 80) })) };
   if (Array.isArray(r.results)) return { sortMode: r.sortMode, totalCount: r.totalCount, pages: r.pages, count: r.count, sample: r.results.slice(0, 3).map(m => ({ messageId: m.messageId, author: m.author, time: m.time, text: (m.text || '').slice(0, 80), images: (m.images || []).length })) };
   if (r.text !== undefined) return { text: String(r.text).slice(0, 200) };
+  // cdp_react: `picked` is the emoji Discord actually applied, which differs
+  // from the requested `emoji` arg when the runtime fuzzy-matched an approximate
+  // name (user typed "example-emoji-typo"; the real custom emoji is "example-emoji").
+  // The recipe generator must bake `picked` into the saved step — see the
+  // cdp_react rule in buildCodexPrompt. Without this field the generator only
+  // sees the approximate arg, copies the typo, and the saved script depends on
+  // re-running the fuzzy correction at replay time.
+  if (r.picked !== undefined) return { ok: r.ok, emoji: r.emoji, picked: r.picked, added: r.added };
   if (r.ok !== undefined) return { ok: r.ok };
   return r;
 }
@@ -3859,7 +4271,7 @@ function resolveStepArgs(args, captures) {
           const refsInCap = Object.keys(refMap);
           if (refsInCap.length === 0) {
             const q = cap.query ? ` (query=${JSON.stringify(cap.query)})` : '';
-            throw new Error(`capture "${m[1]}" is empty${q} — the prior cdp_find matched 0 elements, so $${m[1]}.${m[2]} cannot be resolved. The recipe likely targets UI that doesn't exist in the current app state (e.g. an invented pagination control, or a search term that doesn't match the live DOM). Re-record this automation from a fresh successful chat turn.`);
+            throw new Error(`capture "${m[1]}" is empty${q} — the prior cdp_find matched 0 elements even after retrying for several seconds, so $${m[1]}.${m[2]} cannot be resolved. The element genuinely isn't in the live DOM (not just slow to render): the recipe likely targets UI that doesn't exist in the current app state (e.g. an invented pagination control, or a search term that doesn't match the live DOM). Re-record this automation from a fresh successful chat turn.`);
           }
           const avail = refsInCap.slice(0, 5).join(', ');
           throw new Error(`ref ${m[2]} not in capture "${m[1]}" (have: ${avail})`);
@@ -3872,6 +4284,39 @@ function resolveStepArgs(args, captures) {
   }
   return out;
 }
+
+// ── Script-execution settle/retry ──
+// Automation steps fire back-to-back, but after a navigation (switching a Discord
+// server/channel, opening a panel) the app re-renders its DOM ASYNCHRONOUSLY. A
+// cdp_find / cdp_click / cdp_react fired in the same tick can miss the element
+// that hasn't painted yet — historically producing "$capture is empty" (find
+// matched 0 → downstream click can't resolve its ref) and "ref_not_found". The
+// chat-driven model never hit this because each tool call is gated on a fresh LLM
+// turn (hundreds of ms of natural latency); the script runner has no such pause.
+//
+// Fix: re-run a step WHILE its result looks like "the element isn't there YET",
+// backing off until the UI catches up or the budget is exhausted. This is
+// timing-only — results meaning "it genuinely isn't there" (emoji_not_found,
+// unknown ref) are NOT retried, so a truly-broken recipe still fails fast.
+const STEP_RETRY_DELAYS_MS = [250, 500, 800, 1200, 1700, 2500]; // up to 6 retries after attempt 1 (~7s total)
+const TRANSIENT_STEP_ERRORS = new Set([
+  'ref_not_found', 'no_selector',                            // target not in the current snapshot yet
+  'message_not_found', 'message_zero_size', 'message_gone',  // message row not rendered yet
+  'react_button_not_found', 'react_button_hidden',           // hover toolbar not painted yet
+  'search_input_not_found', 'search_input_hidden',           // emoji picker popout still opening
+  'parse_failed',                                            // content (e.g. messages) not loaded yet
+]);
+
+// True when a step result means "not rendered YET" (worth waiting + retrying)
+// rather than "genuinely absent" (retrying can't fix it).
+function isTransientStepResult(tool, result) {
+  if (!result) return false;
+  if (tool === 'cdp_find') return (result.count || 0) === 0;
+  if (result.error) return TRANSIENT_STEP_ERRORS.has(result.error);
+  return false;
+}
+
+const stepSleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function executeAutomationStep(step, ctx) {
   const { meta, captures, refMapHolder } = ctx;
@@ -3890,7 +4335,22 @@ async function executeAutomationStep(step, ctx) {
     }
   }
 
-  const result = await executeTool(step.tool, args, meta, refMapHolder);
+  // Run the step, re-trying while the result looks like the target hasn't
+  // rendered yet (see STEP_RETRY_DELAYS_MS note above). On the last attempt we
+  // return whatever we got so the runner surfaces the real error.
+  let result;
+  for (let attempt = 0; ; attempt++) {
+    result = await executeTool(step.tool, args, meta, refMapHolder);
+    if (!isTransientStepResult(step.tool, result)) break;
+    if (attempt >= STEP_RETRY_DELAYS_MS.length) break; // budget exhausted
+    const waitMs = STEP_RETRY_DELAYS_MS[attempt];
+    const why = step.tool === 'cdp_find' ? 'count=0' : (result && result.error) || 'transient';
+    debugLog(`[automation retry] step ${step.tool} ${why}; waiting ${waitMs}ms for UI (attempt ${attempt + 1}/${STEP_RETRY_DELAYS_MS.length})`);
+    if (typeof ctx.onStepRetry === 'function') {
+      try { ctx.onStepRetry({ attempt: attempt + 1, waitMs, tool: step.tool }); } catch {}
+    }
+    await stepSleep(waitMs);
+  }
 
   if (step.capture) {
     // Find the refMap that this step produced. `cdp_find` and `cdp_get_tree`
@@ -3936,6 +4396,13 @@ ipcMain.handle('automation:run', async (event, payload) => {
   const runId = uniqueId();
   sender.send('automation:run-start', { runId, id, name: entry.name, total: entry.steps.length });
 
+  // Surface waiting-for-UI retries (see executeAutomationStep) on the current
+  // step's row so a slow navigation reads as "waiting…", not a stall.
+  ctx.currentStepIndex = 0;
+  ctx.onStepRetry = ({ attempt, waitMs, tool }) => {
+    sender.send('automation:run-step', { runId, i: ctx.currentStepIndex, name: tool, status: 'retry', attempt, waitMs });
+  };
+
   let stopped = false;
   const stopHandler = (_e, payload2) => {
     if (payload2 && payload2.runId === runId) stopped = true;
@@ -3950,6 +4417,7 @@ ipcMain.handle('automation:run', async (event, payload) => {
 
     for (let i = 0; i < entry.steps.length; i++) {
       if (stopped) { sender.send('automation:run-step', { runId, i, name: entry.steps[i].tool, status: 'stopped' }); break; }
+      ctx.currentStepIndex = i;
       const step = entry.steps[i];
       sender.send('automation:run-step', { runId, i, name: step.tool, args: step.args, status: 'start' });
       let result;
@@ -3979,7 +4447,81 @@ ipcMain.handle('automation:run', async (event, payload) => {
   }
 });
 
-app.whenReady().then(createWindow);
+// ── Headless inject entrypoint (loop convergence harness) ──
+// Watches loop/inject.json ({ appKey, prompt, ts? }); on change, runs the SAME
+// chat:send pipeline (runChatSend) with a no-op sender, then writes
+// loop/result.json ({ ok, rounds, toolCalls, finalReply, error? }).
+const LOOP_DIR = path.join(__dirname, '..', 'loop');
+const INJECT_PATH = path.join(LOOP_DIR, 'inject.json');
+const RESULT_PATH = path.join(LOOP_DIR, 'result.json');
+
+// Resolve meta from cdp-state.json (NOT the agent .md, which the loop deletes
+// for fresh state each iteration). Match by recomputing appKey(exe).
+function resolveInjectMeta(key) {
+  let state;
+  // cdp-state.json may carry a UTF-8 BOM when last written by the PowerShell
+  // toggler (Start-ElectronDebug.ps1) — strip it before JSON.parse.
+  try { state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8').replace(/^﻿/, '')); } catch { return null; }
+  const app = (state.apps || []).find(a => appKey(a.exe) === key);
+  if (!app) return null;
+  return { exe: app.exe, name: app.name || 'App', type: 'electron', pid: null, port: app.port };
+}
+
+let injectBusy = false;
+let lastInjectSig = '';
+async function handleInject() {
+  if (injectBusy) return;
+  let job;
+  try {
+    const raw = fs.readFileSync(INJECT_PATH, 'utf8');
+    if (!raw.trim()) return;
+    job = JSON.parse(raw);
+  } catch { return; }
+  if (!job || !job.appKey || !job.prompt) return;
+  const sig = JSON.stringify(job);
+  if (sig === lastInjectSig) return; // ignore unchanged re-fires (include a unique ts to re-run same prompt)
+  lastInjectSig = sig;
+  injectBusy = true;
+  const fakeSender = { send: () => {} };
+  let result;
+  try {
+    const meta = resolveInjectMeta(job.appKey);
+    if (!meta) throw new Error(`Cannot resolve meta for appKey "${job.appKey}" from cdp-state.json (no tracked app whose appKey matches).`);
+    try { ensureAgentFile(meta); } catch (e) { debugLog(`[inject] ensureAgentFile: ${e.message}`); }
+    debugLog(`[inject] start appKey=${job.appKey} port=${meta.port} prompt=${JSON.stringify(job.prompt).slice(0, 140)}`);
+    const r = await runChatSend(
+      { sender: fakeSender },
+      { meta, messages: [{ role: 'user', content: job.prompt }] },
+    );
+    result = {
+      ok: !r.error,
+      rounds: r.roundsUsed || 0,
+      toolCalls: (r.trail || []).map(t => ({ name: t.name, args: t.args, result: t.result })),
+      finalReply: r.content || '',
+      error: r.error || undefined,
+    };
+  } catch (err) {
+    result = { ok: false, rounds: 0, toolCalls: [], finalReply: '', error: String((err && err.message) || err) };
+  }
+  try {
+    fs.writeFileSync(RESULT_PATH, JSON.stringify(result, null, 2), 'utf8');
+    debugLog(`[inject] done ok=${result.ok} rounds=${result.rounds} tools=${result.toolCalls.length} err=${result.error || ''}`);
+  } catch (e) { debugLog(`[inject] result write failed: ${e.message}`); }
+  injectBusy = false;
+}
+
+function startInjectWatcher() {
+  try { fs.mkdirSync(LOOP_DIR, { recursive: true }); } catch {}
+  let t = null;
+  const schedule = () => { clearTimeout(t); t = setTimeout(handleInject, 200); };
+  try {
+    fs.watch(LOOP_DIR, (_ev, fname) => { if (!fname || fname === 'inject.json') schedule(); });
+  } catch (e) { debugLog(`[inject] fs.watch failed: ${e.message}`); }
+  fs.watchFile(INJECT_PATH, { interval: 500 }, () => schedule());
+  debugLog('[inject] watcher armed on ' + INJECT_PATH);
+}
+
+app.whenReady().then(() => { createWindow(); startInjectWatcher(); });
 
 app.on('window-all-closed', () => {
   app.quit();

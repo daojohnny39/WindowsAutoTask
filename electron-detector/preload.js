@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('chat', {
   send: (payload) => ipcRenderer.invoke('chat:send', payload),
   reset: (exe) => ipcRenderer.invoke('chat:reset', exe),
   stop: (exe) => ipcRenderer.invoke('chat:stop', exe),
+  answer: (payload) => ipcRenderer.invoke('chat:answer', payload),
   onChunk: (callback) => {
     ipcRenderer.on('chat:chunk', (_e, data) => callback(data));
   },
@@ -45,12 +46,16 @@ contextBridge.exposeInMainWorld('chat', {
   onThinking: (callback) => {
     ipcRenderer.on('chat:thinking', (_e, data) => callback(data));
   },
+  onAsk: (callback) => {
+    ipcRenderer.on('chat:ask', (_e, data) => callback(data));
+  },
   removeListeners: () => {
     ipcRenderer.removeAllListeners('chat:chunk');
     ipcRenderer.removeAllListeners('chat:done');
     ipcRenderer.removeAllListeners('chat:tool');
     ipcRenderer.removeAllListeners('chat:tool-result');
     ipcRenderer.removeAllListeners('chat:thinking');
+    ipcRenderer.removeAllListeners('chat:ask');
   },
 });
 

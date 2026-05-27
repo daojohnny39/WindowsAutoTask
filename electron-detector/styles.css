@@ -399,7 +399,7 @@ body {
 
 .app-card {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 14px;
   padding: 14px 18px;
@@ -425,6 +425,26 @@ body {
 .app-card:active { transform: scale(0.995); }
 .app-card.cdp-active { border-color: oklch(0.78 0.16 145 / 0.30); }
 .app-card.cdp-error  { border-color: oklch(0.68 0.20 25 / 0.35); background: var(--danger-soft); }
+
+.app-icon {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: 6px;
+  object-fit: contain;
+  image-rendering: -webkit-optimize-contrast;
+}
+.app-icon-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-muted);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-soft);
+  letter-spacing: 0;
+}
 
 .app-info {
   display: flex;
@@ -1186,6 +1206,94 @@ body {
   animation: chatFadeIn var(--dur-2) var(--ease-out);
 }
 
+/* Clarifying-question card (mid-turn ask_user) */
+.chat-clarify-card {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  margin: 2px 0;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border-strong);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--r-2);
+  animation: chatFadeIn var(--dur-2) var(--ease-out);
+}
+.chat-clarify-question {
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: var(--text-soft);
+  font-weight: 500;
+}
+.chat-clarify-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chat-clarify-chip {
+  padding: 6px 12px;
+  font-size: 12.5px;
+  font-family: inherit;
+  color: var(--text-soft);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-1);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out),
+              color var(--dur-1) var(--ease-out),
+              border-color var(--dur-1) var(--ease-out);
+}
+.chat-clarify-chip:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text-soft);
+}
+.chat-clarify-chip:disabled { cursor: default; opacity: 0.55; }
+.chat-clarify-chip.chosen {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-on);
+  opacity: 1;
+}
+.chat-clarify-custom {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.chat-clarify-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text-soft);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-1);
+  outline: none;
+  transition: border-color var(--dur-1) var(--ease-out);
+}
+.chat-clarify-input:focus { border-color: var(--accent); }
+.chat-clarify-input:disabled { opacity: 0.55; }
+.chat-clarify-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  color: var(--accent-on);
+  background: var(--accent);
+  border: none;
+  border-radius: var(--r-1);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out), opacity var(--dur-1) var(--ease-out);
+}
+.chat-clarify-send:hover:not(:disabled) { background: var(--accent-strong); }
+.chat-clarify-send:disabled { opacity: 0.4; cursor: default; }
+.chat-clarify-card.answered { border-left-color: var(--border-strong); opacity: 0.85; }
+
 /* Action row under assistant turn */
 .chat-actions {
   display: flex;
@@ -1426,6 +1534,7 @@ body {
 .auto-modal.show { display: flex; }
 
 .auto-modal-box {
+  position: relative;
   background: var(--bg-elev-1);
   border: 1px solid var(--border);
   border-radius: var(--r-3);
@@ -1577,6 +1686,7 @@ body {
 }
 
 .auto-modal-runlog {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -1589,6 +1699,52 @@ body {
   font-family: var(--font-mono);
   font-size: 11.5px;
   user-select: text;
+}
+
+/* Moving outline that tracks the step currently executing. A single element
+   slides between rows so it reads as one box gliding down the script. */
+.auto-modal-runlog-cursor {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  top: 0;
+  height: 0;
+  border: 1.5px solid var(--accent);
+  border-radius: var(--r-1);
+  background: oklch(0.72 0.13 245 / 0.06);
+  box-shadow: 0 0 0 1px oklch(0.72 0.13 245 / 0.12),
+              0 0 14px oklch(0.72 0.13 245 / 0.22);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 1;
+  transition: top var(--dur-3) var(--ease-out-2),
+              height var(--dur-3) var(--ease-out-2),
+              opacity var(--dur-2) var(--ease-out),
+              border-color var(--dur-2) var(--ease-out),
+              box-shadow var(--dur-2) var(--ease-out),
+              background var(--dur-2) var(--ease-out);
+}
+.auto-modal-runlog-cursor.visible { opacity: 1; }
+/* Gentle breathing pulse while a step is in flight */
+.auto-modal-runlog-cursor.running { animation: runCursorPulse 1.6s var(--ease-out) infinite; }
+.auto-modal-runlog-cursor.done {
+  border-color: var(--accent);
+  background: oklch(0.72 0.18 150 / 0.05);
+  box-shadow: 0 0 0 1px oklch(0.72 0.18 150 / 0.14);
+}
+.auto-modal-runlog-cursor.failed {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  box-shadow: 0 0 0 1px oklch(0.63 0.2 25 / 0.18),
+              0 0 14px oklch(0.63 0.2 25 / 0.22);
+  animation: none;
+}
+@keyframes runCursorPulse {
+  0%, 100% { box-shadow: 0 0 0 1px oklch(0.72 0.13 245 / 0.12), 0 0 10px oklch(0.72 0.13 245 / 0.16); }
+  50%      { box-shadow: 0 0 0 1px oklch(0.72 0.13 245 / 0.22), 0 0 18px oklch(0.72 0.13 245 / 0.34); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .auto-modal-runlog-cursor { transition: opacity var(--dur-2) var(--ease-out); animation: none; }
 }
 .auto-modal-runlog::-webkit-scrollbar { width: 6px; }
 .auto-modal-runlog::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -1606,6 +1762,108 @@ body {
 .auto-modal-runlog-status.error { color: var(--danger); }
 .auto-modal-runlog-status.stopped { color: var(--warning); }
 .auto-modal-runlog-detail { color: var(--text-soft); overflow: hidden; text-overflow: ellipsis; }
+
+.auto-modal-runlog-row {
+  position: relative;
+  z-index: 2;
+  border-radius: var(--r-1);
+  padding: 3px 6px;
+  transition: color var(--dur-2) var(--ease-out);
+}
+.auto-modal-runlog-row.active .auto-modal-runlog-name { color: var(--accent); }
+.auto-modal-runlog-row.active .auto-modal-runlog-detail,
+.auto-modal-runlog-row.active .auto-modal-runlog-idx { color: var(--text); }
+.auto-modal-runlog-row.is-done { opacity: 0.78; }
+
+/* ── Run completion overlay ── */
+.run-complete {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: oklch(0.18 0.02 250 / 0.55);
+  backdrop-filter: blur(3px);
+  z-index: 5;
+}
+.run-complete.show {
+  display: flex;
+  animation: scrimFade var(--dur-2) var(--ease-out);
+}
+.run-complete-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 28px 36px 26px;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  box-shadow: 0 18px 50px oklch(0 0 0 / 0.45);
+  animation: runCompletePop var(--dur-3) var(--ease-out-2) both;
+}
+.run-complete-badge {
+  width: 64px;
+  height: 64px;
+  display: grid;
+  place-items: center;
+}
+.run-complete-check { width: 64px; height: 64px; }
+.run-complete-ring {
+  stroke: var(--accent);
+  stroke-width: 3;
+  stroke-dasharray: 151;
+  stroke-dashoffset: 151;
+  animation: runRingDraw 0.5s var(--ease-out) 0.05s forwards;
+}
+.run-complete-mark {
+  stroke: var(--accent);
+  stroke-width: 4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: 60;
+  stroke-dashoffset: 60;
+}
+.run-complete-mark-fail { display: none; }
+.run-complete.show .run-complete-mark-ok {
+  animation: runMarkDraw 0.32s var(--ease-out) 0.42s forwards;
+}
+/* Failure variant */
+.run-complete.failed .run-complete-ring { stroke: var(--danger); }
+.run-complete.failed .run-complete-mark-ok { display: none; }
+.run-complete.failed .run-complete-mark-fail {
+  display: block;
+  stroke: var(--danger);
+}
+.run-complete.failed.show .run-complete-mark-fail {
+  animation: runMarkDraw 0.34s var(--ease-out) 0.42s forwards;
+}
+.run-complete-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+.run-complete.failed .run-complete-title { color: var(--danger); }
+.run-complete-sub {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  text-align: center;
+  max-width: 320px;
+  margin-bottom: 4px;
+}
+.run-complete-card .ghost-btn { margin-top: 2px; }
+
+@keyframes runCompletePop {
+  from { opacity: 0; transform: scale(0.9) translateY(8px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes runRingDraw  { to { stroke-dashoffset: 0; } }
+@keyframes runMarkDraw  { to { stroke-dashoffset: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .run-complete-ring,
+  .run-complete-mark { animation: none !important; stroke-dashoffset: 0; }
+  .run-complete-card { animation: none; }
+}
 
 .auto-modal-foot {
   display: flex;
