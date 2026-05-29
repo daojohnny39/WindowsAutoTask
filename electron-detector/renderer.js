@@ -813,10 +813,178 @@ async function openChat(appName, exe) {
   switchPage('chat');
   renderChat();
   chatInput.focus();
+  refreshWindowPicker(meta);
   try { await window.agent.ensure(meta); } catch (err) { console.error('agent:ensure', err); }
 }
 
 chatBackBtn.addEventListener('click', () => switchPage('workspace'));
+
+// ── Window picker (multi-window apps, e.g. several Chrome windows) ──
+// Surfaces above the composer ONLY when the open chat is scoped to an Electron
+// app with live CDP that currently exposes more than one window/tab. Picking a
+// window calls chat:select-window, which sets the same per-port active target
+// the model's cdp_select_window tool uses — so every snapshot/click/type after
+// the choice acts on the window the user picked.
+const windowPicker      = document.getElementById('chat-window-picker');
+const cwpTrigger        = document.getElementById('cwp-trigger');
+const cwpTriggerLabel   = document.getElementById('cwp-trigger-label');
+const cwpTriggerMeta    = document.getElementById('cwp-trigger-meta');
+const cwpPanel          = document.getElementById('cwp-panel');
+const cwpPanelTitle     = document.getElementById('cwp-panel-title');
+const cwpRefresh        = document.getElementById('cwp-refresh');
+const cwpList           = document.getElementById('cwp-list');
+
+let cwpMeta             = null;   // meta of the app the picker is bound to
+let cwpWindows         = [];     // [{index, id, title, url, active}]
+let cwpActiveId        = null;   // id of the currently selected window
+let cwpOpen            = false;
+let cwpBusy            = false;
+let cwpToken           = 0;       // invalidates stale async loads on app switch
+
+const CWP_CHECK_SVG = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+
+function hostFromUrl(u) {
+  try { return new URL(u).host || ''; } catch { return ''; }
+}
+
+function hideWindowPicker() {
+  closeWindowPanel();
+  windowPicker.hidden = true;
+  windowPicker.classList.remove('intro');
+  cwpMeta = null;
+  cwpWindows = [];
+  cwpActiveId = null;
+}
+
+// Pull the live window list for `meta` and show/hide the picker accordingly.
+async function refreshWindowPicker(meta, { fromRefreshBtn = false } = {}) {
+  // Only meaningful for an Electron app with CDP alive.
+  if (!meta || meta.type !== 'electron' || !meta.port) { hideWindowPicker(); return; }
+  const myToken = ++cwpToken;
+  cwpMeta = meta;
+  if (fromRefreshBtn) cwpRefresh.classList.add('spinning');
+  try {
+    const res = await window.chat.listWindows(meta.port);
+    if (myToken !== cwpToken) return; // user switched apps mid-flight
+    const windows = (res && Array.isArray(res.windows)) ? res.windows : [];
+    // One (or zero) window → nothing to pick; keep the composer uncluttered.
+    if (windows.length < 2) { hideWindowPicker(); return; }
+    cwpWindows = windows;
+    const active = (res && res.active) || windows.find(w => w.active) || null;
+    cwpActiveId = active ? active.id : (cwpActiveId || windows[0].id);
+    const wasHidden = windowPicker.hidden;
+    windowPicker.hidden = false;
+    if (wasHidden) {
+      windowPicker.classList.remove('intro');
+      void windowPicker.offsetWidth; // restart the entrance animation
+      windowPicker.classList.add('intro');
+    }
+    renderWindowPicker();
+  } catch (err) {
+    console.warn('window picker list failed', err);
+    if (myToken === cwpToken) hideWindowPicker();
+  } finally {
+    if (myToken === cwpToken) cwpRefresh.classList.remove('spinning');
+  }
+}
+
+function renderWindowPicker() {
+  const active = cwpWindows.find(w => w.id === cwpActiveId) || cwpWindows[0] || null;
+  if (active) {
+    const host = hostFromUrl(active.url);
+    cwpTriggerLabel.textContent = active.title || host || 'Untitled window';
+    cwpTriggerMeta.textContent = host && host !== (active.title || '') ? host : '';
+  } else {
+    cwpTriggerLabel.textContent = 'Select a window';
+    cwpTriggerMeta.textContent = '';
+  }
+  const n = cwpWindows.length;
+  cwpPanelTitle.textContent = `${n} open window${n === 1 ? '' : 's'}`;
+
+  if (n === 0) {
+    cwpList.innerHTML = `<div class="cwp-empty">No open windows detected.</div>`;
+    return;
+  }
+  cwpList.innerHTML = cwpWindows.map((w, i) => {
+    const selected = w.id === cwpActiveId;
+    const host = hostFromUrl(w.url);
+    const title = w.title || host || 'Untitled window';
+    const tabs = w.tabCount > 1 ? `${w.tabCount} tabs` : '';
+    const sub = [host, tabs].filter(Boolean).join(' · ');
+    return `
+      <button class="cwp-row${selected ? ' selected' : ''}" type="button" role="option"
+              aria-selected="${selected}" data-id="${escapeHtml(w.id)}" style="--row-i:${i}">
+        <span class="cwp-row-dot"></span>
+        <span class="cwp-row-body">
+          <span class="cwp-row-title">${escapeHtml(title)}</span>
+          ${sub ? `<span class="cwp-row-url">${escapeHtml(sub)}</span>` : ''}
+        </span>
+        <span class="cwp-row-check">${selected ? CWP_CHECK_SVG : ''}</span>
+      </button>`;
+  }).join('');
+}
+
+function openWindowPanel() {
+  if (cwpOpen) return;
+  cwpOpen = true;
+  windowPicker.classList.add('open');
+  cwpTrigger.setAttribute('aria-expanded', 'true');
+  // Refresh the list in the background — windows may have opened/closed since
+  // the panel was last populated. The open animation runs immediately.
+  if (cwpMeta) refreshWindowPicker(cwpMeta);
+}
+
+function closeWindowPanel() {
+  if (!cwpOpen) return;
+  cwpOpen = false;
+  windowPicker.classList.remove('open');
+  cwpTrigger.setAttribute('aria-expanded', 'false');
+}
+
+cwpTrigger.addEventListener('click', (e) => {
+  e.stopPropagation();
+  cwpOpen ? closeWindowPanel() : openWindowPanel();
+});
+
+cwpRefresh.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (cwpMeta) refreshWindowPicker(cwpMeta, { fromRefreshBtn: true });
+});
+
+cwpList.addEventListener('click', async (e) => {
+  const row = e.target.closest('.cwp-row');
+  if (!row || cwpBusy) return;
+  const id = row.dataset.id;
+  if (!id || !cwpMeta || !cwpMeta.port) return;
+  if (id === cwpActiveId) { closeWindowPanel(); return; }
+  cwpBusy = true;
+  const prev = cwpActiveId;
+  cwpActiveId = id;             // optimistic — reflect the choice instantly
+  renderWindowPicker();
+  closeWindowPanel();
+  try {
+    const res = await window.chat.selectWindow({ port: cwpMeta.port, id });
+    if (!res || res.error) {
+      cwpActiveId = prev;        // roll back; the window likely closed
+      renderWindowPicker();
+      refreshWindowPicker(cwpMeta);
+    }
+  } catch (err) {
+    console.warn('window picker select failed', err);
+    cwpActiveId = prev;
+    renderWindowPicker();
+  } finally {
+    cwpBusy = false;
+  }
+});
+
+// Close the panel on an outside click or Escape.
+document.addEventListener('click', (e) => {
+  if (cwpOpen && !windowPicker.contains(e.target)) closeWindowPanel();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && cwpOpen) { e.stopPropagation(); closeWindowPanel(); }
+});
 
 chatNewBtn.addEventListener('click', () => {
   if (!chatCurrentExe) return;
@@ -849,9 +1017,29 @@ function renderChat() {
   scrollChatToBottom();
 }
 
+// User text may carry inline tab references as `[tab:<id> "<title>"]` tokens
+// (inserted via the /tab pill). Show them as read-only pills in the sent bubble;
+// the stored content keeps the raw token so the model and logs see the tab id.
+function renderUserContent(content) {
+  const esc = escapeHtml(content == null ? '' : String(content));
+  // escapeHtml (textContent→innerHTML) escapes & < > but NOT ", so the quotes in
+  // the serialised [tab:id "title"] token survive as literal " — match those.
+  return esc.replace(/\[tab:([^\s\]]+)\s+(?:&quot;|")([\s\S]*?)(?:&quot;|")\]/g, (_, id, title) => {
+    const label = (title && title.trim()) || id;
+    return `<span class="chat-tab-pill chat-tab-pill-static" title="${title}">`
+      + `<span class="chat-tab-pill-icon">${TAB_GLYPH_SVG}</span>`
+      + `<span class="chat-tab-pill-label">${label}</span></span>`;
+  }).replace(/\[file:([a-f0-9-]+)\s+(?:&quot;|")([\s\S]*?)(?:&quot;|")\]/g, (_, id, fileName) => {
+    const label = fileName || 'file';
+    return `<span class="chat-file-pill chat-file-pill-static" title="${label}">`
+      + `<span class="chat-file-pill-icon">${FILE_GLYPH_SVG}</span>`
+      + `<span class="chat-file-pill-label">${label}</span></span>`;
+  });
+}
+
 function renderTurn(m, i) {
   if (m.role === 'user') {
-    return `<div class="chat-msg chat-msg-user">${escapeHtml(m.content)}</div>`;
+    return `<div class="chat-msg chat-msg-user">${renderUserContent(m.content)}</div>`;
   }
   if (m.role === 'assistant') {
     let reasoning = '';
@@ -1017,8 +1205,10 @@ const CHAT_STOP_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="cu
 
 function setChatBusy(state) {
   chatBusy = state;
-  chatInput.disabled = state;
+  chatInput.contentEditable = state ? 'false' : 'true';
+  chatInput.classList.toggle('is-disabled', state);
   if (state) {
+    closeTabMenu();
     chatSendBtn.disabled = false;
     chatSendBtn.classList.add('is-stop');
     chatSendBtn.title = 'Stop';
@@ -1293,12 +1483,16 @@ window.chat.onDone((data) => {
 });
 
 async function sendChatMessage(forcedText) {
-  const text = forcedText !== undefined ? forcedText : chatInput.value.trim();
+  const text = forcedText !== undefined ? forcedText : serializeChatInput().trim();
   if (!text || chatBusy) return;
 
+  // Extract file attachments before clearing the input
+  let fileAttachments = [];
   if (forcedText === undefined) {
-    chatInput.value = '';
-    chatInput.style.height = 'auto';
+    const filePills = chatInput.querySelectorAll('.chat-file-pill');
+    fileAttachments = [...filePills].map(p => ({ type: 'file', id: p.dataset.fileId })).filter(a => a.id);
+    closeTabMenu();
+    clearChatInput();
   }
   addChatMessage('user', text);
   lastUserMessage = text;
@@ -1320,7 +1514,7 @@ async function sendChatMessage(forcedText) {
     .map(m => ({ role: m.role, content: m.content }));
 
   try {
-    await window.chat.send({ meta, messages: apiMessages });
+    await window.chat.send({ meta, messages: apiMessages, attachments: fileAttachments });
   } catch (err) {
     hideThinking();
     const streamMsg = document.getElementById('chat-stream-msg');
@@ -1341,6 +1535,66 @@ chatSendBtn.addEventListener('click', () => {
 });
 
 chatInput.addEventListener('keydown', (e) => {
+  // A pill is contentEditable=false; Chromium often won't delete it on Backspace/
+  // Delete. Remove an adjacent pill ourselves so the key works as expected.
+  if ((e.key === 'Backspace' || e.key === 'Delete')) {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount && sel.isCollapsed) {
+      const range = sel.getRangeAt(0);
+      const pill = e.key === 'Backspace' ? pillBeforeCaret(range) : pillAfterCaret(range);
+      if (pill) {
+        e.preventDefault();
+        const newRange = document.createRange();
+        newRange.setStartBefore(pill);
+        newRange.collapse(true);
+        pill.remove();
+        // If nothing meaningful is left, reset so the :empty placeholder returns.
+        if (!chatInput.querySelector('.chat-tab-pill, .chat-file-pill') && chatInput.textContent.trim() === '') {
+          chatInput.innerHTML = '';
+          chatInput.focus();
+        } else {
+          sel.removeAllRanges();
+          sel.addRange(newRange);
+        }
+        evaluateTabTrigger();
+        return;
+      }
+    }
+  }
+  // /file command: Space or Tab after `/file` opens the native file picker.
+  if ((e.key === ' ' || e.key === 'Tab') && !chatBusy) {
+    const ctx = getSlashContext();
+    if (ctx && shouldOfferFilePicker(ctx)) {
+      e.preventDefault();
+      openFilePicker(ctx);
+      return;
+    }
+  }
+  // While the /tab menu is open, hijack navigation keys.
+  if (tabMenuState !== 'closed' && tabMenuItems.length) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      tabMenuActiveIdx = Math.min(tabMenuItems.length - 1, tabMenuActiveIdx + 1);
+      renderTabMenu();
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      tabMenuActiveIdx = Math.max(0, tabMenuActiveIdx - 1);
+      renderTabMenu();
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      pickTab(tabMenuActiveIdx);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeTabMenu();
+      return;
+    }
+  }
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     if (!chatBusy) sendChatMessage();
@@ -1359,9 +1613,436 @@ async function stopChatMessage() {
 }
 
 chatInput.addEventListener('input', () => {
-  chatInput.style.height = 'auto';
-  chatInput.style.height = Math.min(chatInput.scrollHeight, 180) + 'px';
+  // contenteditable grows on its own (CSS max-height + scroll). Drop any stray
+  // <br> left behind when the field is emptied so the :empty placeholder shows.
+  if (chatInput.textContent === '' && chatInput.querySelector('br')) chatInput.innerHTML = '';
+  evaluateTabTrigger();
 });
+
+// ── `/tab` mention: reference Chrome tabs inline as pills ──────────────────────
+// Typing `/tab` (in a CDP/Chrome chat) pops an animated dropdown of the selected
+// window's tabs. Picking one drops an inline pill into the composer. On send the
+// pill serialises to `[tab:<targetId> "<title>"]` — the model resolves it via
+// cdp_select_window({id}), and the logged user message carries the tab id.
+const tabMenuEl     = document.getElementById('chat-tab-menu');
+const tabMenuListEl = document.getElementById('chat-tab-menu-list');
+
+let tabMenuState     = 'closed';   // 'closed' | 'loading' | 'open'
+let tabMenuItems     = [];
+let tabMenuActiveIdx = 0;
+let activeTrigger    = null;        // { node, slashOffset, caretOffset }
+let tabMenuToken     = 0;
+
+const TAB_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"></rect><path d="M2 9h20"></path><path d="M6 6.5h.01M9 6.5h.01"></path></svg>';
+
+const FILE_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>';
+
+// Serialise the composer to plain text, turning pills into [tab:id "title"] tokens
+// and contenteditable's per-line <div> wrappers back into newlines.
+function serializeChatInput() {
+  let out = '';
+  const walk = (parent) => {
+    parent.childNodes.forEach((n) => {
+      if (n.nodeType === Node.TEXT_NODE) {
+        out += n.nodeValue;
+      } else if (n.nodeType === Node.ELEMENT_NODE) {
+        if (n.classList && n.classList.contains('chat-tab-pill')) {
+          const id = n.dataset.tabId || '';
+          const title = (n.dataset.tabTitle || '').replace(/"/g, "'");
+          out += `[tab:${id} "${title}"]`;
+        } else if (n.classList && n.classList.contains('chat-file-pill')) {
+          const id = n.dataset.fileId || '';
+          const name = (n.dataset.fileName || '').replace(/"/g, "'");
+          out += `[file:${id} "${name}"]`;
+        } else if (n.tagName === 'BR') {
+          out += '\n';
+        } else if (n.tagName === 'DIV' || n.tagName === 'P') {
+          if (out && !out.endsWith('\n')) out += '\n';
+          walk(n);
+        } else {
+          walk(n);
+        }
+      }
+    });
+  };
+  walk(chatInput);
+  return out;
+}
+
+function clearChatInput() {
+  chatInput.innerHTML = '';
+}
+
+// Is the caret sitting right after a `/tab`-style slash token? Returns its text
+// node + offsets so we can later splice in a pill.
+function getSlashContext() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  const node = range.startContainer;
+  if (node.nodeType !== Node.TEXT_NODE || !chatInput.contains(node)) return null;
+  const before = node.nodeValue.slice(0, range.startOffset);
+  const m = /(^|\s)\/([a-zA-Z]*)$/.exec(before);
+  if (!m) return null;
+  const query = m[2].toLowerCase();
+  return { node, query, slashOffset: range.startOffset - query.length - 1, caretOffset: range.startOffset };
+}
+
+function shouldOfferTabMenu(ctx) {
+  const q = ctx.query;
+  if (!(q.length >= 1 && ('tab'.startsWith(q) || q.startsWith('tab')))) return false;
+  const meta = chatMetaStore[chatCurrentExe];
+  return !!(meta && meta.type === 'electron' && meta.port);
+}
+
+function shouldOfferFilePicker(ctx) {
+  return ctx.query === 'file';
+}
+
+function evaluateTabTrigger() {
+  if (chatBusy) { if (tabMenuState !== 'closed') closeTabMenu(); return; }
+  const ctx = getSlashContext();
+  if (ctx && shouldOfferTabMenu(ctx)) {
+    if (tabMenuState === 'closed') {
+      openTabMenu(ctx);
+    } else {
+      activeTrigger = ctx;
+      if (tabMenuState === 'open') positionTabMenu();
+    }
+  } else if (tabMenuState !== 'closed') {
+    closeTabMenu();
+  }
+}
+
+async function openTabMenu(ctx) {
+  const meta = chatMetaStore[chatCurrentExe];
+  if (!meta || meta.type !== 'electron' || !meta.port) return;
+  tabMenuState = 'loading';
+  activeTrigger = ctx;
+  const myToken = ++tabMenuToken;
+  let tabs = [];
+  try {
+    const res = await window.chat.listTabs(meta.port);
+    tabs = (res && Array.isArray(res.tabs)) ? res.tabs : [];
+  } catch { tabs = []; }
+  if (myToken !== tabMenuToken || !activeTrigger) return; // closed / superseded mid-fetch
+  if (!tabs.length) { closeTabMenu(); return; }
+  tabMenuItems = tabs;
+  tabMenuActiveIdx = tabs.findIndex(t => t.active);
+  if (tabMenuActiveIdx < 0) tabMenuActiveIdx = 0;
+  renderTabMenu();
+  tabMenuEl.hidden = false;
+  tabMenuState = 'open';
+  positionTabMenu();
+}
+
+function closeTabMenu() {
+  tabMenuState = 'closed';
+  tabMenuToken++;          // invalidate any in-flight fetch
+  tabMenuEl.hidden = true;
+  tabMenuItems = [];
+  activeTrigger = null;
+}
+
+function renderTabMenu() {
+  if (!tabMenuItems.length) {
+    tabMenuListEl.innerHTML = `<div class="chat-tab-menu-empty">No open tabs in this window.</div>`;
+    return;
+  }
+  tabMenuListEl.innerHTML = tabMenuItems.map((t, i) => {
+    const host = hostFromUrl(t.url);
+    const title = t.title || host || 'Untitled tab';
+    return `
+      <button type="button" role="option" class="chat-tab-row${i === tabMenuActiveIdx ? ' active' : ''}"
+              data-i="${i}" aria-selected="${i === tabMenuActiveIdx}">
+        <span class="chat-tab-row-icon">${TAB_GLYPH_SVG}</span>
+        <span class="chat-tab-row-body">
+          <span class="chat-tab-row-title">${escapeHtml(title)}</span>
+          ${host ? `<span class="chat-tab-row-url">${escapeHtml(host)}</span>` : ''}
+        </span>
+      </button>`;
+  }).join('');
+  const activeRow = tabMenuListEl.querySelector('.chat-tab-row.active');
+  if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
+}
+
+// Anchor the menu just above the caret line, inside the composer wrap.
+function positionTabMenu() {
+  const wrap = chatInput.closest('.chat-input-wrap');
+  if (!wrap) return;
+  const wrapRect = wrap.getBoundingClientRect();
+  let caretRect = null;
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount) {
+    const rects = sel.getRangeAt(0).getClientRects();
+    if (rects.length) caretRect = rects[rects.length - 1];
+  }
+  if (!caretRect || (!caretRect.width && !caretRect.height)) caretRect = chatInput.getBoundingClientRect();
+  const left = Math.max(8, Math.min(caretRect.left - wrapRect.left, wrapRect.width - 16));
+  tabMenuEl.style.left = left + 'px';
+  tabMenuEl.style.bottom = (wrapRect.bottom - caretRect.top + 6) + 'px';
+  tabMenuEl.style.top = 'auto';
+}
+
+function buildTabPill(tab) {
+  const span = document.createElement('span');
+  span.className = 'chat-tab-pill';
+  span.contentEditable = 'false';
+  span.dataset.tabId = tab.id || '';
+  span.dataset.tabTitle = tab.title || '';
+  span.dataset.tabUrl = tab.url || '';
+  const label = (tab.title || hostFromUrl(tab.url) || 'tab').trim();
+  span.title = label + (tab.url ? ` — ${tab.url}` : '');
+  const icon = document.createElement('span');
+  icon.className = 'chat-tab-pill-icon';
+  icon.innerHTML = TAB_GLYPH_SVG;
+  const text = document.createElement('span');
+  text.className = 'chat-tab-pill-label';
+  text.textContent = label;
+  span.appendChild(icon);
+  span.appendChild(text);
+  return span;
+}
+
+function pickTab(i) {
+  const tab = tabMenuItems[i];
+  if (tab) replaceTriggerWithPill(tab);
+}
+
+function isTabPill(n) {
+  return n && n.nodeType === Node.ELEMENT_NODE && n.classList && n.classList.contains('chat-tab-pill');
+}
+function isAnyPill(n) {
+  return n && n.nodeType === Node.ELEMENT_NODE && n.classList &&
+    (n.classList.contains('chat-tab-pill') || n.classList.contains('chat-file-pill'));
+}
+const isEmptyText = (n) => n && n.nodeType === Node.TEXT_NODE && n.nodeValue === '';
+
+// The pill immediately before the (collapsed) caret, if any — skipping empty
+// text nodes contenteditable leaves behind around inline non-editable spans.
+function pillBeforeCaret(range) {
+  const { startContainer: node, startOffset: off } = range;
+  let prev;
+  if (node.nodeType === Node.TEXT_NODE) {
+    if (off > 0) return null;               // real chars sit before the caret
+    prev = node.previousSibling;
+  } else {
+    if (off === 0) return null;
+    prev = node.childNodes[off - 1];
+  }
+  while (isEmptyText(prev)) prev = prev.previousSibling;
+  return isAnyPill(prev) ? prev : null;
+}
+
+// The pill immediately after the caret, for forward-delete.
+function pillAfterCaret(range) {
+  const { startContainer: node, startOffset: off } = range;
+  let next;
+  if (node.nodeType === Node.TEXT_NODE) {
+    if (off < node.nodeValue.length) return null;
+    next = node.nextSibling;
+  } else {
+    next = node.childNodes[off];
+  }
+  while (isEmptyText(next)) next = next.nextSibling;
+  return isAnyPill(next) ? next : null;
+}
+
+// Splice the slash token (e.g. "/tab") out of its text node and drop a pill in
+// its place, leaving the caret after a trailing space.
+function replaceTriggerWithPill(tab) {
+  const ctx = activeTrigger;
+  closeTabMenu();
+  if (!ctx || !chatInput.contains(ctx.node) || ctx.node.nodeType !== Node.TEXT_NODE) return;
+  const { node, slashOffset, caretOffset } = ctx;
+  const full = node.nodeValue;
+  const parent = node.parentNode;
+
+  const beforeNode = document.createTextNode(full.slice(0, slashOffset));
+  const pill = buildTabPill(tab);
+  const spaceNode = document.createTextNode(' ');
+  const afterNode = document.createTextNode(full.slice(caretOffset));
+
+  parent.insertBefore(beforeNode, node);
+  parent.insertBefore(pill, node);
+  parent.insertBefore(spaceNode, node);
+  parent.insertBefore(afterNode, node);
+  parent.removeChild(node);
+
+  const sel = window.getSelection();
+  const range = document.createRange();
+  range.setStart(spaceNode, spaceNode.length);
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+  chatInput.focus();
+}
+
+// Click a row (mousedown so the editor keeps focus/caret).
+tabMenuListEl.addEventListener('mousedown', (e) => {
+  const row = e.target.closest('.chat-tab-row');
+  if (!row) return;
+  e.preventDefault();
+  pickTab(parseInt(row.dataset.i, 10));
+});
+tabMenuListEl.addEventListener('mousemove', (e) => {
+  const row = e.target.closest('.chat-tab-row');
+  if (!row) return;
+  const i = parseInt(row.dataset.i, 10);
+  if (i !== tabMenuActiveIdx) { tabMenuActiveIdx = i; renderTabMenu(); }
+});
+
+// Caret moved away from the token (arrows, click) → re-evaluate / close.
+document.addEventListener('selectionchange', () => {
+  if (tabMenuState === 'closed' || document.activeElement !== chatInput) return;
+  const ctx = getSlashContext();
+  if (!ctx || !shouldOfferTabMenu(ctx)) { closeTabMenu(); return; }
+  activeTrigger = ctx;
+  if (tabMenuState === 'open') positionTabMenu();
+});
+
+// Click outside the menu and editor → close.
+document.addEventListener('mousedown', (e) => {
+  if (tabMenuState === 'closed') return;
+  if (tabMenuEl.contains(e.target) || chatInput.contains(e.target)) return;
+  closeTabMenu();
+});
+
+// ── `/file` command: attach local files as inline pills ──────────────────────
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+let filePickerOpen = false;
+
+async function openFilePicker(ctx) {
+  if (filePickerOpen) return;
+  filePickerOpen = true;
+  // Save context for race-condition guard
+  const savedNode = ctx.node;
+  const savedText = ctx.node.nodeValue;
+  try {
+    const res = await window.chat.pickFile();
+    // Back-compat: old shape returned array directly.
+    const files = Array.isArray(res) ? res : (res && res.files) || [];
+    const skipped = (res && res.skipped) || [];
+    const canceled = !!(res && res.canceled);
+
+    if (canceled) {
+      if (chatInput.contains(savedNode) && savedNode.nodeValue === savedText) {
+        removeSlashToken(ctx);
+      }
+      chatInput.focus();
+      return;
+    }
+
+    if (skipped.length) {
+      const summary = skipped.map(s => `${s.name}: ${s.reason}`).join('; ');
+      showStatus(`${skipped.length} file${skipped.length === 1 ? '' : 's'} skipped — ${summary}`, 'error');
+      setTimeout(hideStatus, 6000);
+    }
+
+    if (!files.length) {
+      // Nothing accepted — strip /file text so user can retry.
+      if (chatInput.contains(savedNode) && savedNode.nodeValue === savedText) {
+        removeSlashToken(ctx);
+      }
+      chatInput.focus();
+      return;
+    }
+
+    // Focus the editor so caret-based inserts have a valid selection.
+    chatInput.focus();
+    // Insert pills
+    let isFirst = true;
+    for (const file of files) {
+      if (isFirst && chatInput.contains(savedNode) && savedNode.nodeValue === savedText) {
+        replaceTriggerWithFilePill(ctx, file);
+        isFirst = false;
+      } else {
+        insertFilePillAtCaret(file);
+      }
+    }
+  } catch (err) {
+    showStatus(`File picker failed: ${err && err.message ? err.message : err}`, 'error');
+    setTimeout(hideStatus, 6000);
+  } finally {
+    filePickerOpen = false;
+  }
+}
+
+function removeSlashToken(ctx) {
+  if (!ctx || !chatInput.contains(ctx.node)) return;
+  const { node, slashOffset, caretOffset } = ctx;
+  const full = node.nodeValue;
+  node.nodeValue = full.slice(0, slashOffset) + full.slice(caretOffset);
+}
+
+function buildFilePill(file) {
+  const span = document.createElement('span');
+  span.className = 'chat-file-pill';
+  span.contentEditable = 'false';
+  span.dataset.fileId = file.id;
+  span.dataset.fileName = file.name;
+  span.title = `${file.name} (${formatBytes(file.size)})`;
+  const icon = document.createElement('span');
+  icon.className = 'chat-file-pill-icon';
+  icon.innerHTML = FILE_GLYPH_SVG;
+  const text = document.createElement('span');
+  text.className = 'chat-file-pill-label';
+  text.textContent = file.name;
+  span.appendChild(icon);
+  span.appendChild(text);
+  return span;
+}
+
+function replaceTriggerWithFilePill(ctx, file) {
+  const { node, slashOffset, caretOffset } = ctx;
+  const full = node.nodeValue || '';
+  const before = full.slice(0, slashOffset);
+  const after = full.slice(caretOffset);
+  const pill = buildFilePill(file);
+  const parent = node.parentNode;
+  if (before) {
+    const pre = document.createTextNode(before);
+    parent.insertBefore(pre, node);
+  }
+  parent.insertBefore(pill, node);
+  const trailing = document.createTextNode(after ? ' ' + after : ' ');
+  parent.insertBefore(trailing, node);
+  parent.removeChild(node);
+  // Place caret after trailing space
+  const sel = window.getSelection();
+  const range = document.createRange();
+  range.setStart(trailing, 1);
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+function insertFilePillAtCaret(file) {
+  const pill = buildFilePill(file);
+  const trailing = document.createTextNode(' ');
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) {
+    chatInput.appendChild(pill);
+    chatInput.appendChild(trailing);
+    return;
+  }
+  const range = sel.getRangeAt(0);
+  range.deleteContents();
+  range.insertNode(trailing);
+  range.insertNode(pill);
+  // Move caret after trailing space
+  const newRange = document.createRange();
+  newRange.setStartAfter(trailing);
+  newRange.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(newRange);
+}
 
 // ── Markdown renderer (kept from prior, ChatGPT-style code chrome) ──
 const katex = window.katex;
@@ -1571,6 +2252,9 @@ const AUTO_TOOLS_CDP = new Set([
   'cdp_get_search_results', 'cdp_set_search_sort', 'cdp_jump_to_search_result',
 ]);
 const AUTO_TOOLS_UIA = new Set(['uia_invoke', 'uia_set_value', 'uia_get_tree']);
+// Tools whose message_id must be a live ref ($cap.…) or index — never a baked
+// snowflake. Mirrors main.js MESSAGE_ID_TOOLS.
+const MSG_ID_TOOLS = new Set(['cdp_react', 'cdp_scroll_to_message', 'cdp_jump_to_search_result']);
 
 function backendFor(meta) {
   if (!meta) return null;
@@ -1644,6 +2328,18 @@ function validateRecipeClient(steps, backend) {
     if (s.args !== undefined && (typeof s.args !== 'object' || s.args === null || Array.isArray(s.args))) return `Step ${i + 1} "args" must be an object.`;
     if (s.capture !== undefined && typeof s.capture !== 'string') return `Step ${i + 1} "capture" must be text.`;
     if (s.description !== undefined && typeof s.description !== 'string') return `Step ${i + 1} "description" must be text.`;
+    if (s.forEach !== undefined) {
+      const fe = s.forEach;
+      if (!fe || typeof fe !== 'object' || Array.isArray(fe)) return `Step ${i + 1} "forEach" must be an object.`;
+      if (typeof fe.from !== 'string' || !fe.from) return `Step ${i + 1} "forEach.from" must name a prior capture.`;
+      if (!MSG_ID_TOOLS.has(s.tool)) return `Step ${i + 1} "forEach" is only valid on ${[...MSG_ID_TOOLS].join('/')}.`;
+    }
+    if (MSG_ID_TOOLS.has(s.tool) && s.args && typeof s.args.message_id === 'string') {
+      const mid = s.args.message_id.trim();
+      if (mid && mid[0] !== '$' && /\d{17,}/.test(mid)) {
+        return `Step ${i + 1} (${s.tool}) has a hard-coded message id. Reference a live message instead — e.g. "$msgs.images.last", or a "forEach" on the step. (Capture a cdp_get_messages step as "msgs" first.)`;
+      }
+    }
   }
   return null;
 }
@@ -2268,7 +2964,9 @@ window.automation.onRunStep((data) => {
   const detail = data.status === 'error'
     ? `error: ${data.error || ''}`
     : data.status === 'retry'
-      ? `waiting for UI to update… (retry ${data.attempt || 1})`
+      ? (data.forEach
+          ? `${data.attempt || 0} of ${data.total || '?'} done…`
+          : `waiting for UI to update… (retry ${data.attempt || 1})`)
       : data.status === 'ok' && data.result
         ? summariseResult(data.result)
         : summariseArgs(data.args || {});

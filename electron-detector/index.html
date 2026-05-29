@@ -137,8 +137,36 @@
       </div>
     </div>
     <div class="chat-composer">
+      <div class="chat-window-picker" id="chat-window-picker" hidden>
+        <button class="cwp-trigger" id="cwp-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+          <span class="cwp-trigger-icon">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"></rect><path d="M2 9h20"></path><path d="M6 6.5h.01M9 6.5h.01"></path></svg>
+          </span>
+          <span class="cwp-trigger-text">
+            <span class="cwp-trigger-label" id="cwp-trigger-label">Active window</span>
+            <span class="cwp-trigger-meta" id="cwp-trigger-meta"></span>
+          </span>
+          <svg class="cwp-chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+        </button>
+        <div class="cwp-panel" id="cwp-panel" role="listbox" aria-label="Open windows">
+          <div class="cwp-panel-head">
+            <span class="cwp-panel-title" id="cwp-panel-title">Open windows</span>
+            <button class="cwp-refresh" id="cwp-refresh" type="button" title="Refresh window list" aria-label="Refresh window list">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15A9 9 0 1 1 18 6.36L23 11"></path></svg>
+            </button>
+          </div>
+          <div class="cwp-list" id="cwp-list"></div>
+        </div>
+      </div>
       <div class="chat-input-wrap">
-        <textarea class="chat-input" id="chat-input" placeholder="Send a message…" rows="1"></textarea>
+        <div class="chat-tab-menu" id="chat-tab-menu" hidden role="listbox" aria-label="Reference a tab">
+          <div class="chat-tab-menu-head">
+            <span class="chat-tab-menu-title">Reference a tab</span>
+          </div>
+          <div class="chat-tab-menu-list" id="chat-tab-menu-list"></div>
+        </div>
+        <div class="chat-input" id="chat-input" contenteditable="true" role="textbox"
+             aria-multiline="true" data-placeholder="Send a message…"></div>
         <button class="chat-send-btn" id="chat-send-btn" title="Send (Enter)">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M5 12h14M13 6l6 6-6 6"></path>

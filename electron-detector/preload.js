@@ -31,6 +31,10 @@ contextBridge.exposeInMainWorld('chat', {
   reset: (exe) => ipcRenderer.invoke('chat:reset', exe),
   stop: (exe) => ipcRenderer.invoke('chat:stop', exe),
   answer: (payload) => ipcRenderer.invoke('chat:answer', payload),
+  listWindows: (port) => ipcRenderer.invoke('chat:list-windows', port),
+  selectWindow: (payload) => ipcRenderer.invoke('chat:select-window', payload),
+  listTabs: (port) => ipcRenderer.invoke('chat:list-tabs', port),
+  pickFile: () => ipcRenderer.invoke('chat:pick-file'),
   onChunk: (callback) => {
     ipcRenderer.on('chat:chunk', (_e, data) => callback(data));
   },
