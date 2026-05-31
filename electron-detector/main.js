@@ -4018,13 +4018,41 @@ than the currently active in-app tab.
 - **"What pages do you see?"** → \`cdp_get_tree("nav")\` → list every
   \`role="treeitem"\` (skip the \`sidebar-tab-*\` nav buttons). Group
   by section if the user asks for a breakdown.
-- **"Open page X"** → \`cdp_find("X")\` scoped to the treeitem label,
-  then \`cdp_click\` the matching ref. If the page is nested inside a
-  collapsed group, click the group's "Open" toggle first, re-fetch the
-  tree, then click the page.
+- **"Open page X"** — PREFERRED: call
+  \`cdp_open_notion_page\` with the page id (32 hex chars, with or
+  without hyphens). This bypasses the sidebar entirely and works
+  even when the sidebar is collapsed or off-screen. Sidebar treeitem
+  clicking is a fallback only.
+
+  **Known page ids in this workspace** (use these directly — do NOT
+  search the sidebar for them):
+  - \`TEST TASKLIST\` → \`00000000000000000000000000000000\`
+  - \`TEST CALENDAR\` → \`00000000000000000000000000000000\`
+
+  Fallback for unknown pages: \`cdp_find("X")\` scoped to the treeitem
+  label, then \`cdp_click\` the matching ref. If the page is nested
+  inside a collapsed group, click the group's "Open" toggle first,
+  re-fetch the tree, then click the page.
+
+- **NEVER call \`ask_user\` for a page name that is one of the known
+  ids above.** The sidebar render truncates titles (e.g. "EST
+  TASKLIST" instead of "TEST TASKLIST") because of column width — that
+  is NOT a different page. Use the known page id directly via
+  \`cdp_open_notion_page\` and skip the sidebar entirely.
 - **"What's on this page?"** → \`cdp_get_tree("main")\` or
   \`cdp_get_tree("[role='main']")\` for the editor body. Avoid an
   unscoped \`cdp_get_tree\` — Notion's full DOM is huge.
+- **Task lists / to-do blocks** — PREFERRED:
+  \`notion_tasklist_read\` returns every row in display order with
+  \`{rowId, content, checked, displayIndex}\`. Use this to count tasks,
+  find the first unchecked, find by text, etc. — instead of
+  \`cdp_get_tree\` + manual ref discovery. Then act with
+  \`notion_task_toggle({rowId, checked})\` to check or uncheck a
+  specific row. \`checked\` is optional; omit to flip the current
+  state. These two cover P3 "count tasks", P4 "first unchecked, check
+  it off", P9 "checked vs unchecked ratio", P19 "check every task due
+  this week", etc. Do NOT cdp_click a checkbox ref — refs are
+  positional and easy to misread; rowId is stable.
 
 ### Anti-patterns — do not do these
 
@@ -4438,6 +4466,9 @@ const CDP_TOOLS = [
   { type: 'function', name: 'cdp_list_windows', description: 'List EVERY open browser window/tab this app exposes over CDP (one row per page target), not just the one you are currently looking at. Returns { count, active, windows:[{ index, id, title, url, active }] }. REQUIRED to answer "what windows/tabs do you see", "how many windows are open", or any request that spans more than the active window — a normal snapshot (cdp_get_tree/cdp_find) only sees the single active page, so without this you will wrongly report just one window. For a browser like Chrome this enumerates windows across ALL open profiles in the same browser session. After listing, switch to a specific one with cdp_select_window before reading/acting on it.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { type: 'function', name: 'cdp_select_window', description: 'Bind all subsequent snapshot/click/type/scroll tools to a specific open window/tab. Pass either `index` (the integer from cdp_list_windows) or `id` (the target id). Until you call this, the tools operate on the first page target. Call cdp_list_windows first to see the choices, select one, then cdp_get_tree to snapshot it. Returns { ok, active:{ index, id, title, url } }. Use when the user refers to a different window/profile than the one currently in view, or when iterating over every window (select index 0, read; select index 1, read; …).', parameters: { type: 'object', properties: { index: { type: 'integer', description: 'Zero-based index from cdp_list_windows.windows[].index.' }, id: { type: 'string', description: 'Target id from cdp_list_windows.windows[].id. Use this OR index.' } }, additionalProperties: false } },
   { type: 'function', name: 'cdp_click', description: 'Click a DOM element by ref from the live snapshot table.', parameters: { type: 'object', properties: { ref: { type: 'string', description: 'Element ref like e12 from the snapshot table.' } }, required: ['ref'], additionalProperties: false } },
+  { type: 'function', name: 'cdp_open_notion_page', description: 'Navigate the active Notion window directly to a page by Notion page id. Use this in preference to clicking sidebar entries — it works even when the sidebar is collapsed.', parameters: { type: 'object', properties: { pageId: { type: 'string', description: 'Notion page id, 32 hex chars (with or without hyphens)' } }, required: ['pageId'], additionalProperties: false } },
+  { type: 'function', name: 'notion_tasklist_read', description: 'Read the task list on the currently-open Notion page. Returns the rows in display order with structured fields: { rowId, content, checked, displayIndex }. Use this instead of cdp_get_tree + manual ref discovery when the user asks to count tasks, find a task by text, or identify which tasks are checked/unchecked. Works on both to_do-block pages and database task tables.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
+  { type: 'function', name: 'notion_task_toggle', description: 'Toggle (or set) the checked state of a specific Notion task row by Notion row id. Reliably dispatches a real React click on the checkbox of that row — works for both inline to_do blocks and database task rows. If `checked` is omitted, the current state is flipped. Prefer this over cdp_click on a ref when the user asks to check/uncheck a specific task — refs are positional and easy to misread, row ids are stable.', parameters: { type: 'object', properties: { rowId: { type: 'string', description: 'Notion row id, 32 hex (with or without hyphens), from notion_tasklist_read.rowId' }, checked: { type: 'boolean', description: 'Optional target state. Omit to flip current state.' } }, required: ['rowId'], additionalProperties: false } },
   { type: 'function', name: 'cdp_type', description: 'Focus an input/textarea/contenteditable by ref and set its text.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' } }, required: ['ref', 'text'], additionalProperties: false } },
   { type: 'function', name: 'cdp_get_text', description: 'Return textContent (or value) of a DOM element by ref. Use to read what is currently displayed.', parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'], additionalProperties: false } },
   { type: 'function', name: 'cdp_get_tree', description: 'Re-inspect the DOM and return a fresh element snapshot table with new refs. Use after the UI changes. Optional region narrows the scope and slashes snapshot size.', parameters: { type: 'object', properties: { region: { type: 'string', description: 'Optional scope to narrow the snapshot. Discord-aware keys: "servers" (left rail), "channels" (channel sidebar), "composer" (message input area), "messages" (chat scroller). Or pass any CSS selector to scope manually. Omit for full document.' } }, additionalProperties: false } },
@@ -4631,6 +4662,196 @@ async function executeTool(name, args, meta, refMapHolder) {
     if (r.error) return r;
     if (!r.selector) return { error: 'no_selector', hint: 'This ref has no CSS selector — UI may have changed.' };
     return cdpClickReal(meta.port, r.selector);
+  }
+  if (name === 'cdp_open_notion_page') {
+    const rawId = (args && typeof args.pageId === 'string') ? args.pageId.trim() : '';
+    if (!rawId) return { error: 'missing_pageId', hint: 'Pass pageId — 32 hex chars (with or without hyphens).' };
+    const noHy = rawId.replace(/-/g, '').toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(noHy)) return { error: 'bad_pageId', hint: 'pageId must be 32 hex chars (dashed UUID or unhyphenated).' };
+    const target = `https://www.notion.so/${noHy}`;
+    const setExpr = `(function(){try{window.location.href=${JSON.stringify(target)};return JSON.stringify({ok:true,started:true});}catch(e){return JSON.stringify({ok:false,error:String(e && e.message || e)});}})()`;
+    const readExpr = `(function(){try{var path=(location && location.pathname)||'';var hash=(location && location.hash)||'';var url=(location && location.href)||'';var idl=${JSON.stringify(noHy)};var inPath=path.toLowerCase().replace(/-/g,'').indexOf(idl)>=0;var inHash=hash.toLowerCase().replace(/-/g,'').indexOf(idl)>=0;var inUrl=url.toLowerCase().replace(/-/g,'').indexOf(idl)>=0;var blockMatch=false;try{var root=document.querySelector('[data-block-id]');if(root){var bid=(root.getAttribute('data-block-id')||'').replace(/-/g,'').toLowerCase();if(bid && bid.indexOf(idl)===0)blockMatch=true;}}catch(_){}var hits=[];try{var ms=document.querySelectorAll('[data-block-id]');for(var i=0;i<ms.length && i<5;i++){hits.push((ms[i].getAttribute('data-block-id')||'').replace(/-/g,'').toLowerCase().slice(0,12));}}catch(_){}return JSON.stringify({ok:(inPath||inHash||inUrl||blockMatch),pageId:idl,finalUrl:url,inPath:inPath,inHash:inHash,inUrl:inUrl,blockMatch:blockMatch,sampleBlockIds:hits});}catch(e){return JSON.stringify({ok:false,error:String(e && e.message || e)});}})()`;
+    try {
+      const setRawRaw = await cdpEvalRaw(meta.port, setExpr);
+      let setRaw = setRawRaw;
+      if (typeof setRaw === 'string' && setRaw.startsWith('"') && setRaw.endsWith('"')) {
+        try { setRaw = JSON.parse(setRaw); } catch {}
+      }
+      let setPayload = null;
+      try { setPayload = JSON.parse(setRaw); } catch {}
+      if (!setPayload || !setPayload.ok) {
+        return { ok: false, error: 'nav_set_failed', raw: String(setRawRaw).slice(0, 200) };
+      }
+      const deadline = Date.now() + 6000;
+      let last = null;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 300));
+        try {
+          const readRawRaw = await cdpEvalRaw(meta.port, readExpr);
+          let readRaw = readRawRaw;
+          if (typeof readRaw === 'string' && readRaw.startsWith('"') && readRaw.endsWith('"')) {
+            try { readRaw = JSON.parse(readRaw); } catch {}
+          }
+          last = JSON.parse(readRaw);
+          if (last && last.ok) return last;
+        } catch (_) { /* keep polling */ }
+      }
+      return { ok: false, error: 'nav_timeout', last: last || null };
+    } catch (e) {
+      return { ok: false, error: String(e && e.message || e) };
+    }
+  }
+  if (name === 'notion_tasklist_read') {
+    const listExpr = `(function(){
+      function clean(s){return String(s||'').replace(/[\\u0000-\\u001F\\u007F-\\u009F]/g,'').replace(/\\s+/g,' ').trim();}
+      function norm(id){return String(id||'').replace(/-/g,'').toLowerCase();}
+      var todoEls=Array.from(document.querySelectorAll('.notion-to_do-block[data-block-id]'));
+      var byId={};
+      todoEls.forEach(function(el){
+        var id=el.getAttribute('data-block-id');if(!id)return;
+        var t=clean(el.textContent||'');
+        var hasInput=!!el.querySelector('input[type="checkbox"]');
+        var r=el.getBoundingClientRect?el.getBoundingClientRect():null;
+        var rect=r&&r.height>0;
+        if(!byId[id]||(byId[id].txt===''&&(t||hasInput))||(rect&&!byId[id].rect)){
+          byId[id]={el:el,txt:t,rect:rect};
+        }
+      });
+      var rows=[];var seen={};
+      todoEls.forEach(function(el){
+        var id=el.getAttribute('data-block-id');if(!id||seen[id])return;seen[id]=true;rows.push(byId[id].el);
+      });
+      // database table fallback
+      if(rows.length===0){
+        var selectors=['.notion-table-view .notion-collection-item','.notion-list-view .notion-collection-item','.notion-collection-view .notion-table-row','.notion-collection-item','.notion-list-item'];
+        for(var si=0;si<selectors.length&&rows.length===0;si++){
+          rows=Array.from(document.querySelectorAll(selectors[si]));
+        }
+      }
+      var out=[];
+      rows.forEach(function(row,idx){
+        var rid=row.getAttribute&&row.getAttribute('data-block-id');
+        if(!rid){var inner=row.querySelector('[data-block-id]');if(inner)rid=inner.getAttribute('data-block-id');}
+        var content='';
+        try{
+          var titleEl=row.querySelector('.notion-table-cell-title')||row.querySelector('.notion-list-item-title')||row.querySelector('[class*="title"]');
+          content=clean(titleEl?titleEl.textContent:row.textContent||'');
+        }catch(e){}
+        if(!content) content=clean((row.textContent||'').slice(0,200));
+        var checked=false;
+        try{
+          var inp=row.querySelector('input[type="checkbox"]');
+          if(inp){
+            if(inp.checked===true)checked=true;
+            else if(inp.hasAttribute('checked'))checked=true;
+          }
+          if(!checked){
+            var rcb=row.querySelector('[role="checkbox"][aria-checked="true"]');
+            if(rcb)checked=true;
+          }
+          if(!checked){
+            var cbCell=row.querySelector('[class*="checkbox-on"], [class*="checkboxOn"], [data-checked="true"]');
+            if(cbCell)checked=true;
+          }
+        }catch(e){}
+        out.push({rowId:norm(rid)||rid||'',content:content,checked:!!checked,displayIndex:idx});
+      });
+      return JSON.stringify({rows:out,count:out.length});
+    })()`;
+    try {
+      const raw = await cdpEvalRaw(meta.port, listExpr);
+      let s = raw;
+      if (typeof s === 'string' && s.startsWith('"') && s.endsWith('"')) {
+        try { s = JSON.parse(s); } catch {}
+      }
+      try { return JSON.parse(s); }
+      catch { return { error: 'parse_failed', raw: String(raw).slice(0, 300) }; }
+    } catch (e) {
+      return { error: String(e && e.message || e) };
+    }
+  }
+  if (name === 'notion_task_toggle') {
+    const rawId = (args && typeof args.rowId === 'string') ? args.rowId.trim() : '';
+    if (!rawId) return { error: 'missing_rowId' };
+    const noHy = rawId.replace(/-/g, '').toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(noHy)) return { error: 'bad_rowId', hint: 'rowId must be 32 hex chars.' };
+    const desiredRaw = (args && Object.prototype.hasOwnProperty.call(args, 'checked')) ? args.checked : null;
+    const coordsExpr = `(function(){
+      var raw=${JSON.stringify(noHy)};
+      var rows=document.querySelectorAll('[data-block-id]');
+      function findCb(c){
+        return c.querySelector('input[type="checkbox"]')
+          ||c.querySelector('[role="checkbox"][aria-checked]')
+          ||c.querySelector('.notion-record-icon[class*="checkbox" i]')
+          ||c.querySelector('.notion-property-checkbox [role="checkbox"]')
+          ||c.querySelector('.notion-property-checkbox')
+          ||c.querySelector('[class*="checkbox" i]');
+      }
+      var cands=[];
+      for(var i=0;i<rows.length;i++){
+        var bid=(rows[i].getAttribute('data-block-id')||'').replace(/-/g,'').toLowerCase();
+        if(bid===raw)cands.push(rows[i]);
+      }
+      if(cands.length===0)return JSON.stringify({error:'row_not_found'});
+      var cb=null,row=null;
+      for(var k=0;k<cands.length;k++){
+        var c=cands[k];var lcb=findCb(c);var hasText=(c.textContent||'').trim().length>0;
+        if(lcb&&hasText){cb=lcb;row=c;break;}
+        if(lcb&&!cb){cb=lcb;row=c;}
+      }
+      if(!cb)return JSON.stringify({error:'no_checkbox'});
+      var clickTarget=cb;
+      if(cb.tagName==='INPUT'&&cb.type==='checkbox'){
+        var box=cb.closest&&(cb.closest('.notion-list-item-box-left')||cb.closest('.notion-property-checkbox'));
+        if(box)clickTarget=box;
+      }
+      try{clickTarget.scrollIntoView({block:'center'});}catch(e){}
+      var r=clickTarget.getBoundingClientRect();
+      if(r.width===0||r.height===0){
+        var p=cb.parentElement;
+        if(p){var pr=p.getBoundingClientRect();if(pr.width>0&&pr.height>0){r=pr;clickTarget=p;}}
+      }
+      if(r.width===0||r.height===0)return JSON.stringify({error:'checkbox_not_visible'});
+      var checked=false;
+      if(cb.checked===true)checked=true;
+      else if(cb.getAttribute&&cb.getAttribute('aria-checked')==='true')checked=true;
+      else if(cb.hasAttribute&&cb.hasAttribute('checked'))checked=true;
+      return JSON.stringify({ok:true,checked:checked,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});
+    })()`;
+    try {
+      const rawCoords = await cdpEvalRaw(meta.port, coordsExpr);
+      let cs = rawCoords;
+      if (typeof cs === 'string' && cs.startsWith('"') && cs.endsWith('"')) {
+        try { cs = JSON.parse(cs); } catch {}
+      }
+      let coords;
+      try { coords = JSON.parse(cs); } catch { return { error: 'coord_parse_failed', raw: String(rawCoords).slice(0, 200) }; }
+      if (!coords.ok) return { error: coords.error || 'coord_error', detail: coords };
+      const wantFlip = (desiredRaw === null) || (Boolean(desiredRaw) !== Boolean(coords.checked));
+      if (!wantFlip) return { ok: true, idempotent: true, rowId: noHy, checked: coords.checked };
+      const x = Number(coords.x), y = Number(coords.y);
+      await cdpNativeWsSession(meta.port, [
+        { method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x, y, button: 'none' } },
+        { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: 'left', clickCount: 1 } },
+        { method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 } },
+      ]);
+      await new Promise((r) => setTimeout(r, 400));
+      // read-back verify
+      const rawVerify = await cdpEvalRaw(meta.port, coordsExpr);
+      let vs = rawVerify;
+      if (typeof vs === 'string' && vs.startsWith('"') && vs.endsWith('"')) {
+        try { vs = JSON.parse(vs); } catch {}
+      }
+      let after = null;
+      try { after = JSON.parse(vs); } catch {}
+      const expected = (desiredRaw === null) ? !coords.checked : Boolean(desiredRaw);
+      if (!after || after.error || Boolean(after.checked) !== expected) {
+        return { error: 'toggle_did_not_take', expected, got: after };
+      }
+      return { ok: true, rowId: noHy, checked: after.checked, wasChecked: coords.checked };
+    } catch (e) {
+      return { error: String(e && e.message || e) };
+    }
   }
   if (name === 'cdp_type') {
     const r = lookup(args.ref);
