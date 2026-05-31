@@ -89,10 +89,15 @@ param(
     [switch]$Disable,
     [switch]$Restore,
     [switch]$Watch,
-    [switch]$Status
+    [switch]$Status,
+    [switch]$ApplyBrowserShortcuts,
+    [switch]$CleanupBrowserShortcuts,
+    [string]$ForExe,
+    [int]$ForPort
 )
 
 $StatePath = Join-Path $PSScriptRoot "cdp-state.json"
+$ShortcutBackupPath = Join-Path $PSScriptRoot "cdp-shortcut-backup.json"
 $TaskName = "ElectronCDP-Persistent"
 
 # Standalone Chromium browsers ignore --remote-debugging-port on their DEFAULT
@@ -239,6 +244,168 @@ function Remove-BrowserLinkRedirect {
     Write-Host "  Link redirect OFF: $progId (restored default profile)"
 }
 
+# --- Browser shortcut redirect (taskbar / Start menu / Desktop) ---------------
+# The URL handler (HKCU\Software\Classes\<ProgId>) only catches EXTERNAL link
+# clicks. Plain user launches of Chrome (taskbar pin, Start menu, Desktop icon)
+# bypass that path and hit chrome.exe directly via the shortcut's TargetPath,
+# which has no --user-data-dir => default profile, no debug port. The watcher
+# then kills and relaunches in the sandbox, but the user sees the default
+# Chrome window flash for ~1-3s first ("starts the normal chrome window, then
+# restarts again"). To make the launch "one solid startup", we rewrite the
+# Arguments of every Chrome .lnk in user-writable locations so the FIRST
+# launch already lands in the sandbox profile with --remote-debugging-port set.
+# Originals are saved to cdp-shortcut-backup.json and restored on disable.
+
+function Get-BrowserShortcutSearchDirs {
+    @(
+        (Join-Path $env:APPDATA   'Microsoft\Windows\Start Menu\Programs'),
+        (Join-Path $env:USERPROFILE 'Desktop'),
+        (Join-Path $env:PUBLIC    'Desktop'),
+        (Join-Path $env:APPDATA   'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'),
+        (Join-Path $env:APPDATA   'Microsoft\Internet Explorer\Quick Launch'),
+        (Join-Path $env:PROGRAMDATA 'Microsoft\Windows\Start Menu\Programs')
+    )
+}
+
+function Get-ShortcutBackups {
+    if (-not (Test-Path $ShortcutBackupPath)) { return @() }
+    try {
+        $raw = Get-Content $ShortcutBackupPath -Raw -ErrorAction Stop
+        if (-not $raw) { return @() }
+        $parsed = $raw | ConvertFrom-Json
+        if (-not $parsed) { return @() }
+        return @($parsed)
+    } catch { return @() }
+}
+
+function Save-ShortcutBackups {
+    param([array]$Backups)
+    if (-not $Backups -or $Backups.Count -eq 0) {
+        if (Test-Path $ShortcutBackupPath) { Remove-Item $ShortcutBackupPath -Force -ErrorAction SilentlyContinue }
+        return
+    }
+    # PS 5.1 ConvertTo-Json on a top-level array is unreliable (wraps as
+    # {value:[...],Count:N} when passed via pipeline or comma operator). Build
+    # the JSON array by hand from per-item objects so the shape stays stable
+    # regardless of element count.
+    $parts = foreach ($b in $Backups) { ($b | ConvertTo-Json -Depth 4 -Compress:$false) }
+    $json = '[' + ($parts -join ",`r`n") + ']'
+    Set-Content -Path $ShortcutBackupPath -Value $json -Encoding utf8
+}
+
+function Get-CdpPortForBasename {
+    param([string]$Basename)
+    if (-not $Basename) { return $null }
+    $st = Get-CdpState
+    if (-not $st -or -not $st.apps) { return $null }
+    $bnLower = $Basename.ToLower()
+    foreach ($a in $st.apps) {
+        if ($a.exe -and ([IO.Path]::GetFileName($a.exe).ToLower() -eq $bnLower)) { return [int]$a.port }
+    }
+    return $null
+}
+
+function Set-BrowserShortcutRedirect {
+    param([string]$ExePath, [int]$Port)
+    if (-not $ExePath) { return }
+    if (-not (Test-IsBrowser -ExePath $ExePath)) { return }
+    if (-not $Port -or $Port -le 0) { return }
+    $exeBase = [IO.Path]::GetFileName($ExePath).ToLower()
+    $seedDir = Get-CdpSeedDir -ExePath $ExePath
+    $sandboxArgs = "--user-data-dir=`"$seedDir`" --remote-debugging-port=$Port --no-first-run --no-default-browser-check"
+
+    $wsh = New-Object -ComObject WScript.Shell
+    $backups = @(Get-ShortcutBackups)
+    $byPath = @{}
+    foreach ($b in $backups) { if ($b.path) { $byPath[$b.path.ToLower()] = $b } }
+    $touched = $false
+
+    foreach ($dir in (Get-BrowserShortcutSearchDirs)) {
+        if (-not (Test-Path $dir)) { continue }
+        $lnks = Get-ChildItem -LiteralPath $dir -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue
+        foreach ($lnk in $lnks) {
+            $sc = $null
+            try {
+                $sc = $wsh.CreateShortcut($lnk.FullName)
+                $tgt = $sc.TargetPath
+                if (-not $tgt) { continue }
+                if ([IO.Path]::GetFileName($tgt).ToLower() -ne $exeBase) { continue }
+                $curArgs = [string]$sc.Arguments
+                $seedQuoted = '--user-data-dir="' + $seedDir + '"'
+                $portFlag = '--remote-debugging-port=' + $Port
+                if ($curArgs -and $curArgs.Contains($seedQuoted) -and $curArgs.Contains($portFlag)) { continue }
+                $key = $lnk.FullName.ToLower()
+                if (-not $byPath.ContainsKey($key)) {
+                    $entry = [PSCustomObject]@{
+                        path    = $lnk.FullName
+                        target  = $tgt
+                        args    = $curArgs
+                        exeBase = $exeBase
+                    }
+                    $backups += $entry
+                    $byPath[$key] = $entry
+                }
+                # Strip any leftover sandbox args from a previous port; keep user's other args.
+                $rest = $curArgs
+                if ($rest) {
+                    $rest = [Regex]::Replace($rest, '\s*--user-data-dir=(?:"[^"]+"|\S+)', '')
+                    $rest = [Regex]::Replace($rest, '\s*--remote-debugging-port=\d+', '')
+                    $rest = [Regex]::Replace($rest, '\s*--no-first-run', '')
+                    $rest = [Regex]::Replace($rest, '\s*--no-default-browser-check', '')
+                    $rest = $rest.Trim()
+                }
+                $sc.Arguments = if ($rest) { "$sandboxArgs $rest" } else { $sandboxArgs }
+                $sc.Save()
+                $touched = $true
+            } catch {
+                Write-Host "  Shortcut redirect skipped $($lnk.FullName): $($_.Exception.Message)"
+            } finally {
+                if ($sc) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sc) }
+            }
+        }
+    }
+
+    [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wsh)
+
+    if ($touched) {
+        Save-ShortcutBackups -Backups $backups
+        Write-Host "  Shortcut redirect ON for $exeBase (port $Port)"
+    }
+}
+
+function Remove-BrowserShortcutRedirect {
+    param([string]$ExePath)
+    if (-not $ExePath) { return }
+    $exeBase = [IO.Path]::GetFileName($ExePath).ToLower()
+    $backups = @(Get-ShortcutBackups)
+    if ($backups.Count -eq 0) { return }
+    $wsh = New-Object -ComObject WScript.Shell
+    $remaining = @()
+    $restored = 0
+    foreach ($b in $backups) {
+        $bExe = ''
+        if ($b.exeBase) { $bExe = [string]$b.exeBase }
+        if ($bExe.ToLower() -ne $exeBase) { $remaining += $b; continue }
+        if (-not $b.path -or -not (Test-Path $b.path)) { continue }
+        $sc = $null
+        try {
+            $sc = $wsh.CreateShortcut($b.path)
+            $sc.Arguments = if ($b.args) { [string]$b.args } else { '' }
+            if ($b.target) { $sc.TargetPath = [string]$b.target }
+            $sc.Save()
+            $restored++
+        } catch {
+            Write-Host "  Shortcut restore skipped $($b.path): $($_.Exception.Message)"
+            $remaining += $b
+        } finally {
+            if ($sc) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sc) }
+        }
+    }
+    [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wsh)
+    Save-ShortcutBackups -Backups $remaining
+    if ($restored -gt 0) { Write-Host "  Shortcut redirect OFF for $exeBase ($restored restored)" }
+}
+
 function Find-RunningElectronApps {
     $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object { $_.ExecutablePath }
@@ -322,7 +489,13 @@ function Start-AppWithCdp {
     Start-Process -FilePath $ExePath -ArgumentList $launchArgs
 
     # Route external link clicks straight into this sandbox profile (no flash).
-    if (Test-IsBrowser -ExePath $ExePath) { Set-BrowserLinkRedirect -ExePath $ExePath }
+    if (Test-IsBrowser -ExePath $ExePath) {
+        Set-BrowserLinkRedirect -ExePath $ExePath
+        # Rewrite taskbar / Start menu / Desktop .lnk Arguments so plain user
+        # launches land in the sandbox profile from the start - no default-profile
+        # window flash before the watcher consolidates.
+        Set-BrowserShortcutRedirect -ExePath $ExePath -Port $Port
+    }
 
     return [PSCustomObject]@{
         App      = $name
@@ -341,7 +514,10 @@ function Start-AppNormally {
     if ($killed -gt 0) { Write-Host "  Stopped $killed process(es) for $name" }
 
     # Restore default-profile link handling (undo the sandbox redirect).
-    if (Test-IsBrowser -ExePath $ExePath) { Remove-BrowserLinkRedirect -ExePath $ExePath }
+    if (Test-IsBrowser -ExePath $ExePath) {
+        Remove-BrowserLinkRedirect -ExePath $ExePath
+        Remove-BrowserShortcutRedirect -ExePath $ExePath
+    }
 
     Write-Host "  Launching $name normally (no CDP)"
     Start-Process -FilePath $ExePath
@@ -439,6 +615,25 @@ if ($Status) {
     return
 }
 
+# ---------- Apply / cleanup browser shortcut redirect (external invocation) ----
+# Used by electron-detector main.js so the shortcut rewrite happens out of band
+# of the enable/disable flow (which already triggers it through Start-AppWithCdp
+# / Start-AppNormally). Idempotent: a redundant Apply with same port is a no-op.
+if ($ApplyBrowserShortcuts) {
+    if (-not $ForExe) { Write-Error "ApplyBrowserShortcuts requires -ForExe"; return }
+    $port = $ForPort
+    if (-not $port -or $port -le 0) { $port = Get-CdpPortForBasename -Basename ([IO.Path]::GetFileName($ForExe)) }
+    if (-not $port -or $port -le 0) { Write-Error "No port found for $ForExe"; return }
+    Set-BrowserShortcutRedirect -ExePath $ForExe -Port $port
+    return
+}
+
+if ($CleanupBrowserShortcuts) {
+    if (-not $ForExe) { Write-Error "CleanupBrowserShortcuts requires -ForExe"; return }
+    Remove-BrowserShortcutRedirect -ExePath $ForExe
+    return
+}
+
 # ---------- Enable ----------
 if ($Enable) {
     $running = Find-RunningElectronApps
@@ -477,7 +672,12 @@ if ($Enable) {
 
     # Ensure link redirect is on for every tracked browser (covers the
     # already-had-CDP branch that skips Start-AppWithCdp).
-    foreach ($r in $results) { if (Test-IsBrowser -ExePath $r.Exe) { Set-BrowserLinkRedirect -ExePath $r.Exe } }
+    foreach ($r in $results) {
+        if (Test-IsBrowser -ExePath $r.Exe) {
+            Set-BrowserLinkRedirect -ExePath $r.Exe
+            Set-BrowserShortcutRedirect -ExePath $r.Exe -Port $r.Port
+        }
+    }
 
     Save-CdpState -Enabled $true -Apps $results
     Write-Host ""
@@ -507,9 +707,12 @@ if ($Disable) {
     Write-Host "Disabling persistent CDP..."
 
     foreach ($app in $state.apps) {
-        # Always undo the link redirect, even if the browser isn't running now
-        # (Start-AppNormally only runs for live apps).
-        if (Test-IsBrowser -ExePath $app.exe) { Remove-BrowserLinkRedirect -ExePath $app.exe }
+        # Always undo the link / shortcut redirects, even if the browser isn't
+        # running now (Start-AppNormally only runs for live apps).
+        if (Test-IsBrowser -ExePath $app.exe) {
+            Remove-BrowserLinkRedirect -ExePath $app.exe
+            Remove-BrowserShortcutRedirect -ExePath $app.exe
+        }
 
         $isRunning = Get-Process -ErrorAction SilentlyContinue | Where-Object {
             try { $_.Path -eq $app.exe } catch { $false }
@@ -847,6 +1050,10 @@ if ($Watch) {
                 # Keep the link redirect asserted (Chrome can rewrite its
                 # registration on update/launch); cheap - skips redundant writes.
                 Set-BrowserLinkRedirect -ExePath $exe
+                # Re-assert .lnk shortcut redirect to current port so taskbar /
+                # Start menu launches stay aligned with the live sandbox port.
+                $curPort = Get-CdpPortForBasename -Basename $bn
+                if ($curPort) { Set-BrowserShortcutRedirect -ExePath $exe -Port $curPort }
                 $seed = [Regex]::Escape((Get-CdpSeedDir -ExePath $exe))
                 $defMain = @($procs | Where-Object { $_.CommandLine -notmatch '--type=' -and $_.CommandLine -notmatch $seed })
                 if ($defMain.Count -gt 0) { Invoke-Reflag -ExePath $exe -TriggerCmd $defMain[0].CommandLine }

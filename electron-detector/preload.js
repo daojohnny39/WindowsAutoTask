@@ -28,6 +28,9 @@ contextBridge.exposeInMainWorld('agent', {
 
 contextBridge.exposeInMainWorld('chat', {
   send: (payload) => ipcRenderer.invoke('chat:send', payload),
+  sendDirect: (payload) => ipcRenderer.invoke('chat:send-direct', payload),
+  loadDirect: () => ipcRenderer.invoke('chat:load-direct'),
+  resetDirect: () => ipcRenderer.invoke('chat:reset-direct'),
   reset: (exe) => ipcRenderer.invoke('chat:reset', exe),
   stop: (exe) => ipcRenderer.invoke('chat:stop', exe),
   answer: (payload) => ipcRenderer.invoke('chat:answer', payload),
@@ -53,6 +56,9 @@ contextBridge.exposeInMainWorld('chat', {
   onAsk: (callback) => {
     ipcRenderer.on('chat:ask', (_e, data) => callback(data));
   },
+  onCitation: (callback) => {
+    ipcRenderer.on('chat:citation', (_e, data) => callback(data));
+  },
   removeListeners: () => {
     ipcRenderer.removeAllListeners('chat:chunk');
     ipcRenderer.removeAllListeners('chat:done');
@@ -60,6 +66,46 @@ contextBridge.exposeInMainWorld('chat', {
     ipcRenderer.removeAllListeners('chat:tool-result');
     ipcRenderer.removeAllListeners('chat:thinking');
     ipcRenderer.removeAllListeners('chat:ask');
+    ipcRenderer.removeAllListeners('chat:citation');
+  },
+});
+
+contextBridge.exposeInMainWorld('shell', {
+  openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),
+});
+
+contextBridge.exposeInMainWorld('overlay', {
+  resize: (width, height, opts) => ipcRenderer.send('overlay:resize', { width, height, center: opts && opts.center, anchor: opts && opts.anchor, instant: !!(opts && opts.instant) }),
+  // Drag the frameless overlay from the renderer: report the desired top-left;
+  // main applies horizontal-center snap + on-screen clamp.
+  moveTo: (x, y) => ipcRenderer.send('overlay:move-to', { x, y }),
+  getPosition: () => ipcRenderer.invoke('overlay:get-position'),
+  maxHeight: () => ipcRenderer.invoke('overlay:max-height'),
+  // Suppress blur-dismiss while a footer drag is in progress.
+  setDragging: (active) => ipcRenderer.send('overlay:set-dragging', { active: !!active }),
+  dismiss: () => ipcRenderer.invoke('overlay:dismiss'),
+  setResetProgress: (progress) => ipcRenderer.send('tray:reset-progress', progress),
+  openSettings: (section) => ipcRenderer.invoke('overlay:open-settings', section),
+  getConfig: () => ipcRenderer.invoke('config:get'),
+  setHotkey: (accel) => ipcRenderer.invoke('config:set-hotkey', accel),
+  suspendHotkey: () => ipcRenderer.invoke('config:suspend-hotkey'),
+  resumeHotkey: () => ipcRenderer.invoke('config:resume-hotkey'),
+  setOverlayConfig: (patch) => ipcRenderer.invoke('config:set-overlay', patch),
+  openLogs: () => ipcRenderer.invoke('logs:open'),
+  onShow: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('overlay:show', handler);
+    return () => ipcRenderer.removeListener('overlay:show', handler);
+  },
+  onHide: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on('overlay:hide', handler);
+    return () => ipcRenderer.removeListener('overlay:hide', handler);
+  },
+  onSettingsFocusSection: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('settings:focus-section', handler);
+    return () => ipcRenderer.removeListener('settings:focus-section', handler);
   },
 });
 

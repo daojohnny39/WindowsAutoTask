@@ -9,6 +9,44 @@
   <link rel="stylesheet" href="./node_modules/katex/dist/katex.min.css">
 </head>
 <body>
+  <!-- Overlay launcher (quick-entry). Shown only in overlay mode. Input pinned
+       at the bottom; the dropdown + (later) chat grow upward above it. -->
+  <div class="launcher" id="launcher" hidden>
+    <div class="launcher-backdrop" id="launcher-backdrop"></div>
+    <div class="launcher-card" id="launcher-card">
+      <div class="launcher-dropdown" id="launcher-dropdown" role="listbox" aria-label="Suggestions" hidden></div>
+      <div class="launcher-row">
+        <span class="launcher-logo" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+        </span>
+        <span class="launcher-app-pill" id="launcher-app-pill" hidden>
+          <img class="launcher-app-pill-icon" id="launcher-app-pill-icon" alt="">
+          <span class="launcher-app-pill-name" id="launcher-app-pill-name"></span>
+          <button class="launcher-app-pill-x" id="launcher-app-pill-x" type="button" title="Change app (Backspace)">×</button>
+        </span>
+        <span class="launcher-input-stack">
+          <span class="launcher-ghost" id="launcher-ghost" aria-hidden="true"></span>
+          <input class="launcher-input" id="launcher-input" type="text" autocomplete="off" spellcheck="false" placeholder="Search an app or type a prompt…">
+        </span>
+        <span class="launcher-mode-chip" id="launcher-mode-chip" data-mode="chat">Chat</span>
+      </div>
+      <div class="launcher-foot" id="launcher-foot" title="Drag to move">
+        <span class="launcher-hint" id="launcher-hint"></span>
+        <div class="launcher-gear-menu" id="launcher-gear-menu" role="menu" hidden>
+          <button class="launcher-gear-item" id="launcher-gear-reset" type="button" role="menuitem">Reset chat</button>
+          <button class="launcher-gear-item" id="launcher-gear-pick" type="button" role="menuitem">Pick a different app</button>
+          <button class="launcher-gear-item" id="launcher-gear-settings" type="button" role="menuitem">Settings…</button>
+        </div>
+        <button class="launcher-close-btn" id="launcher-close-btn" type="button" title="Close overlay" hidden>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+        <button class="launcher-settings-btn" id="launcher-settings-btn" type="button" title="Settings">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
   <nav class="navbar">
     <button class="nav-browse" id="nav-browse" title="Browse all apps" aria-controls="drawer" aria-expanded="false">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -20,6 +58,8 @@
     </button>
     <div class="nav-brand">Autobot</div>
     <div class="nav-right">
+      <button class="nav-link-btn" id="nav-hotkey" title="Change overlay hotkey">Hotkey: …</button>
+      <button class="nav-link-btn" id="nav-logs" title="Open chat logs folder">Logs</button>
       <button class="nav-link-btn" id="nav-inspector" title="Open Inspector">Inspector</button>
       <button class="codex-login-btn" id="codex-login-btn" disabled>Checking…</button>
       <div class="codex-install-error" id="codex-install-error"></div>
@@ -164,6 +204,12 @@
             <span class="chat-tab-menu-title">Reference a tab</span>
           </div>
           <div class="chat-tab-menu-list" id="chat-tab-menu-list"></div>
+        </div>
+        <div class="chat-tab-menu" id="chat-app-menu" hidden role="listbox" aria-label="Reference an app">
+          <div class="chat-tab-menu-head">
+            <span class="chat-tab-menu-title">Reference an app</span>
+          </div>
+          <div class="chat-tab-menu-list" id="chat-app-menu-list"></div>
         </div>
         <div class="chat-input" id="chat-input" contenteditable="true" role="textbox"
              aria-multiline="true" data-placeholder="Send a message…"></div>

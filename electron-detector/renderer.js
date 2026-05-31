@@ -35,7 +35,20 @@ let currentPage        = 'workspace';
 let currentApps        = [];        // electron apps with cdpAlive/error fields
 let cachedUiaApps      = [];        // UIA apps minus electron exes
 let persistentExes     = new Set(); // exes with persistent CDP flag
-let selectedUiaExes    = new Set();
+// Persisted across windows (overlay + main share the file:// origin localStorage)
+// so the overlay's "selected apps only" list includes Win32 picks made in the
+// main window. Electron picks persist separately via cdpAlive / cdp-state.json.
+const UIA_SEL_KEY = 'autobot.selectedUiaExes';
+function loadSelectedUiaExes() {
+  try {
+    const raw = localStorage.getItem(UIA_SEL_KEY);
+    return new Set(raw ? JSON.parse(raw) : []);
+  } catch { return new Set(); }
+}
+function saveSelectedUiaExes() {
+  try { localStorage.setItem(UIA_SEL_KEY, JSON.stringify([...selectedUiaExes])); } catch {}
+}
+let selectedUiaExes    = loadSelectedUiaExes();
 
 let drawerOpen         = false;
 let drawerLastFocus    = null;
@@ -60,6 +73,32 @@ function escapeHtml(str) {
 
 function fmtCount(n, noun) {
   return `${n} ${noun}${n === 1 ? '' : 's'}`;
+}
+
+// True when an enumerated Windows app is the ChatGPT desktop app — used to
+// hide it everywhere (Apps grid, drawer, launcher candidates). Direct chat
+// supersedes app-scoped automation of ChatGPT: see SPEC.md and CLAUDE.md.
+// Matches the same loose patterns the old findGptApp used so renames and
+// minor branding tweaks (ChatGPT, ChatGPT Desktop, GPT, etc.) all hit.
+function isChatGptApp(app) {
+  if (!app) return false;
+  const name = String(app.Name || app.name || '').toLowerCase();
+  const exe  = String(app.Exe  || app.exe  || '').toLowerCase();
+  return /chat\s*gpt/.test(name) || /\bgpt\b/.test(name) || /chatgpt/.test(exe);
+}
+
+// Mirror of appKey() in main.js — derive the canonical per-app key from an exe
+// path so the /app pill carries the same key the backend registers under.
+function appKeyFor(exe) {
+  exe = String(exe || '');
+  const baseFull = exe.split(/[\\/]/).pop() || '';
+  const dot = baseFull.lastIndexOf('.');
+  const base = (dot > 0 ? baseFull.slice(0, dot) : baseFull).toLowerCase();
+  const slug = base.replace(/[^a-z0-9]/g, '_').replace(/^_+|_+$/g, '') || 'app';
+  let h = 0;
+  for (let i = 0; i < exe.length; i++) h = (h * 31 + exe.charCodeAt(i)) | 0;
+  const suffix = Math.abs(h).toString(36).slice(0, 6);
+  return `${slug}_${suffix}`;
 }
 
 function showStatus(msg, kind = '') {
@@ -142,36 +181,53 @@ async function checkCdpStatus(apps) {
   }));
 }
 
+let refreshAppsInFlight = null;
 async function refreshApps(fromDrawer = false) {
-  if (drawerBusy) return;
+  // Coalesce concurrent calls. Without this, a hotkey-triggered refresh that
+  // arrives while the initial preload refresh is still running would early-
+  // return on `drawerBusy`, resolving to undefined immediately. The overlay's
+  // `.then(refreshSuggestions)` would then run against still-empty
+  // currentApps/cachedUiaApps and the launcher would show no selected apps.
+  // Returning the in-flight promise makes the caller wait for real data.
+  if (refreshAppsInFlight) {
+    if (fromDrawer) drawerRefresh.classList.add('spinning');
+    try { return await refreshAppsInFlight; }
+    finally { if (fromDrawer) drawerRefresh.classList.remove('spinning'); }
+  }
   drawerBusy = true;
   if (fromDrawer) drawerRefresh.classList.add('spinning');
 
-  try {
-    const [electronResult, uiaResult, cdpResult] = await Promise.allSettled([
-      window.api.detectApps(),
-      window.api.detectUiaApps(),
-      window.api.getCdpState(),
-    ]);
+  refreshAppsInFlight = (async () => {
+    try {
+      const [electronResult, uiaResult, cdpResult] = await Promise.allSettled([
+        window.api.detectApps(),
+        window.api.detectUiaApps(),
+        window.api.getCdpState(),
+      ]);
 
-    const electronApps = electronResult.status === 'fulfilled' ? electronResult.value : [];
-    const allUiaApps   = uiaResult.status === 'fulfilled' ? uiaResult.value : [];
-    const cdpState     = cdpResult.status === 'fulfilled' ? cdpResult.value : { apps: [] };
+      const electronApps = electronResult.status === 'fulfilled' ? electronResult.value : [];
+      const allUiaApps   = uiaResult.status === 'fulfilled' ? uiaResult.value : [];
+      const cdpState     = cdpResult.status === 'fulfilled' ? cdpResult.value : { apps: [] };
 
-    persistentExes = new Set((cdpState.apps || []).map(a => a.exe));
-    const electronExes = new Set(electronApps.map(a => a.Exe));
-    cachedUiaApps = allUiaApps.filter(a => !electronExes.has(a.Exe));
+      persistentExes = new Set((cdpState.apps || []).map(a => a.exe));
+      const electronExes = new Set(electronApps.map(a => a.Exe));
+      cachedUiaApps = allUiaApps.filter(a => !electronExes.has(a.Exe));
 
-    currentApps = await checkCdpStatus(electronApps);
-    appsLoaded = true;
+      currentApps = await checkCdpStatus(electronApps);
+      appsLoaded = true;
 
-    renderDrawer();
-    renderWorkspace();
-  } catch (err) {
-    setDrawerStatus(`Detection failed: ${err.message}`, 'error');
-  } finally {
+      renderDrawer();
+      renderWorkspace();
+    } catch (err) {
+      setDrawerStatus(`Detection failed: ${err.message}`, 'error');
+    }
+  })();
+
+  try { await refreshAppsInFlight; }
+  finally {
     drawerBusy = false;
     drawerRefresh.classList.remove('spinning');
+    refreshAppsInFlight = null;
   }
 }
 
@@ -191,8 +247,8 @@ function renderDrawer() {
     return n.includes(filter) || e.includes(filter);
   };
 
-  const electron = currentApps.filter(match);
-  const uia = cachedUiaApps.filter(match);
+  const electron = currentApps.filter(app => !isChatGptApp(app) && match(app));
+  const uia = cachedUiaApps.filter(app => !isChatGptApp(app) && match(app));
   const total = electron.length + uia.length;
   drawerCount.textContent = fmtCount(total, 'app');
 
@@ -265,6 +321,7 @@ async function onDrawerItemClick(itemEl) {
   if (type === 'uia') {
     if (selectedUiaExes.has(exe)) selectedUiaExes.delete(exe);
     else selectedUiaExes.add(exe);
+    saveSelectedUiaExes();
     renderDrawer();
     renderWorkspace();
     return;
@@ -313,8 +370,8 @@ function renderWorkspace() {
     return;
   }
 
-  const selectedElectron = currentApps.filter(a => a.cdpAlive);
-  const selectedUia = cachedUiaApps.filter(a => selectedUiaExes.has(a.Exe));
+  const selectedElectron = currentApps.filter(a => a.cdpAlive && !isChatGptApp(a));
+  const selectedUia = cachedUiaApps.filter(a => selectedUiaExes.has(a.Exe) && !isChatGptApp(a));
   const total = selectedElectron.length + selectedUia.length;
 
   // Header chrome
@@ -773,17 +830,54 @@ const chatSendBtn      = document.getElementById('chat-send-btn');
 const chatNewBtn       = document.getElementById('chat-new-btn');
 const chatWelcomeSub   = document.getElementById('chat-welcome-sub');
 
+// Sentinel "exe" used for the direct GPT-5.5 chat (no real app is selected).
+// Mirrors DIRECT_CHAT_ID in main.js — all chat:* IPC events carry this same
+// string in `data.exe`, so chatStore / chatMetaStore / event filtering all key
+// off it identically to a real exe path. Real exe paths are absolute Windows
+// paths so this sentinel will never collide.
+const DIRECT_CHAT_ID   = '__direct__';
+const DIRECT_CHAT_NAME = 'Direct chat — GPT-5.5';
+
 let chatCurrentExe     = null;
-let chatStore          = {};        // exe → [{role, content, reasoning?, reasoningMs?}]
+let chatStore          = {};        // exe → [{role, content, reasoning?, reasoningMs?, sources?}]
 let chatMetaStore      = {};
 let chatStreamContent  = '';
 let chatStreamExe      = null;
 let chatBusy           = false;
+let chatStreamSources  = [];        // collected URL citations for the streaming assistant msg
 
 let thinkingBuffer     = '';
 let thinkingFallback   = '';
 let reasoningStartMs   = 0;
 let lastUserMessage    = '';
+let lastRenderedCount  = 0;        // last msg count rendered; used to flag fresh bubbles
+let chatStreamEl       = null;     // ref to currently-streaming assistant bubble
+
+// Empty-state source of truth. Composer-only mode kicks in when the thread is
+// empty AND no stream is mid-flight. Used by sizing + CSS class toggling.
+function chatIsEmpty() {
+  const msgs = (chatStore && chatCurrentExe && chatStore[chatCurrentExe]) || [];
+  return msgs.length === 0 && !chatStreamContent;
+}
+
+function updateChatEmptyClass() {
+  if (!pageChat) return;
+  const empty = chatIsEmpty();
+  pageChat.classList.toggle('chat-empty', empty);
+  // Inline overlay chat: same flag on .launcher-card so the moved #chat-scroll
+  // can collapse in empty state (the original pageChat.chat-empty selectors no
+  // longer match because chat-scroll has been reparented out of #page-chat).
+  const card = document.getElementById('launcher-card');
+  if (card) {
+    const wasEmpty = card.classList.contains('chat-empty');
+    card.classList.toggle('chat-empty', empty);
+    // On the empty→non-empty flip, bypass the MutationObserver's 60ms debounce
+    // so the window grows up in the same frame as the bubble appears.
+    if (wasEmpty !== empty && typeof window.__overlaySizeForChat === 'function') {
+      window.__overlaySizeForChat({ immediate: true });
+    }
+  }
+}
 
 function resolveAppMeta(exe, name) {
   const electron = currentApps.find(a => a.Exe === exe);
@@ -801,11 +895,25 @@ function resolveAppMeta(exe, name) {
   return { exe, name: name || exe, type: 'uia', pid: null, port: null };
 }
 
-async function openChat(appName, exe) {
+async function openChat(appName, exe, metaOverride) {
   chatCurrentExe = exe;
   chatAppNameEl.textContent = appName;
   if (!chatStore[exe]) chatStore[exe] = [];
-  const meta = resolveAppMeta(exe, appName);
+  // Prefer caller-supplied meta (overlay's selApp carries the live CDP port
+  // captured at selection time) to avoid a resolveAppMeta race when
+  // currentApps has been mutated by an in-flight refreshApps().
+  let meta;
+  if (metaOverride && metaOverride.type) {
+    meta = { exe, name: appName, type: metaOverride.type, pid: metaOverride.pid || null, port: metaOverride.port || null };
+    // Fall back to resolveAppMeta only if override lacks a port for an electron app
+    // (e.g. CDP died between selection and submit) — try to recover a fresh port.
+    if (meta.type === 'electron' && !meta.port) {
+      const resolved = resolveAppMeta(exe, appName);
+      if (resolved.port) meta = resolved;
+    }
+  } else {
+    meta = resolveAppMeta(exe, appName);
+  }
   chatMetaStore[exe] = meta;
   chatWelcomeSub.textContent = meta.type === 'electron'
     ? `Scoped to ${appName}. CDP active — I can read DOM, click, type, scroll.`
@@ -814,7 +922,37 @@ async function openChat(appName, exe) {
   renderChat();
   chatInput.focus();
   refreshWindowPicker(meta);
+  // Persist the currently-bound exe for the overlay's restore-on-reopen path.
+  // sessionStorage is per-window; harmless in the main window (no view='chat'
+  // key is ever written there, so the restore branch never fires).
+  try { sessionStorage.setItem('autobot.overlay.exe', String(exe || '')); } catch {}
   try { await window.agent.ensure(meta); } catch (err) { console.error('agent:ensure', err); }
+}
+
+// Open the direct GPT-5.5 chat (no app selected). Hydrates the in-memory store
+// from logs/direct-gpt.json so the conversation survives an app restart, then
+// hands off to the same chat UI the app-scoped flow uses. The window picker is
+// hidden and agent.ensure is skipped — direct mode has no app context.
+async function openDirectChat() {
+  chatCurrentExe = DIRECT_CHAT_ID;
+  chatAppNameEl.textContent = DIRECT_CHAT_NAME;
+  const meta = { exe: DIRECT_CHAT_ID, name: 'GPT-5.5', type: 'direct', pid: null, port: null };
+  chatMetaStore[DIRECT_CHAT_ID] = meta;
+  chatWelcomeSub.textContent = 'Talking directly to GPT-5.5. No app context — ask anything. Web search is on; attached files work.';
+  try {
+    const state = await window.chat.loadDirect();
+    const messages = (state && Array.isArray(state.messages)) ? state.messages : [];
+    chatStore[DIRECT_CHAT_ID] = messages.map(m => ({ role: m.role, content: m.content }));
+  } catch (err) {
+    console.warn('loadDirect failed', err);
+    if (!chatStore[DIRECT_CHAT_ID]) chatStore[DIRECT_CHAT_ID] = [];
+  }
+  switchPage('chat');
+  hideWindowPicker();
+  renderChat();
+  chatInput.focus();
+  // Persist exe for the overlay restore-on-reopen path (see openChat).
+  try { sessionStorage.setItem('autobot.overlay.exe', DIRECT_CHAT_ID); } catch {}
 }
 
 chatBackBtn.addEventListener('click', () => switchPage('workspace'));
@@ -986,22 +1124,44 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && cwpOpen) { e.stopPropagation(); closeWindowPanel(); }
 });
 
-chatNewBtn.addEventListener('click', () => {
+async function resetCurrentChat() {
   if (!chatCurrentExe) return;
-  window.chat.reset(chatCurrentExe);
+  if (chatCurrentExe === DIRECT_CHAT_ID) {
+    try { await window.chat.resetDirect(); } catch (err) { console.warn('resetDirect failed', err); }
+  } else {
+    window.chat.reset(chatCurrentExe);
+  }
   chatStore[chatCurrentExe] = [];
   chatStreamContent = '';
   chatStreamExe = null;
+  chatStreamEl = null;
+  chatStreamSources = [];
   thinkingBuffer = '';
   reasoningStartMs = 0;
   hideThinking();
   setChatBusy(false);
+  lastRenderedCount = 0;
   renderChat();
+  updateChatEmptyClass();
+  // In overlay mode, a reset returns to the launcher's "Search an app or type
+  // a prompt" view instead of leaving the user staring at the empty-state chat.
+  if (typeof window.__enterLauncher === 'function') {
+    try { window.__enterLauncher('chat'); return; } catch (err) { console.warn('enterLauncher failed', err); }
+  }
+  // Shrink overlay window back to composer-only (empty-state height).
+  try {
+    if (typeof window.__overlaySizeForChat === 'function') {
+      window.__overlaySizeForChat({ immediate: true });
+    }
+  } catch {}
   chatInput.focus();
-});
+}
+
+chatNewBtn.addEventListener('click', resetCurrentChat);
 
 function renderChat() {
   const msgs = chatStore[chatCurrentExe] || [];
+  const grew = msgs.length > lastRenderedCount;
   if (msgs.length === 0) {
     chatMessagesEl.innerHTML = `
       <div class="chat-welcome">
@@ -1011,9 +1171,23 @@ function renderChat() {
         <p class="chat-welcome-title">Start a conversation</p>
         <p class="chat-welcome-sub">${escapeHtml(chatWelcomeSub.textContent || '')}</p>
       </div>`;
+    lastRenderedCount = 0;
+    updateChatEmptyClass();
     return;
   }
   chatMessagesEl.innerHTML = msgs.map((m, i) => renderTurn(m, i)).join('');
+  // Flag newly-appended bubble with enter animation (only when count grew, so
+  // a full rerender on chat entry doesn't replay animations on the history).
+  if (grew) {
+    const bubbles = chatMessagesEl.querySelectorAll('.chat-msg');
+    const last = bubbles[bubbles.length - 1];
+    if (last) {
+      last.classList.add('bubble-enter');
+      setTimeout(() => { try { last.classList.remove('bubble-enter'); } catch {} }, 220);
+    }
+  }
+  lastRenderedCount = msgs.length;
+  updateChatEmptyClass();
   scrollChatToBottom();
 }
 
@@ -1034,6 +1208,11 @@ function renderUserContent(content) {
     return `<span class="chat-file-pill chat-file-pill-static" title="${label}">`
       + `<span class="chat-file-pill-icon">${FILE_GLYPH_SVG}</span>`
       + `<span class="chat-file-pill-label">${label}</span></span>`;
+  }).replace(/\[app:([^\s\]]+)\s+(?:&quot;|")([\s\S]*?)(?:&quot;|")\]/g, (_, key, appName) => {
+    const label = (appName && appName.trim()) || key;
+    return `<span class="chat-app-pill chat-app-pill-static" title="${label}">`
+      + `<span class="chat-app-pill-icon">${APP_GLYPH_SVG}</span>`
+      + `<span class="chat-app-pill-label">${label}</span></span>`;
   });
 }
 
@@ -1064,6 +1243,7 @@ function renderTurn(m, i) {
     }
     const hasContent = (m.content || '').trim().length > 0;
     const body = hasContent ? renderMarkdown(m.content) : '';
+    const sourcesBlock = renderSourcesBlock(m.sources);
     const automatable = canAutomate(m);
     const automateBtn = automatable
       ? `<button class="chat-action-btn automate" data-act="automate" title="Save this task as a reusable automation">
@@ -1073,7 +1253,7 @@ function renderTurn(m, i) {
       : '';
     const actionsCls = automatable ? 'chat-actions persist' : 'chat-actions';
     const msgBlock = hasContent
-      ? `<div class="chat-msg chat-msg-assistant" data-i="${i}">${body}</div>
+      ? `<div class="chat-msg chat-msg-assistant" data-i="${i}">${body}${sourcesBlock}</div>
          <div class="${actionsCls}" data-i="${i}">
            <button class="chat-action-btn" data-act="copy" title="Copy">
              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
@@ -1095,10 +1275,27 @@ function renderTurn(m, i) {
   return '';
 }
 
+// Footer chips for web_search citations attached to an assistant turn. Empty
+// string when there are none so the markup stays clean. Titles fall back to the
+// hostname; clicks are routed through window.shell.openExternal (delegated).
+function renderSourcesBlock(sources) {
+  if (!Array.isArray(sources) || !sources.length) return '';
+  const chips = sources.map(s => {
+    if (!s || !s.url) return '';
+    let host = '';
+    try { host = new URL(s.url).host; } catch { host = s.url; }
+    const label = (s.title && s.title.trim()) || host;
+    return `<a class="chat-source-chip" data-href="${escapeHtml(s.url)}" href="${escapeHtml(s.url)}" title="${escapeHtml(s.url)}" rel="noopener">${escapeHtml(label)}</a>`;
+  }).filter(Boolean).join('');
+  if (!chips) return '';
+  return `<div class="chat-sources"><div class="chat-sources-label">Sources</div><div class="chat-sources-list">${chips}</div></div>`;
+}
+
 function addChatMessage(role, content, extras = {}) {
   if (!chatStore[chatCurrentExe]) chatStore[chatCurrentExe] = [];
   chatStore[chatCurrentExe].push({ role, content, ...extras });
   renderChat();
+  updateChatEmptyClass();
 }
 
 function scrollChatToBottom() {
@@ -1107,6 +1304,18 @@ function scrollChatToBottom() {
 
 // Reasoning expand/collapse + actions
 chatMessagesEl.addEventListener('click', (e) => {
+  // Route http(s) anchors inside chat messages (assistant markdown links,
+  // web_search citation chips) through the OS browser. Without this, an in-app
+  // click would navigate the renderer window itself and break the chat UI.
+  const link = e.target.closest('a[href]');
+  if (link) {
+    const url = link.dataset.href || link.getAttribute('href') || '';
+    if (/^https?:\/\//i.test(url)) {
+      e.preventDefault();
+      try { window.shell.openExternal(url); } catch (err) { console.warn('openExternal failed', err); }
+      return;
+    }
+  }
   const reasoning = e.target.closest('.chat-reasoning');
   if (reasoning) {
     reasoning.classList.toggle('open');
@@ -1205,8 +1414,10 @@ const CHAT_STOP_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="cu
 
 function setChatBusy(state) {
   chatBusy = state;
-  chatInput.contentEditable = state ? 'false' : 'true';
-  chatInput.classList.toggle('is-disabled', state);
+  // Keep the composer editable + clickable at all times so the user can queue
+  // their next message while the model is still streaming. Send is still
+  // gated by `if (chatBusy) return` in sendChatMessage.
+  chatInput.contentEditable = 'true';
   if (state) {
     closeTabMenu();
     chatSendBtn.disabled = false;
@@ -1224,8 +1435,17 @@ function setChatBusy(state) {
 }
 
 // SSE wiring
+let chatChunkRaf = 0;
+function flushStreamMarkdown() {
+  chatChunkRaf = 0;
+  const el = document.getElementById('chat-stream-msg');
+  if (!el) return;
+  el.innerHTML = renderMarkdown(chatStreamContent);
+  scrollChatToBottom();
+}
 window.chat.onChunk((data) => {
   if (data.exe !== chatCurrentExe) return;
+  const wasEmpty = !chatStreamContent;
   chatStreamContent += data.delta;
   hideThinking();
 
@@ -1233,11 +1453,15 @@ window.chat.onChunk((data) => {
   if (!streamMsg) {
     streamMsg = document.createElement('div');
     streamMsg.id = 'chat-stream-msg';
-    streamMsg.className = 'chat-msg chat-msg-assistant';
+    streamMsg.className = 'chat-msg chat-msg-assistant streaming';
     chatMessagesEl.appendChild(streamMsg);
+    chatStreamEl = streamMsg;
   }
-  streamMsg.innerHTML = renderMarkdown(chatStreamContent);
-  scrollChatToBottom();
+  // Coalesce per-token innerHTML swaps into one rAF. Multiple chunks arriving
+  // in the same frame collapse to a single DOM rewrite + MutationObserver
+  // burst, which collapses to a single scheduleChatResize call.
+  if (!chatChunkRaf) chatChunkRaf = requestAnimationFrame(flushStreamMarkdown);
+  if (wasEmpty) updateChatEmptyClass(); // first chunk flips empty→non-empty
 });
 
 window.chat.onThinking((data) => {
@@ -1259,9 +1483,25 @@ window.chat.onTool((data) => {
   if (data.exe !== chatCurrentExe) return;
   if (data.name === 'ask_user') return; // rendered as a clarify card, not a tool line
   hideThinking();
+  if (data.name === 'web_search') {
+    const q = (data.args && typeof data.args.query === 'string') ? data.args.query.slice(0, 120) : '';
+    thinkingFallback = q ? `searching the web for "${q}"…` : 'searching the web…';
+    appendToolLine(`🌐 web_search ${escapeHtml(q ? `"${q}"` : '')}`);
+    return;
+  }
   thinkingFallback = `running ${data.name}…`;
   const summary = formatToolCall(data.name, data.args);
   appendToolLine(`⚙ ${summary}`);
+});
+
+// Inline URL citations from the hosted web_search tool. Collected for the
+// currently streaming assistant turn, deduplicated by URL, then rendered as a
+// Sources footer when chat:done lands. Ignore events for stale streams.
+window.chat.onCitation((data) => {
+  if (data.exe !== chatStreamExe) return;
+  if (!data.url) return;
+  if (chatStreamSources.some(s => s.url === data.url)) return;
+  chatStreamSources.push({ url: data.url, title: data.title || '' });
 });
 
 window.chat.onToolResult((data) => {
@@ -1270,6 +1510,23 @@ window.chat.onToolResult((data) => {
   const ok = data.result && data.result.ok;
   const err = data.result && data.result.error;
   let msg, fallback;
+  if (data.name === 'web_search' && !err) {
+    const n = (data.result && (data.result.count || (Array.isArray(data.result.sources) && data.result.sources.length))) || 0;
+    msg = `✓ web_search → ${n} source${n === 1 ? '' : 's'}`;
+    fallback = `web search returned ${n} source${n === 1 ? '' : 's'}`;
+    if (data.result && Array.isArray(data.result.sources)) {
+      for (const s of data.result.sources) {
+        if (s && s.url && !chatStreamSources.some(x => x.url === s.url)) {
+          chatStreamSources.push({ url: s.url, title: s.title || '' });
+        }
+      }
+    }
+    appendToolLine(msg);
+    thinkingFallback = fallback;
+    thinkingBuffer = '';
+    showThinking(fallback);
+    return;
+  }
   if (err) {
     msg = `✕ ${escapeHtml(data.name)}: ${escapeHtml(err)}`;
     fallback = `after ${data.name} → error: ${err}`;
@@ -1441,6 +1698,16 @@ function appendToolLine(html) {
 window.chat.onDone((data) => {
   if (data.exe !== chatStreamExe) return;
   hideThinking();
+  // Drain any pending coalesced markdown render so the final bubble paints
+  // the complete content before chat:done's renderChat() replaces it.
+  if (chatChunkRaf) { cancelAnimationFrame(chatChunkRaf); flushStreamMarkdown(); }
+  // Stop the streaming pulse on the in-flight assistant bubble.
+  try {
+    if (chatStreamEl && chatStreamEl.classList) chatStreamEl.classList.remove('streaming');
+    const liveStream = document.getElementById('chat-stream-msg');
+    if (liveStream) liveStream.classList.remove('streaming');
+  } catch {}
+  chatStreamEl = null;
 
   const targetExe = chatStreamExe;
   const elapsedMs = reasoningStartMs ? (Date.now() - reasoningStartMs) : 0;
@@ -1459,6 +1726,7 @@ window.chat.onDone((data) => {
       reasoningMs: elapsedMs,
       trail: doneTrail,
       userMsg: lastUserMessage || '',
+      sources: chatStreamSources.slice(),
     });
   }
 
@@ -1472,6 +1740,7 @@ window.chat.onDone((data) => {
 
   chatStreamContent = '';
   chatStreamExe = null;
+  chatStreamSources = [];
   thinkingBuffer = '';
   thinkingFallback = '';
   reasoningStartMs = 0;
@@ -1480,20 +1749,39 @@ window.chat.onDone((data) => {
   if (targetExe === chatCurrentExe) {
     renderChat();
   }
+  updateChatEmptyClass();
 });
 
-async function sendChatMessage(forcedText) {
+async function sendChatMessage(forcedText, forcedApps) {
   const text = forcedText !== undefined ? forcedText : serializeChatInput().trim();
   if (!text || chatBusy) return;
 
-  // Extract file attachments before clearing the input
+  // Extract file attachments + /app references before clearing the input
   let fileAttachments = [];
+  let appRefs = [];
   if (forcedText === undefined) {
     const filePills = chatInput.querySelectorAll('.chat-file-pill');
     fileAttachments = [...filePills].map(p => ({ type: 'file', id: p.dataset.fileId })).filter(a => a.id);
+    const appPills = chatInput.querySelectorAll('.chat-app-pill');
+    const seenApp = new Set();
+    appPills.forEach(p => {
+      const exe = p.dataset.appExe;
+      if (!exe || seenApp.has(exe)) return;
+      seenApp.add(exe);
+      const m = resolveAppMeta(exe, p.dataset.appName);
+      appRefs.push({ key: p.dataset.appKey || appKeyFor(exe), exe: m.exe, name: m.name, type: m.type, pid: m.pid, port: m.port });
+    });
     closeTabMenu();
+    closeAppMenu();
     clearChatInput();
+    // Click-Send moves focus to the button; Enter keeps it on the input.
+    // Always pull focus back so the user can keep typing without re-clicking.
+    try { chatInput.focus(); } catch {}
   }
+  // Overlay launcher path sends the first message via forcedText and resolves
+  // /app tokens itself (the composer there is the plain #launcher-input, not the
+  // pill-aware #chat-input), so honour an explicit apps[] when provided.
+  if (forcedText !== undefined && Array.isArray(forcedApps)) appRefs = forcedApps;
   addChatMessage('user', text);
   lastUserMessage = text;
 
@@ -1505,8 +1793,12 @@ async function sendChatMessage(forcedText) {
 
   chatStreamContent = '';
   chatStreamExe = chatCurrentExe;
+  chatStreamSources = [];
 
-  const meta = chatMetaStore[chatCurrentExe] || resolveAppMeta(chatCurrentExe, chatAppNameEl.textContent);
+  const isDirect = chatCurrentExe === DIRECT_CHAT_ID;
+  const meta = isDirect
+    ? (chatMetaStore[DIRECT_CHAT_ID] || { exe: DIRECT_CHAT_ID, name: 'GPT-5.5', type: 'direct', pid: null, port: null })
+    : (chatMetaStore[chatCurrentExe] || resolveAppMeta(chatCurrentExe, chatAppNameEl.textContent));
   chatMetaStore[chatCurrentExe] = meta;
 
   const apiMessages = (chatStore[chatCurrentExe] || [])
@@ -1514,7 +1806,11 @@ async function sendChatMessage(forcedText) {
     .map(m => ({ role: m.role, content: m.content }));
 
   try {
-    await window.chat.send({ meta, messages: apiMessages, attachments: fileAttachments });
+    if (isDirect) {
+      await window.chat.sendDirect({ messages: apiMessages, attachments: fileAttachments, apps: appRefs });
+    } else {
+      await window.chat.send({ meta, messages: apiMessages, attachments: fileAttachments, apps: appRefs });
+    }
   } catch (err) {
     hideThinking();
     const streamMsg = document.getElementById('chat-stream-msg');
@@ -1549,7 +1845,7 @@ chatInput.addEventListener('keydown', (e) => {
         newRange.collapse(true);
         pill.remove();
         // If nothing meaningful is left, reset so the :empty placeholder returns.
-        if (!chatInput.querySelector('.chat-tab-pill, .chat-file-pill') && chatInput.textContent.trim() === '') {
+        if (!chatInput.querySelector('.chat-tab-pill, .chat-file-pill, .chat-app-pill') && chatInput.textContent.trim() === '') {
           chatInput.innerHTML = '';
           chatInput.focus();
         } else {
@@ -1567,6 +1863,32 @@ chatInput.addEventListener('keydown', (e) => {
     if (ctx && shouldOfferFilePicker(ctx)) {
       e.preventDefault();
       openFilePicker(ctx);
+      return;
+    }
+  }
+  // While the /app menu is open, hijack navigation keys (Space falls through so
+  // the user can type a filter after `/app `).
+  if (appMenuState !== 'closed' && appMenuItems.length) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      appMenuActiveIdx = Math.min(appMenuItems.length - 1, appMenuActiveIdx + 1);
+      renderAppMenu();
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      appMenuActiveIdx = Math.max(0, appMenuActiveIdx - 1);
+      renderAppMenu();
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      pickApp(appMenuActiveIdx);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeAppMenu();
       return;
     }
   }
@@ -1617,6 +1939,7 @@ chatInput.addEventListener('input', () => {
   // <br> left behind when the field is emptied so the :empty placeholder shows.
   if (chatInput.textContent === '' && chatInput.querySelector('br')) chatInput.innerHTML = '';
   evaluateTabTrigger();
+  evaluateAppTrigger();
 });
 
 // ── `/tab` mention: reference Chrome tabs inline as pills ──────────────────────
@@ -1637,6 +1960,8 @@ const TAB_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="non
 
 const FILE_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>';
 
+const APP_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect></svg>';
+
 // Serialise the composer to plain text, turning pills into [tab:id "title"] tokens
 // and contenteditable's per-line <div> wrappers back into newlines.
 function serializeChatInput() {
@@ -1654,6 +1979,10 @@ function serializeChatInput() {
           const id = n.dataset.fileId || '';
           const name = (n.dataset.fileName || '').replace(/"/g, "'");
           out += `[file:${id} "${name}"]`;
+        } else if (n.classList && n.classList.contains('chat-app-pill')) {
+          const key = n.dataset.appKey || '';
+          const name = (n.dataset.appName || '').replace(/"/g, "'");
+          out += `[app:${key} "${name}"]`;
         } else if (n.tagName === 'BR') {
           out += '\n';
         } else if (n.tagName === 'DIV' || n.tagName === 'P') {
@@ -1768,7 +2097,10 @@ function renderTabMenu() {
 
 // Anchor the menu just above the caret line, inside the composer wrap.
 function positionTabMenu() {
-  const wrap = chatInput.closest('.chat-input-wrap');
+  // In overlay chat mode chatInput is reparented into .launcher-input-stack;
+  // the original .chat-input-wrap is no longer the ancestor. Fall back to
+  // whichever positioned container actually holds chatInput.
+  const wrap = chatInput.closest('.chat-input-wrap, .launcher-input-stack, .launcher-row');
   if (!wrap) return;
   const wrapRect = wrap.getBoundingClientRect();
   let caretRect = null;
@@ -1814,7 +2146,7 @@ function isTabPill(n) {
 }
 function isAnyPill(n) {
   return n && n.nodeType === Node.ELEMENT_NODE && n.classList &&
-    (n.classList.contains('chat-tab-pill') || n.classList.contains('chat-file-pill'));
+    (n.classList.contains('chat-tab-pill') || n.classList.contains('chat-file-pill') || n.classList.contains('chat-app-pill'));
 }
 const isEmptyText = (n) => n && n.nodeType === Node.TEXT_NODE && n.nodeValue === '';
 
@@ -1906,6 +2238,208 @@ document.addEventListener('mousedown', (e) => {
   if (tabMenuState === 'closed') return;
   if (tabMenuEl.contains(e.target) || chatInput.contains(e.target)) return;
   closeTabMenu();
+});
+
+// ── `/app` mention: reference any running app inline as a pill ────────────────
+// Typing `/app` (in app-scoped OR direct chat) pops a dropdown of running apps,
+// reusing the same detected list as the overlay launcher. Picking one drops an
+// inline pill. On send each pill serialises to `[app:<key> "<name>"]` and the
+// app's live meta is collected into payload.apps so the model can select_app it.
+const appMenuEl     = document.getElementById('chat-app-menu');
+const appMenuListEl = document.getElementById('chat-app-menu-list');
+
+let appMenuState     = 'closed';   // 'closed' | 'open'
+let appMenuItems     = [];
+let appMenuActiveIdx = 0;
+let appTrigger       = null;       // { node, filter, slashOffset, caretOffset }
+
+// Detected running apps, minus ChatGPT, optionally filtered by substring.
+// Mirrors the overlay launcher's candidate list (electron + UIA).
+function appMenuCandidates(filter) {
+  const out = [];
+  for (const a of currentApps) {
+    if (isChatGptApp(a)) continue;
+    const cdp = !!(a.cdpAlive && a.DebugPort);
+    out.push({ exe: a.Exe, name: a.Name, backend: cdp ? 'cdp' : 'uia' });
+  }
+  for (const a of cachedUiaApps) {
+    if (isChatGptApp(a)) continue;
+    if (out.some(o => o.exe === a.Exe)) continue;
+    out.push({ exe: a.Exe, name: a.Name, backend: 'uia' });
+  }
+  const f = (filter || '').trim().toLowerCase();
+  const filtered = f ? out.filter(o => (o.name || '').toLowerCase().includes(f) || (o.exe || '').toLowerCase().includes(f)) : out;
+  return filtered.slice(0, 50);
+}
+
+// Caret context for /app. Two phases: typing the command word itself (/a../app)
+// with no trailing text, OR `/app <filter>` to filter the list by name.
+function getAppContext() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  const node = range.startContainer;
+  if (node.nodeType !== Node.TEXT_NODE || !chatInput.contains(node)) return null;
+  const before = node.nodeValue.slice(0, range.startOffset);
+  // Phase 2: "/app " or "/app <filter>" (a space already separates the filter)
+  let m = /(^|\s)\/app[ \t]+([^\n]*)$/i.exec(before);
+  if (m) {
+    const tokenLen = m[0].length - (m[1] ? m[1].length : 0);
+    return { node, filter: m[2], slashOffset: range.startOffset - tokenLen, caretOffset: range.startOffset };
+  }
+  // Phase 1: typing the command word (/a, /ap, /app) with no trailing text
+  m = /(^|\s)\/([a-zA-Z]*)$/.exec(before);
+  if (m) {
+    const q = m[2].toLowerCase();
+    if (q.length >= 1 && ('app'.startsWith(q) || q.startsWith('app'))) {
+      return { node, filter: '', slashOffset: range.startOffset - m[2].length - 1, caretOffset: range.startOffset };
+    }
+  }
+  return null;
+}
+
+function evaluateAppTrigger() {
+  if (chatBusy) { if (appMenuState !== 'closed') closeAppMenu(); return; }
+  const ctx = getAppContext();
+  if (ctx) {
+    openAppMenu(ctx);
+  } else if (appMenuState !== 'closed') {
+    closeAppMenu();
+  }
+}
+
+function openAppMenu(ctx) {
+  appTrigger = ctx;
+  const items = appMenuCandidates(ctx.filter);
+  appMenuItems = items;
+  if (appMenuActiveIdx >= items.length) appMenuActiveIdx = 0;
+  if (!items.length) {
+    appMenuListEl.innerHTML = `<div class="chat-tab-menu-empty">No running apps match${ctx.filter ? ` “${escapeHtml(ctx.filter)}”` : ''}.</div>`;
+  } else {
+    renderAppMenu();
+  }
+  appMenuEl.hidden = false;
+  appMenuState = 'open';
+  positionAppMenu();
+}
+
+function closeAppMenu() {
+  appMenuState = 'closed';
+  appMenuEl.hidden = true;
+  appMenuItems = [];
+  appMenuActiveIdx = 0;
+  appTrigger = null;
+}
+
+function renderAppMenu() {
+  appMenuListEl.innerHTML = appMenuItems.map((a, i) => {
+    const base = (a.exe || '').split(/[\\/]/).pop() || a.exe || '';
+    return `
+      <button type="button" role="option" class="chat-tab-row${i === appMenuActiveIdx ? ' active' : ''}"
+              data-i="${i}" aria-selected="${i === appMenuActiveIdx}">
+        <span class="chat-tab-row-icon">${APP_GLYPH_SVG}</span>
+        <span class="chat-tab-row-body">
+          <span class="chat-tab-row-title">${escapeHtml(a.name || base)}</span>
+          <span class="chat-tab-row-url">${escapeHtml(base)} · ${a.backend}</span>
+        </span>
+      </button>`;
+  }).join('');
+  const activeRow = appMenuListEl.querySelector('.chat-tab-row.active');
+  if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
+}
+
+function positionAppMenu() {
+  const wrap = chatInput.closest('.chat-input-wrap, .launcher-input-stack, .launcher-row');
+  if (!wrap) return;
+  const wrapRect = wrap.getBoundingClientRect();
+  let caretRect = null;
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount) {
+    const rects = sel.getRangeAt(0).getClientRects();
+    if (rects.length) caretRect = rects[rects.length - 1];
+  }
+  if (!caretRect || (!caretRect.width && !caretRect.height)) caretRect = chatInput.getBoundingClientRect();
+  const left = Math.max(8, Math.min(caretRect.left - wrapRect.left, wrapRect.width - 16));
+  appMenuEl.style.left = left + 'px';
+  appMenuEl.style.bottom = (wrapRect.bottom - caretRect.top + 6) + 'px';
+  appMenuEl.style.top = 'auto';
+}
+
+function buildAppPill(app) {
+  const span = document.createElement('span');
+  span.className = 'chat-app-pill';
+  span.contentEditable = 'false';
+  span.dataset.appExe = app.exe || '';
+  span.dataset.appName = app.name || '';
+  span.dataset.appKey = appKeyFor(app.exe || '');
+  const label = (app.name || (app.exe || '').split(/[\\/]/).pop() || 'app').trim();
+  span.title = label + (app.exe ? ` — ${app.exe}` : '');
+  const icon = document.createElement('span');
+  icon.className = 'chat-app-pill-icon';
+  icon.innerHTML = APP_GLYPH_SVG;
+  const text = document.createElement('span');
+  text.className = 'chat-app-pill-label';
+  text.textContent = label;
+  span.appendChild(icon);
+  span.appendChild(text);
+  return span;
+}
+
+function pickApp(i) {
+  const app = appMenuItems[i];
+  if (app) insertAppPill(app);
+}
+
+// Splice the slash token (e.g. "/app" or "/app disc") out of its text node and
+// drop a pill in its place, leaving the caret after a trailing space.
+function insertAppPill(app) {
+  const ctx = appTrigger;
+  closeAppMenu();
+  if (!ctx || !chatInput.contains(ctx.node) || ctx.node.nodeType !== Node.TEXT_NODE) return;
+  const { node, slashOffset, caretOffset } = ctx;
+  const full = node.nodeValue;
+  const parent = node.parentNode;
+  const beforeNode = document.createTextNode(full.slice(0, slashOffset));
+  const pill = buildAppPill(app);
+  const spaceNode = document.createTextNode(' ');
+  const afterNode = document.createTextNode(full.slice(caretOffset));
+  parent.insertBefore(beforeNode, node);
+  parent.insertBefore(pill, node);
+  parent.insertBefore(spaceNode, node);
+  parent.insertBefore(afterNode, node);
+  parent.removeChild(node);
+  const sel = window.getSelection();
+  const range = document.createRange();
+  range.setStart(spaceNode, spaceNode.length);
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+  chatInput.focus();
+}
+
+appMenuListEl.addEventListener('mousedown', (e) => {
+  const row = e.target.closest('.chat-tab-row');
+  if (!row) return;
+  e.preventDefault();
+  pickApp(parseInt(row.dataset.i, 10));
+});
+appMenuListEl.addEventListener('mousemove', (e) => {
+  const row = e.target.closest('.chat-tab-row');
+  if (!row) return;
+  const i = parseInt(row.dataset.i, 10);
+  if (i !== appMenuActiveIdx) { appMenuActiveIdx = i; renderAppMenu(); }
+});
+document.addEventListener('selectionchange', () => {
+  if (appMenuState === 'closed' || document.activeElement !== chatInput) return;
+  const ctx = getAppContext();
+  if (!ctx) { closeAppMenu(); return; }
+  appTrigger = ctx;
+  positionAppMenu();
+});
+document.addEventListener('mousedown', (e) => {
+  if (appMenuState === 'closed') return;
+  if (appMenuEl.contains(e.target) || chatInput.contains(e.target)) return;
+  closeAppMenu();
 });
 
 // ── `/file` command: attach local files as inline pills ──────────────────────
@@ -3057,3 +3591,1139 @@ renderWorkspace = function () {
 
 // ── Init ──
 refreshApps();
+
+// ════════════════════════════════════════════════════════════════════════
+// Overlay mode — hotkey-activated quick-entry launcher.
+//
+// The same index.html/renderer.js runs in two windows. `?mode=overlay` turns
+// this window into the frameless launcher: a bottom-pinned bar where the user
+// searches an app (autocomplete + ghost text + dropdown), then either types a
+// task (Chat mode) or an automation name (Automation mode, entered via a
+// double-tap of the hotkey). Chat reuses openChat()/sendChatMessage(); runs
+// reuse runAutomation(). Everything below is inert unless mode === 'overlay'.
+// ════════════════════════════════════════════════════════════════════════
+(function initOverlayMode() {
+  const APP_MODE = new URLSearchParams(location.search).get('mode') || 'settings';
+  document.body.dataset.mode = APP_MODE;
+  if (APP_MODE !== 'overlay') return;
+
+  const OVERLAY_PAD = 16;                 // matches .launcher padding in CSS
+  let cfg = { width: 600, collapsedHeight: 72, dropdownMaxHeight: 280, chatHeight: 540, runHeight: 560 };
+  let WIN_W = cfg.width;
+
+  const launcher        = document.getElementById('launcher');
+  const launcherCard    = document.getElementById('launcher-card');
+  const launcherBackdrop= document.getElementById('launcher-backdrop');
+  const lRow            = launcherCard.querySelector('.launcher-row');
+  const lInput          = document.getElementById('launcher-input');
+  const lGhost          = document.getElementById('launcher-ghost');
+  const lDropdown       = document.getElementById('launcher-dropdown');
+  const lAppPill        = document.getElementById('launcher-app-pill');
+  const lAppPillIcon    = document.getElementById('launcher-app-pill-icon');
+  const lAppPillName    = document.getElementById('launcher-app-pill-name');
+  const lAppPillX       = document.getElementById('launcher-app-pill-x');
+  const lModeChip       = document.getElementById('launcher-mode-chip');
+  const lHint           = document.getElementById('launcher-hint');
+  const lSettingsBtn    = document.getElementById('launcher-settings-btn');
+  const lCloseBtn       = document.getElementById('launcher-close-btn');
+  const lFoot           = document.getElementById('launcher-foot');
+
+  // State
+  let mode      = 'chat';        // 'chat' | 'automation'
+  let stage     = 'app';         // 'app' | 'task'
+  let view      = 'launcher';    // 'launcher' | 'chat'
+  let selApp    = null;          // {name, exe, type, icon}
+  let items     = [];            // current dropdown candidates
+  let activeIdx = -1;            // highlighted dropdown row
+  let autos     = [];            // automation entries for selApp (automation mode)
+  let allowOverlayClose = true;  // mirrors top-level config.allowOverlayClose
+  // `/app` reference mode inside the launcher task input: when the user types
+  // `/app` mid-prompt, the dropdown lists running apps (same as initial app
+  // selection) and picking one inserts an [app:key "name"] token into lInput.
+  let lAppMode  = false;         // dropdown currently showing /app candidates
+  let lAppCtx   = null;          // { filter, start, end } caret span of the /app token
+  const launcherAppRefs = new Map(); // exe → resolved meta, for submit-time apps[]
+
+  function applyCloseBtnVisibility() {
+    if (lCloseBtn) lCloseBtn.hidden = allowOverlayClose;
+  }
+
+  window.overlay.getConfig().then((c) => {
+    if (c && c.overlay) { cfg = { ...cfg, ...c.overlay }; WIN_W = cfg.width; }
+    if (c) { allowOverlayClose = c.allowOverlayClose !== false; applyCloseBtnVisibility(); }
+  }).catch(() => {});
+
+  // ── App candidates (selected apps only — matches the workspace view) ──
+  // Electron selection = live CDP attach (cdpAlive); Win32 selection = selectedUiaExes.
+  // Without this filter the overlay listed every detected app instead of the
+  // user's chosen workspace apps.
+  function appCandidates() {
+    const out = [];
+    const seen = new Set();
+    for (const a of currentApps) {
+      if (!a.Exe || seen.has(a.Exe) || !a.cdpAlive) continue;
+      if (isChatGptApp(a)) continue;        // direct GPT chat supersedes app-scoping ChatGPT
+      seen.add(a.Exe);
+      out.push({
+        name: a.Name || a.Exe,
+        exe: a.Exe,
+        type: 'electron',
+        icon: a.Icon || '',
+        // Capture live CDP port + pid at selection time so a later refreshApps()
+        // race can't strip them before openChat() resolves meta. Without these,
+        // resolveAppMeta(exe) may read a stale row → meta.port=null → /tab gate
+        // refuses to open the picker (shouldOfferTabMenu requires meta.port).
+        port: a.DebugPort || null,
+        pid: a.MainPid || null,
+      });
+    }
+    for (const a of cachedUiaApps) {
+      if (!a.Exe || seen.has(a.Exe) || !selectedUiaExes.has(a.Exe)) continue;
+      if (isChatGptApp(a)) continue;
+      seen.add(a.Exe);
+      out.push({ name: a.Name || a.Exe, exe: a.Exe, type: 'uia', icon: a.Icon || '', port: null, pid: a.Pid || null });
+    }
+    return out;
+  }
+
+  // Skip app selection and open the Autobot direct chat with GPT-5.5. The
+  // chat is appless: no CDP/UIA snapshot, no scope guard, no per-app tools.
+  // Optional `msg` is sent as the first turn; empty just drops the user into
+  // the direct chat panel to type.
+  async function chatWithGptDirect(msg) {
+    showChatView();
+    try {
+      await openDirectChat();
+    } catch (err) {
+      console.warn('openDirectChat failed', err);
+    }
+    const t = (msg || '').trim();
+    if (t) sendChatMessage(t);
+  }
+
+  // prefix matches first, then substring; cap to keep the dropdown tight
+  function filterApps(q) {
+    const all = appCandidates();
+    if (!q) return all.slice(0, 8);
+    const ql = q.toLowerCase();
+    const pre = [], sub = [];
+    for (const a of all) {
+      const nl = a.name.toLowerCase();
+      if (nl.startsWith(ql)) pre.push(a);
+      else if (nl.includes(ql)) sub.push(a);
+    }
+    return [...pre, ...sub].slice(0, 8);
+  }
+
+  function filterAutos(q) {
+    if (!q) return autos.slice(0, 8);
+    const ql = q.toLowerCase();
+    const pre = [], sub = [];
+    for (const a of autos) {
+      const nl = (a.name || '').toLowerCase();
+      const sl = (a.slug || '').toLowerCase();
+      if (nl.startsWith(ql) || sl.startsWith(ql)) pre.push(a);
+      else if (nl.includes(ql) || sl.includes(ql)) sub.push(a);
+    }
+    return [...pre, ...sub].slice(0, 8);
+  }
+
+  // ── Window sizing ──
+  let lastSyncedH = -1;
+  let syncRAF     = 0;
+  function syncLauncherSize() {
+    if (view === 'chat') return; // chat mode is driven by sizeForChat()
+    if (syncRAF) cancelAnimationFrame(syncRAF);
+    syncRAF = requestAnimationFrame(() => {
+      syncRAF = 0;
+      const h = Math.ceil(launcherCard.getBoundingClientRect().height) + OVERLAY_PAD * 2;
+      // Dedupe: every keystroke calls renderDropdown -> syncLauncherSize, but the
+      // dropdown height only changes when row-count changes. Skipping no-op
+      // resizes prevents the frameless transparent window from repainting on
+      // each keystroke, which read as a full-UI flicker.
+      if (h === lastSyncedH) return;
+      const prev = lastSyncedH;
+      lastSyncedH = h;
+      // Tween only when transitioning to/from the collapsed state (dropdown
+      // opening/closing). Steady-state launcher keystrokes that nudge the
+      // height by a row reapply bounds instantly — 16-step tweens on a
+      // frameless transparent window otherwise read as a flicker per keystroke.
+      const instant = prev > 0;
+      window.overlay.resize(WIN_W, h, { anchor: 'bottom', instant });
+    });
+  }
+  // ── Inline chat sizing (top-anchored, content-driven, capped) ──
+  // The chat panel replaces the app-list region. The window keeps its top edge
+  // pinned and grows downward as messages accumulate. Main is the authority on
+  // the actual cap (fresh work area per resize); we propose a generous target
+  // and let main floor it. A min-delta gate + 60ms debounce prevents the
+  // streaming MutationObserver from re-tweening on every token.
+  let chatChromePx     = 130;     // re-measured at enter and on composer resize
+  // Bottom-anchored growth: window pins to the bottom, messages stack above the
+  // composer. Cache last sent payload so delta-gate can also fire on empty flip.
+  let lastSent         = { w: 0, h: 0, empty: false };
+  let chatResizeTimer  = null;
+  let chatResizeRAF    = null;
+  let chatScrollObs    = null;
+  let chatComposerObs  = null;
+  function chatWinW() { return Math.max(WIN_W, cfg.chatWidth || 760); }
+  function chatMinH() { return cfg.chatMinHeight || 280; }
+  function chatMaxFrac() { return cfg.chatMaxHeightFrac || 0.72; }
+  function measureChatChrome() { /* unused in static-composer layout */ }
+  // Cached availableUp the bottom-anchored resize can grant. Updated on enter
+  // and after each resize so chat-scroll's max-height tracks the true cap
+  // instead of overshooting and clipping content off-screen above the card.
+  let cachedAvailH = 0;
+  async function refreshAvailH() {
+    try { cachedAvailH = await window.overlay.maxHeight(); } catch {}
+  }
+  function sizeForChat(opts) {
+    const immediate = !!(opts && opts.immediate);
+    const empty = chatIsEmpty();
+    const w = chatWinW();
+    // Static-composer layout: launcher-card is `display:flex` inside `.launcher`
+    // (position:fixed, inset:0) so its height is upper-bounded by the window.
+    // Measuring cardH and then sizing the window to it is circular — when the
+    // window is small, chat-scroll's flex slot collapses (to ~52px) even though
+    // chat-messages.scrollHeight is much larger. Instead, compute the window
+    // target directly from content: chat-messages.scrollHeight + composer +
+    // foot + picker (if any) + overlay padding, capped at 72% of screen height.
+    let target;
+    if (empty) {
+      // Clear any inline cap from a previous non-empty pass so the empty card
+      // hugs lRow + foot only.
+      chatScrollEl.style.maxHeight = '';
+      const cardH = Math.ceil(launcherCard.getBoundingClientRect().height);
+      target = cardH + OVERLAY_PAD * 2;
+    } else {
+      const lRowH = Math.ceil(lRow.getBoundingClientRect().height) || 52;
+      const footEl = document.querySelector('.launcher-foot');
+      const footH = footEl ? Math.ceil(footEl.getBoundingClientRect().height) : 30;
+      const cwpVisible = chatWindowPickerEl && !chatWindowPickerEl.hidden
+        && chatWindowPickerEl.parentNode === launcherCard;
+      const cwpH = cwpVisible ? Math.ceil(chatWindowPickerEl.getBoundingClientRect().height) + 6 : 0;
+      const screenH = (window.screen && window.screen.availHeight) || 900;
+      const chromeH = lRowH + footH + cwpH + 6 + OVERLAY_PAD * 2;
+      const screenCap = Math.floor(screenH * 0.85);
+      // Use the lower of (screen-fraction cap) and (what main can actually
+      // grant from current window position). Without the main cap we'd ask
+      // for a window taller than the desktop and the card would overflow
+      // off-screen above the viewport.
+      const availCap = cachedAvailH > 0 ? cachedAvailH : screenCap;
+      const maxWinH = Math.min(screenCap, availCap);
+      const maxScrollH = Math.max(120, maxWinH - chromeH);
+      const msgsH = Math.ceil(chatMessagesEl.scrollHeight);
+      const scrollH = Math.min(msgsH + 4, maxScrollH);
+      // Drive chat-scroll height from JS so the old CSS 72vh trap (vh derived
+      // from the window we are about to resize) can't fight us. Card sums to
+      // its children; window matches card + overlay padding. No dead space.
+      chatScrollEl.style.maxHeight = scrollH + 'px';
+      target = scrollH + chromeH;
+    }
+    const flipped = empty !== lastSent.empty;
+    // During GPT streaming, scrollHeight grows by a few px per token. Each
+    // setBounds on the transparent frameless overlay = one DWM repaint = one
+    // visible flicker, so coalesce growth into multi-line hops (~120px ≈ 5
+    // lines). Non-streaming UI keeps the tight 6px gate so launcher / msg-list
+    // edits feel responsive.
+    const streaming = !!chatStreamExe;
+    const minDelta = streaming ? 120 : 6;
+    if (!immediate && !flipped && Math.abs(target - lastSent.h) < minDelta && w === lastSent.w) return;
+    lastSent = { w, h: target, empty };
+    const atBottom = chatScrollEl.scrollTop + chatScrollEl.clientHeight >= chatScrollEl.scrollHeight - 24;
+    // Every resize is instant. The tween used to run 16 setBounds × 14ms on
+    // the empty↔non-empty flip and the first chat-mode size to look smooth,
+    // but each tween step DWM-repaints the transparent frameless window — the
+    // animation IS the flicker. One setBounds = one flicker; tweening turns a
+    // single state change into ~16 visible flashes. Static target only.
+    window.overlay.resize(w, target, { anchor: 'bottom', instant: true });
+    // setBounds is synchronous on the main side but the renderer hasn't seen
+    // the new viewport yet. Refresh the cap and re-pin scroll on the next tick.
+    setTimeout(() => { refreshAvailH(); }, 32);
+    if (atBottom) requestAnimationFrame(() => { chatScrollEl.scrollTop = chatScrollEl.scrollHeight; });
+  }
+  function scheduleChatResize() {
+    // Trailing-edge throttle: if a tick is already pending, let it fire
+    // instead of resetting it. Pure debounce here meant a continuous token
+    // stream (chunks faster than `delay`) kept pushing the timer forward and
+    // the window never grew until the stream paused or finished — chat view
+    // stayed collapsed for the whole reply. Throttling guarantees a resize
+    // lands at most `delay`ms after the first dirty chunk, mid-stream.
+    if (chatResizeTimer) return;
+    // Streaming bursts MutationObserver callbacks per token. A 60ms tick still
+    // lets ~16 setBounds/sec through, which DWM-flickers the transparent
+    // frameless window. Stretch to ~200ms while a turn is streaming so growth
+    // lands in discrete steps; 60ms for normal edits.
+    const delay = chatStreamExe ? 200 : 60;
+    chatResizeTimer = setTimeout(() => {
+      chatResizeTimer = null;
+      if (chatResizeRAF) cancelAnimationFrame(chatResizeRAF);
+      chatResizeRAF = requestAnimationFrame(() => { chatResizeRAF = null; sizeForChat(); });
+    }, delay);
+  }
+  function attachChatObservers() {
+    if (!chatScrollObs) {
+      chatScrollObs = new MutationObserver(() => {
+        updateChatEmptyClass();
+        scheduleChatResize();
+      });
+      chatScrollObs.observe(chatScrollEl, { childList: true, subtree: true, characterData: true });
+    }
+    if (!chatComposerObs && typeof ResizeObserver !== 'undefined') {
+      chatComposerObs = new ResizeObserver(() => { scheduleChatResize(); });
+      chatComposerObs.observe(launcherCard);
+    }
+  }
+  function detachChatObservers() {
+    try { chatScrollObs && chatScrollObs.disconnect(); } catch {}
+    try { chatComposerObs && chatComposerObs.disconnect(); } catch {}
+    chatScrollObs = null;
+    chatComposerObs = null;
+    if (chatResizeTimer) { clearTimeout(chatResizeTimer); chatResizeTimer = null; }
+    if (chatResizeRAF) { cancelAnimationFrame(chatResizeRAF); chatResizeRAF = null; }
+  }
+  function sizeForRun()   { window.overlay.resize(WIN_W, cfg.runHeight, { center: true }); }
+
+  // ── Inline chat panel: static-composer mode ──
+  // The launcher-row at the bottom IS the composer — across both launcher and
+  // chat. On enter we slot #chat-input (and its sibling #chat-tab-menu) into
+  // the .launcher-input-stack so the contenteditable + pill/slash/file logic
+  // keep working, hide the underlying #launcher-input, and reparent #chat-scroll
+  // (plus #chat-window-picker when applicable) above lRow inside .launcher-card.
+  // No DOM duplication; restore swaps everything back on exit.
+  let inlineChatActive = false;
+  // Saved parent/anchor pairs for each reparented node so exit can restore.
+  let inlineSaved = null;       // { chatInput, tabMenu, chatScroll, windowPicker }
+  const inputStack = lRow.querySelector('.launcher-input-stack');
+  const chatInputEl = document.getElementById('chat-input');
+  const chatTabMenuEl = document.getElementById('chat-tab-menu');
+  const chatAppMenuEl = document.getElementById('chat-app-menu');
+  const chatWindowPickerEl = document.getElementById('chat-window-picker');
+  const chatHeaderEl = pageChat.querySelector('.chat-header');
+  const chatComposerEl = pageChat.querySelector('.chat-composer');
+  function saveAnchor(node) {
+    if (!node) return null;
+    return { parent: node.parentNode, next: node.nextSibling };
+  }
+  function restoreAnchor(node, anchor) {
+    if (!node || !anchor || !anchor.parent) return;
+    if (anchor.next && anchor.next.parentNode === anchor.parent) {
+      anchor.parent.insertBefore(node, anchor.next);
+    } else {
+      anchor.parent.appendChild(node);
+    }
+  }
+  function enterInlineChat() {
+    if (inlineChatActive) { sizeForChat({ immediate: true }); return; }
+    inlineChatActive = true;
+    view = 'chat';
+    document.body.dataset.overlayView = 'chat';
+    lDropdown.hidden = true;
+    inlineSaved = {
+      chatInput: saveAnchor(chatInputEl),
+      tabMenu: saveAnchor(chatTabMenuEl),
+      appMenu: saveAnchor(chatAppMenuEl),
+      chatScroll: saveAnchor(chatScrollEl),
+      windowPicker: saveAnchor(chatWindowPickerEl),
+    };
+    // Slot chat-input into the launcher-input-stack so lRow remains the visible
+    // composer; lInput + ghost stay in the DOM but hidden via .has-chat-input.
+    if (chatInputEl && inputStack) inputStack.appendChild(chatInputEl);
+    if (chatTabMenuEl && inputStack) inputStack.appendChild(chatTabMenuEl);
+    if (chatAppMenuEl && inputStack) inputStack.appendChild(chatAppMenuEl);
+    // Reparent chat-scroll and the multi-window picker above lRow.
+    if (chatScrollEl) launcherCard.insertBefore(chatScrollEl, lRow);
+    if (chatWindowPickerEl) launcherCard.insertBefore(chatWindowPickerEl, chatScrollEl || lRow);
+    // pageChat still in main tree but its children moved out — keep .active off
+    // so chat-empty / chat-header CSS quirks elsewhere don't kick in.
+    pageChat.classList.remove('active', 'chat-enter', 'chat-leave', 'inline-enter');
+    inputStack.classList.add('has-chat-input');
+    currentPage = 'chat';
+    updateChatEmptyClass();
+    setHint();
+    lastSent = { w: 0, h: 0, empty: false };
+    window.__overlaySizeForChat = sizeForChat;
+    chatScrollEl.classList.add('chat-enter');
+    refreshAvailH().then(() => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          measureChatChrome();
+          sizeForChat({ immediate: true });
+          attachChatObservers();
+        });
+      });
+    });
+    try { sessionStorage.setItem('autobot.overlay.view', 'chat'); } catch {}
+    try { sessionStorage.setItem('autobot.overlay.exe', String(chatCurrentExe || '')); } catch {}
+    if (chatInputEl) chatInputEl.focus();
+  }
+  function exitInlineChat() {
+    if (!inlineChatActive) return;
+    inlineChatActive = false;
+    chatScrollEl.classList.remove('chat-enter');
+    chatScrollEl.classList.add('chat-leave');
+    setTimeout(() => {
+      detachChatObservers();
+      lastSent = { w: 0, h: 0, empty: false };
+      pageChat.classList.remove('active', 'inline-enter', 'chat-leave', 'chat-empty');
+      chatScrollEl.classList.remove('chat-leave');
+      // Drop the inline max-height sizeForChat set during chat mode; next
+      // enter re-derives it from the new chat-messages content.
+      chatScrollEl.style.maxHeight = '';
+      inputStack.classList.remove('has-chat-input');
+      // Restore all four reparented nodes to their original anchors.
+      if (inlineSaved) {
+        restoreAnchor(chatInputEl, inlineSaved.chatInput);
+        restoreAnchor(chatTabMenuEl, inlineSaved.tabMenu);
+        restoreAnchor(chatAppMenuEl, inlineSaved.appMenu);
+        restoreAnchor(chatScrollEl, inlineSaved.chatScroll);
+        restoreAnchor(chatWindowPickerEl, inlineSaved.windowPicker);
+      }
+      inlineSaved = null;
+      try { delete window.__overlaySizeForChat; } catch { window.__overlaySizeForChat = undefined; }
+      document.body.dataset.overlayView = 'launcher';
+      syncLauncherSize();
+    }, 140);
+    try { sessionStorage.removeItem('autobot.overlay.view'); } catch {}
+    try { sessionStorage.removeItem('autobot.overlay.exe'); } catch {}
+  }
+
+  // ── Dropdown render ──
+  const ICON_PLACEHOLDER =
+    '<span class="ld-icon-fallback"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="3"></rect></svg></span>';
+
+  // Stable identity per item so we can detect when the row set is unchanged
+  // and patch in place instead of wiping innerHTML. Wiping re-mounts every
+  // row, which re-fires the .ld-row entrance keyframe and reads as a list-
+  // wide flicker on each keystroke / arrow-nav.
+  function rowKeyFor(it) {
+    if (mode === 'automation' && stage === 'task') return `auto|${it.slug || it.name || ''}`;
+    return `app|${it.type || ''}|${it.exe || it.path || it.name || ''}`;
+  }
+  function rowHtmlFor(it, i) {
+    const active = i === activeIdx ? ' active' : '';
+    if (mode === 'automation' && stage === 'task') {
+      const sub = it.userMsg ? escapeHtml(String(it.userMsg).slice(0, 60)) : `${(it.steps || []).length} steps`;
+      return `<div class="ld-row${active}" role="option" data-i="${i}">
+        <span class="ld-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg></span>
+        <span class="ld-text"><span class="ld-name">${escapeHtml(it.name)}</span><span class="ld-sub">${sub}</span></span>
+      </div>`;
+    }
+    const iconHtml = it.icon ? `<img class="ld-icon-img" src="${it.icon}" alt="">` : ICON_PLACEHOLDER;
+    return `<div class="ld-row${active}" role="option" data-i="${i}">
+      ${iconHtml}
+      <span class="ld-text"><span class="ld-name">${escapeHtml(it.name)}</span><span class="ld-sub">${it.type === 'electron' ? 'Electron · CDP' : 'Win32 · UIA'}</span></span>
+      <span class="ld-enter">hit <kbd>tab</kbd></span>
+    </div>`;
+  }
+
+  let lastRowKeys = [];
+  function renderDropdown() {
+    if (!items.length) { lDropdown.hidden = true; lDropdown.innerHTML = ''; lastRowKeys = []; syncLauncherSize(); return; }
+    lDropdown.hidden = false;
+    lDropdown.style.maxHeight = cfg.dropdownMaxHeight + 'px';
+    const keys = items.map(rowKeyFor);
+    const sameSet = keys.length === lastRowKeys.length
+      && lDropdown.children.length === keys.length
+      && keys.every((k, i) => k === lastRowKeys[i]);
+    if (sameSet) {
+      // Patch in place: only flip .active. Existing nodes stay alive so the
+      // ldRowIn entrance keyframe does not re-fire.
+      for (let i = 0; i < keys.length; i++) {
+        const row = lDropdown.children[i];
+        const shouldActive = i === activeIdx;
+        if (row.classList.contains('active') !== shouldActive) row.classList.toggle('active', shouldActive);
+      }
+    } else {
+      lDropdown.innerHTML = items.map((it, i) => rowHtmlFor(it, i)).join('');
+      lastRowKeys = keys;
+    }
+    // No visible scrollbar, so keep the active row on screen as the user
+    // arrows through the list (block:'nearest' avoids jumping when in view).
+    const activeRow = lDropdown.children[activeIdx];
+    if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
+    syncLauncherSize();
+  }
+
+  function setGhost() {
+    const v = lInput.value;
+    // No inline ghost while picking a /app reference — the input holds the whole
+    // prompt, not just an app name, so ghosting the app name would corrupt it.
+    if (lAppMode) { lGhost.textContent = ''; return; }
+    if (!v || activeIdx > 0) { lGhost.textContent = ''; return; }
+    const top = items[0];
+    if (top && top.gptDirect) { lGhost.textContent = ''; return; }
+    const label = top ? (mode === 'automation' && stage === 'task' ? top.name : top.name) : '';
+    if (label && label.toLowerCase().startsWith(v.toLowerCase()) && label.length > v.length) {
+      lGhost.textContent = v + label.slice(v.length);
+    } else {
+      lGhost.textContent = '';
+    }
+  }
+
+  // Caret context for a `/app` token in the launcher TASK input. Two phases like
+  // the chat composer: typing the command word (/a../app) or `/app <filter>`.
+  function lAppContext() {
+    if (stage !== 'task' || mode === 'automation') return null;
+    const caret = (lInput.selectionStart == null) ? lInput.value.length : lInput.selectionStart;
+    const before = lInput.value.slice(0, caret);
+    let m = /(^|\s)\/app[ \t]+([^\n]*)$/i.exec(before);
+    if (m) { const tokLen = m[0].length - (m[1] ? m[1].length : 0); return { filter: m[2], start: caret - tokLen, end: caret }; }
+    m = /(^|\s)\/([a-zA-Z]*)$/.exec(before);
+    if (m) { const word = m[2].toLowerCase(); if (word.length >= 1 && ('app'.startsWith(word) || word.startsWith('app'))) return { filter: '', start: caret - m[2].length - 1, end: caret }; }
+    return null;
+  }
+
+  function refreshSuggestions() {
+    const q = lInput.value.trim();
+    if (stage === 'app') {
+      items = filterApps(q);
+      lAppMode = false; lAppCtx = null;
+    }
+    else if (mode === 'automation') { items = filterAutos(q); lAppMode = false; lAppCtx = null; }
+    else {
+      // chat task stage: free text, EXCEPT a `/app` token opens the app list.
+      const actx = lAppContext();
+      if (actx) { lAppMode = true; lAppCtx = actx; items = filterApps(actx.filter.trim()); }
+      else { lAppMode = false; lAppCtx = null; items = []; }
+    }
+    activeIdx = items.length ? 0 : -1;
+    renderDropdown();
+    setGhost();
+  }
+
+  function completeGhost() {
+    if (lGhost.textContent) { lInput.value = lGhost.textContent; lGhost.textContent = ''; refreshSuggestions(); return true; }
+    if (items[activeIdx]) { lInput.value = items[activeIdx].name; lGhost.textContent = ''; refreshSuggestions(); return true; }
+    return false;
+  }
+
+  // ── Stage transitions ──
+  function setModeChip() {
+    lModeChip.textContent = mode === 'automation' ? 'Automation' : 'Chat';
+    lModeChip.dataset.mode = mode;
+    launcherCard.dataset.mode = mode;
+  }
+  function setHint() {
+    if (view === 'chat') {
+      lHint.textContent = 'Enter to send · Shift+Enter for newline · Esc to close · Hold Esc to clear chat';
+      return;
+    }
+    if (stage === 'app') lHint.textContent = '↑↓ navigate · Tab to pick an app · Enter to chat with GPT-5.5 · Esc to close';
+    else if (mode === 'automation') lHint.textContent = `Run an automation on ${selApp ? selApp.name : ''} · Enter to run`;
+    else lHint.textContent = `Ask ${selApp ? selApp.name : 'the app'} to do something · Enter to send`;
+  }
+
+  function enterLauncher(nextMode) {
+    // If we were in inline chat, unmount it (DOM reparent + state clear)
+    // before resetting the launcher.
+    const wasInline = inlineChatActive;
+    if (inlineChatActive) exitInlineChat();
+    view = 'launcher';
+    mode = nextMode === 'automation' ? 'automation' : 'chat';
+    stage = 'app';
+    selApp = null;
+    autos = [];
+    lAppPill.hidden = true;
+    lInput.value = '';
+    lGhost.textContent = '';
+    lInput.placeholder = 'Search an app or type a prompt…';
+    // hide chat page if it was open
+    pageChat.classList.remove('active');
+    pageWorkspace.classList.remove('active');
+    pageInspector.classList.remove('active');
+    // switchPage() short-circuits when currentPage matches the target, so the
+    // class removals above would silently no-op the next switchPage('chat').
+    // Reset to a sentinel so any later page switch actually re-applies .active.
+    currentPage = 'launcher';
+    launcher.hidden = false;
+    launcherCard.classList.remove('anim');
+    void launcherCard.offsetWidth;          // reflow so the entrance anim replays each show
+    launcherCard.classList.add('anim');
+    setModeChip();
+    setHint();
+    refreshSuggestions();
+    lInput.focus();
+    // When exiting inline chat, .has-chat-input keeps lInput display:none until
+    // exitInlineChat's 140ms restoration timeout removes the class. The focus()
+    // above is dropped because the element isn't focusable yet. Re-focus once
+    // the DOM is restored so the user can type immediately after Esc-hold reset.
+    if (wasInline) {
+      setTimeout(() => { try { lInput.focus(); } catch {} }, 160);
+    }
+    syncLauncherSize();
+  }
+
+  // Exposed for module-scope callers (e.g. resetCurrentChat) so a chat reset
+  // can return to the launcher's "Search an app or type a prompt" view instead
+  // of sitting in the empty inline-chat state.
+  window.__enterLauncher = enterLauncher;
+
+  async function selectApp(app) {
+    selApp = app;
+    lAppPill.hidden = false;
+    lAppPillName.textContent = app.name;
+    if (app.icon) { lAppPillIcon.src = app.icon; lAppPillIcon.style.display = ''; }
+    else lAppPillIcon.style.display = 'none';
+    stage = 'task';
+    lInput.value = '';
+    lGhost.textContent = '';
+    lDropdown.hidden = true;
+    items = [];
+    if (mode === 'automation') {
+      lInput.placeholder = 'Automation name…';
+      try { autos = await window.automation.list(app.exe) || []; } catch { autos = []; }
+      refreshSuggestions();
+    } else {
+      lInput.placeholder = `Message ${app.name}…`;
+    }
+    setHint();
+    lInput.focus();
+    syncLauncherSize();
+  }
+
+  function popApp() {
+    if (stage !== 'task') return;
+    stage = 'app';
+    selApp = null;
+    autos = [];
+    lAppPill.hidden = true;
+    lInput.value = '';
+    lInput.placeholder = 'Search an app or type a prompt…';
+    setHint();
+    refreshSuggestions();
+    lInput.focus();
+  }
+
+  function showChatView() {
+    // Inline chat lives inside .launcher-card now — keep launcher visible so
+    // its bottom edge anchors the window and the chat grows upward above it.
+    enterInlineChat();
+  }
+
+  // Replace the active `/app` token in lInput with `[app:key "name"]` and record
+  // the app's resolved meta so submit can hand it to the backend as apps[].
+  function pickLauncherApp(app) {
+    const ctx = lAppCtx;
+    if (!ctx || !app) return;
+    const key = appKeyFor(app.exe);
+    const token = `[app:${key} "${String(app.name || '').replace(/"/g, "'")}"] `;
+    const v = lInput.value;
+    lInput.value = v.slice(0, ctx.start) + token + v.slice(ctx.end);
+    launcherAppRefs.set(app.exe, { key, exe: app.exe, name: app.name, type: app.type, pid: app.pid || null, port: app.port || null });
+    const pos = ctx.start + token.length;
+    lAppMode = false; lAppCtx = null; items = []; activeIdx = -1;
+    lDropdown.hidden = true; lGhost.textContent = '';
+    lInput.focus();
+    try { lInput.setSelectionRange(pos, pos); } catch {}
+    refreshSuggestions();
+  }
+
+  // Scan a task string for [app:key "name"] tokens → resolved apps[] for the
+  // backend. Prefers the meta captured at pick time; falls back to live lookup.
+  function collectLauncherApps(text) {
+    const out = []; const seen = new Set();
+    const re = /\[app:([^\s\]]+)\s+"([^"]*)"\]/g;
+    let m;
+    while ((m = re.exec(text))) {
+      const key = m[1], name = m[2];
+      let meta = null;
+      for (const v of launcherAppRefs.values()) { if (v.key === key) { meta = v; break; } }
+      if (!meta) {
+        const c = appCandidates().find(a => appKeyFor(a.exe) === key || String(a.name || '').toLowerCase() === name.toLowerCase());
+        if (c) meta = { key: appKeyFor(c.exe), exe: c.exe, name: c.name, type: c.type, pid: c.pid || null, port: c.port || null };
+      }
+      if (meta && !seen.has(meta.exe)) { seen.add(meta.exe); out.push(meta); }
+    }
+    return out;
+  }
+
+  // ── Submit ──
+  async function submitChat(task) {
+    if (!selApp || !task.trim()) return;
+    showChatView();
+    try {
+      // Pass selApp through so openChat skips resolveAppMeta(exe) and uses the
+      // CDP port captured when the user selected the app. Without this, a
+      // racing refreshApps() can land a row with cdpAlive=false → meta.port
+      // null → /tab picker silently refuses to open.
+      await openChat(selApp.name, selApp.exe, selApp);
+    } catch (e) { /* openChat handles its own errors */ }
+    const apps = collectLauncherApps(task);
+    sendChatMessage(task.trim(), apps);
+  }
+
+  function submitAutomation(q) {
+    if (!selApp) return;
+    const ql = q.trim().toLowerCase();
+    let entry = items[activeIdx]
+      || autos.find(a => (a.name || '').toLowerCase() === ql || (a.slug || '').toLowerCase() === ql)
+      || filterAutos(q.trim())[0];
+    if (!entry) { lHint.textContent = 'No matching automation. ↑↓ to pick from the list.'; return; }
+    const meta = resolveAppMeta(selApp.exe, selApp.name);
+    if (meta.type === 'electron' && !meta.port) {
+      lHint.textContent = '⚠ This app needs CDP enabled — turn it on in Settings.';
+      return;
+    }
+    // Grow + center so the run modal fits, then run (reuses runAutomation()).
+    sizeForRun();
+    runAutomation(entry, meta);
+  }
+
+  // ── Input events ──
+  lInput.addEventListener('input', () => {
+    activeIdx = items.length ? 0 : -1;
+    refreshSuggestions();
+  });
+
+  lInput.addEventListener('keydown', (e) => {
+    const hasList = !lDropdown.hidden && items.length;
+    // `/app` reference picking: Enter/Tab insert the highlighted app token,
+    // Escape dismisses the app list without leaving the task stage. Arrow keys
+    // fall through to the normal list navigation below.
+    if (lAppMode && items.length) {
+      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickLauncherApp(items[activeIdx] || items[0]); return; }
+      if (e.key === 'Escape') { e.preventDefault(); lAppMode = false; lAppCtx = null; items = []; activeIdx = -1; lDropdown.hidden = true; lGhost.textContent = ''; setHint(); syncLauncherSize(); return; }
+    }
+    if (e.key === 'ArrowDown' && hasList) {
+      e.preventDefault(); activeIdx = (activeIdx + 1) % items.length; renderDropdown(); setGhost(); return;
+    }
+    if (e.key === 'ArrowUp' && hasList) {
+      e.preventDefault(); activeIdx = (activeIdx - 1 + items.length) % items.length; renderDropdown(); setGhost(); return;
+    }
+    if (e.key === 'Tab') {
+      // App stage: Tab picks the highlighted/ghost app (autocomplete-to-select).
+      // Automation stage: Tab fills the ghosted automation name into the input.
+      if (stage === 'app') {
+        e.preventDefault();
+        const typed = lInput.value.trim();
+        const pick = items[activeIdx] || (lGhost.textContent ? items[0] : null) || filterApps(typed)[0];
+        if (pick && pick.gptDirect) { chatWithGptDirect(typed); return; }
+        if (pick) { selectApp(pick); return; }
+        return;
+      }
+      if (mode === 'automation' && completeGhost()) { e.preventDefault(); return; }
+    }
+    if (e.key === 'Escape') {
+      if (stage === 'task') { e.preventDefault(); popApp(); return; }
+      if (allowOverlayClose) { e.preventDefault(); window.overlay.dismiss(); }
+      return;
+    }
+    if (e.key === 'Backspace' && lInput.value === '' && stage === 'task') {
+      e.preventDefault(); popApp(); return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (stage === 'app') {
+        // Enter is reserved for direct GPT-5.5 chat. App selection uses Tab.
+        chatWithGptDirect(lInput.value.trim());
+        return;
+      }
+      if (mode === 'automation') { submitAutomation(lInput.value); return; }
+      // chat task
+      submitChat(lInput.value);
+      return;
+    }
+  });
+
+  lDropdown.addEventListener('click', (e) => {
+    const row = e.target.closest('.ld-row');
+    if (!row) return;
+    const i = Number(row.dataset.i);
+    if (Number.isNaN(i) || !items[i]) return;
+    if (lAppMode) { pickLauncherApp(items[i]); return; }
+    if (stage === 'app') {
+      if (items[i].gptDirect) chatWithGptDirect(lInput.value.trim());
+      else selectApp(items[i]);
+    }
+    else if (mode === 'automation') { activeIdx = i; submitAutomation(items[i].name); }
+  });
+
+  lAppPillX.addEventListener('click', popApp);
+  // Gear menu: in launcher view, click opens Settings directly. In chat view,
+  // it toggles a small popover with Reset / Pick different app / Settings.
+  const gearMenuEl     = document.getElementById('launcher-gear-menu');
+  const gearResetBtn   = document.getElementById('launcher-gear-reset');
+  const gearPickBtn    = document.getElementById('launcher-gear-pick');
+  const gearSettingsBtn= document.getElementById('launcher-gear-settings');
+  function closeGearMenu() { if (gearMenuEl) gearMenuEl.hidden = true; }
+  function openGearMenu() {
+    if (!gearMenuEl) return;
+    // Item visibility depends on whether the current chat is app-scoped.
+    if (gearPickBtn) gearPickBtn.hidden = !(chatCurrentExe && chatCurrentExe !== DIRECT_CHAT_ID);
+    gearMenuEl.hidden = false;
+  }
+  lSettingsBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (view !== 'chat') { window.overlay.openSettings(); return; }
+    if (gearMenuEl && gearMenuEl.hidden) openGearMenu(); else closeGearMenu();
+  });
+  document.addEventListener('click', (e) => {
+    if (!gearMenuEl || gearMenuEl.hidden) return;
+    if (gearMenuEl.contains(e.target) || lSettingsBtn.contains(e.target)) return;
+    closeGearMenu();
+  });
+  if (gearResetBtn) gearResetBtn.addEventListener('click', () => {
+    closeGearMenu();
+    // Reuse the existing chat-reset path (chatNewBtn click handler).
+    chatNewBtn.click();
+  });
+  if (gearPickBtn) gearPickBtn.addEventListener('click', () => {
+    closeGearMenu();
+    enterLauncher('chat');
+  });
+  if (gearSettingsBtn) gearSettingsBtn.addEventListener('click', () => {
+    closeGearMenu();
+    window.overlay.openSettings();
+  });
+  lCloseBtn.addEventListener('click', () => window.overlay.dismiss());
+  launcherBackdrop.addEventListener('click', () => { if (allowOverlayClose) window.overlay.dismiss(); });
+
+  // ── Drag the overlay by its footer/hint bar ──
+  // The window is frameless and uses JS-driven dragging (CSS app-region drag
+  // can't snap and fights the always-on-top/click behavior). On mousedown we
+  // capture the window's top-left + the screen cursor offset, then on each
+  // mousemove report the new desired top-left to main (which applies the
+  // horizontal-center snap + on-screen clamp). setDragging suppresses the
+  // blur-dismiss while a drag is live.
+  (function wireFooterDrag() {
+    let dragging = false;
+    let startScreenX = 0, startScreenY = 0;   // cursor position when drag began
+    let startWinX = 0, startWinY = 0;         // window top-left when drag began
+
+    function onMouseMove(e) {
+      if (!dragging) return;
+      const x = startWinX + (e.screenX - startScreenX);
+      const y = startWinY + (e.screenY - startScreenY);
+      window.overlay.moveTo(x, y);
+    }
+    function onMouseUp() {
+      if (!dragging) return;
+      dragging = false;
+      document.removeEventListener('mousemove', onMouseMove, true);
+      document.removeEventListener('mouseup', onMouseUp, true);
+      window.overlay.setDragging(false);
+    }
+    lFoot.addEventListener('mousedown', async (e) => {
+      // Ignore drags that start on the settings gear or close X (button clicks).
+      if (e.button !== 0 || (lSettingsBtn && lSettingsBtn.contains(e.target)) || (lCloseBtn && lCloseBtn.contains(e.target))) return;
+      e.preventDefault();
+      startScreenX = e.screenX;
+      startScreenY = e.screenY;
+      const pos = await window.overlay.getPosition();
+      startWinX = pos.x; startWinY = pos.y;
+      dragging = true;
+      window.overlay.setDragging(true);
+      document.addEventListener('mousemove', onMouseMove, true);
+      document.addEventListener('mouseup', onMouseUp, true);
+    });
+  })();
+
+  // Chat back button → return to the launcher (instead of the hidden workspace).
+  chatBackBtn.addEventListener('click', () => { if (view === 'chat') enterLauncher('chat'); });
+
+  // Chat-view Esc:
+  //   - Tap (release < 1s): dismiss the overlay (original behaviour).
+  //   - Hold ≥ 1s: reset the current chat. While held, the tray icon shows a
+  //     circular progress ring driven by setResetProgress IPC.
+  //
+  // chatBusy / allowOverlayClose gating mirrors the prior tap-only handler so
+  // an in-flight stream still blocks dismissal. The reset gesture itself is
+  // NOT gated by chatBusy — when the model is stuck in a loop, hold-Esc is the
+  // user's escape hatch (chat:reset / chat:reset-direct destroy the in-flight
+  // request, so it's safe to fire mid-stream).
+  const ESC_HOLD_MS = 1000;
+  let escHoldStart = 0;
+  let escHoldTimer = null;
+  let escHoldRaf = null;
+  let escResetFired = false;
+  // After a hold-to-reset fires, the user often keeps the Esc key down for a
+  // beat. Without this guard the next key-repeat lands on the launcher's Esc
+  // handler and dismisses the overlay. Stay suppressed until we see keyup.
+  let escSuppressUntilKeyup = false;
+
+  // Composer-icon circular progress ring. Lives inside the .launcher-logo span
+  // so it stays anchored to the green bolt regardless of layout shifts. The
+  // ring is hidden via opacity (not display) so we never reflow during a hold.
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const RING_R = 13;
+  const RING_C = 2 * Math.PI * RING_R;
+  const launcherLogoEl = launcherCard.querySelector('.launcher-logo');
+  let ringSvg = null, ringArc = null;
+  if (launcherLogoEl) {
+    ringSvg = document.createElementNS(SVG_NS, 'svg');
+    ringSvg.setAttribute('class', 'launcher-logo-ring');
+    ringSvg.setAttribute('viewBox', '0 0 32 32');
+    const track = document.createElementNS(SVG_NS, 'circle');
+    track.setAttribute('class', 'track');
+    track.setAttribute('cx', '16'); track.setAttribute('cy', '16'); track.setAttribute('r', String(RING_R));
+    ringArc = document.createElementNS(SVG_NS, 'circle');
+    ringArc.setAttribute('class', 'arc');
+    ringArc.setAttribute('cx', '16'); ringArc.setAttribute('cy', '16'); ringArc.setAttribute('r', String(RING_R));
+    ringArc.setAttribute('stroke-dasharray', String(RING_C));
+    ringArc.setAttribute('stroke-dashoffset', String(RING_C));
+    ringSvg.appendChild(track);
+    ringSvg.appendChild(ringArc);
+    launcherLogoEl.appendChild(ringSvg);
+  }
+  function setLogoRing(p) {
+    if (!ringSvg || !ringArc) return;
+    const v = Math.max(0, Math.min(1, p || 0));
+    if (v > 0) ringSvg.classList.add('is-active');
+    else ringSvg.classList.remove('is-active');
+    ringArc.setAttribute('stroke-dashoffset', String(RING_C * (1 - v)));
+  }
+
+  function cancelEscHold() {
+    if (escHoldTimer) { clearTimeout(escHoldTimer); escHoldTimer = null; }
+    if (escHoldRaf) { cancelAnimationFrame(escHoldRaf); escHoldRaf = null; }
+    escHoldStart = 0;
+    setLogoRing(0);
+    try { window.overlay.setResetProgress(0); } catch {}
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    // Swallow every Esc keydown (chat or launcher view) until the user
+    // releases the key after a hold-to-reset. Prevents the held key from
+    // immediately exiting the overlay once the reset drops us into launcher.
+    if (escSuppressUntilKeyup) { e.preventDefault(); e.stopPropagation(); return; }
+    if (view !== 'chat' || !allowOverlayClose) return;
+    if (e.repeat) { e.preventDefault(); return; }
+    if (escHoldTimer) { e.preventDefault(); return; }
+    e.preventDefault();
+    escResetFired = false;
+    escHoldStart = performance.now();
+    const tick = () => {
+      if (!escHoldStart) return;
+      const elapsed = performance.now() - escHoldStart;
+      const p = Math.min(1, elapsed / ESC_HOLD_MS);
+      setLogoRing(p);
+      try { window.overlay.setResetProgress(p); } catch {}
+      if (p < 1) escHoldRaf = requestAnimationFrame(tick);
+    };
+    escHoldRaf = requestAnimationFrame(tick);
+    escHoldTimer = setTimeout(() => {
+      escHoldTimer = null;
+      escResetFired = true;
+      escSuppressUntilKeyup = true;
+      setLogoRing(1);
+      try { window.overlay.setResetProgress(1); } catch {}
+      Promise.resolve(resetCurrentChat()).finally(() => {
+        setLogoRing(0);
+        try { window.overlay.setResetProgress(0); } catch {}
+      });
+    }, ESC_HOLD_MS);
+  }, true);
+  document.addEventListener('keyup', (e) => {
+    if (e.key !== 'Escape') return;
+    const wasHolding = escHoldStart > 0 || escResetFired;
+    const didReset = escResetFired;
+    cancelEscHold();
+    escResetFired = false;
+    escSuppressUntilKeyup = false;
+    if (!wasHolding) return;
+    if (didReset) return; // suppress dismiss after a successful reset
+    if (view === 'chat' && !chatBusy && allowOverlayClose) window.overlay.dismiss();
+  }, true);
+  // Window losing focus aborts the hold (the user can't see the progress and
+  // we should not silently reset on a keyup we'll never receive).
+  //
+  // Do NOT use capture phase here. Element-level blurs (chatInput losing focus
+  // when resetCurrentChat → enterLauncher → lInput.focus() steals it) would
+  // otherwise bubble up in capture and clear escSuppressUntilKeyup mid-hold,
+  // which then lets the still-held Esc fall through to the launcher's keydown
+  // handler and dismiss the overlay. Bind to the window's own blur only.
+  window.addEventListener('blur', () => {
+    if (escHoldStart || escHoldTimer) cancelEscHold();
+    escSuppressUntilKeyup = false;
+  });
+
+  // ── Show / hide from the hotkey ──
+  window.overlay.onShow((data) => {
+    window.overlay.getConfig().then((c) => {
+      if (c) {
+        allowOverlayClose = c.allowOverlayClose !== false;
+        applyCloseBtnVisibility();
+      }
+    }).catch(() => {});
+    // Pick up Win32 selection changes made in the main window since this
+    // (preloaded) overlay window first loaded its in-memory copy.
+    selectedUiaExes = loadSelectedUiaExes();
+    const reqMode = (data && data.mode) || 'chat';
+    // Restore an in-flight chat instead of resetting it out from under a stream.
+    if (reqMode === 'chat' && chatBusy && chatCurrentExe) { showChatView(); lInput.blur(); return; }
+    // Restore a paused conversation when reopening the overlay — covers both
+    // the "dismissed mid-chat" case and the user picking the hotkey to come
+    // back to an existing thread. sessionStorage is wiped on app restart.
+    let restored = false;
+    try {
+      const persistedView = sessionStorage.getItem('autobot.overlay.view');
+      const persistedExe  = sessionStorage.getItem('autobot.overlay.exe');
+      if (reqMode === 'chat' && persistedView === 'chat' && persistedExe && chatStore[persistedExe] && chatStore[persistedExe].length) {
+        chatCurrentExe = persistedExe;
+        const meta = chatMetaStore[persistedExe];
+        if (persistedExe === DIRECT_CHAT_ID) chatAppNameEl.textContent = DIRECT_CHAT_NAME;
+        else if (meta) chatAppNameEl.textContent = meta.name || persistedExe;
+        renderChat();
+        showChatView();
+        lInput.blur();
+        restored = true;
+      }
+    } catch {}
+    if (restored) return;
+    enterLauncher(reqMode);
+    // Re-detect on every show. The main window's "My apps" edits (CDP toggles
+    // for Electron, selectedUiaExes for Win32) don't push to the preloaded
+    // overlay's currentApps/cachedUiaApps, so newly added apps would never
+    // appear in candidates without this refresh.
+    refreshApps().then(() => {
+      if (view === 'launcher' && stage === 'app') refreshSuggestions();
+    }).catch(() => {});
+  });
+  window.overlay.onHide(() => {
+    // Keep chat state for restore; just clear the launcher input.
+    if (view === 'launcher') { lInput.value = ''; lGhost.textContent = ''; }
+  });
+
+  // Refresh the running-apps list shortly after load so suggestions are warm.
+  setTimeout(() => { refreshApps().then(() => { if (view === 'launcher' && stage === 'app') refreshSuggestions(); }); }, 50);
+
+  // Initial paint.
+  enterLauncher('chat');
+})();
+
+// ════════════════════════════════════════════════════════════════════════
+// Settings-window extras — overlay hotkey rebinding + open logs folder.
+// Inert in overlay mode (the navbar is hidden there).
+// ════════════════════════════════════════════════════════════════════════
+(function initSettingsExtras() {
+  const APP_MODE = new URLSearchParams(location.search).get('mode') || 'settings';
+  if (APP_MODE === 'overlay') return;
+  if (!window.overlay) return;
+
+  const hotkeyBtn = document.getElementById('nav-hotkey');
+  const logsBtn   = document.getElementById('nav-logs');
+
+  // Pretty-print an Electron accelerator for the button label.
+  function prettyAccel(a) {
+    return (a || '')
+      .replace(/CommandOrControl|CmdOrCtrl/gi, 'Ctrl')
+      .replace(/Control/gi, 'Ctrl')
+      .replace(/\+/g, ' + ');
+  }
+
+  let capturing = false;
+  function setLabel(accel) { if (hotkeyBtn) hotkeyBtn.textContent = `Hotkey: ${prettyAccel(accel) || '—'}`; }
+
+  if (hotkeyBtn) {
+    let savedLabelAccel = '';
+    window.overlay.getConfig().then((c) => {
+      savedLabelAccel = (c && c.hotkey) || '';
+      setLabel(savedLabelAccel);
+    }).catch(() => setLabel(''));
+
+    // Translate a DOM KeyboardEvent into an Electron accelerator string.
+    // Returns null when the event is a modifier-only press or doesn't carry
+    // a usable key (IME composition, dead keys, OS-reserved combos).
+    function accelFromEvent(e) {
+      const raw = e.key;
+      if (!raw || raw === 'Unidentified' || raw === 'Process' || raw === 'Dead') return null;
+      if (raw === 'Control' || raw === 'Shift' || raw === 'Alt' || raw === 'Meta') return null;
+      const parts = [];
+      if (e.ctrlKey) parts.push('Control');
+      if (e.altKey)  parts.push('Alt');
+      if (e.shiftKey) parts.push('Shift');
+      if (e.metaKey) parts.push('Super');
+      let key = raw;
+      if (key === ' ' || key === 'Spacebar') key = 'Space';
+      else if (key === 'ArrowUp') key = 'Up';
+      else if (key === 'ArrowDown') key = 'Down';
+      else if (key === 'ArrowLeft') key = 'Left';
+      else if (key === 'ArrowRight') key = 'Right';
+      else if (typeof key === 'string' && key.length === 1) key = key.toUpperCase();
+      parts.push(key);
+      return parts.join('+');
+    }
+
+    hotkeyBtn.addEventListener('click', async () => {
+      if (capturing) return;
+      capturing = true;
+      hotkeyBtn.textContent = 'Press a key combo…  (Esc to cancel)';
+      hotkeyBtn.classList.add('capturing');
+
+      // Suspend the currently-bound globalShortcut so the user can press it
+      // here (and any combo it overlaps) without the OS-level accelerator
+      // swallowing the keystroke and popping the overlay instead.
+      try { await window.overlay.suspendHotkey(); } catch {}
+
+      // Safety: if anything strands us in capture state (focus loss, IPC hang,
+      // unexpected error), drop out after 15s so the button isn't bricked.
+      const safetyTimer = setTimeout(() => {
+        if (capturing) {
+          finish();
+          setLabel(savedLabelAccel);
+          showStatus('Hotkey capture timed out — try again.', 'error');
+        }
+      }, 15000);
+
+      const onKey = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.repeat) return;
+        const k = e.key;
+        if (k === 'Escape') {
+          finish();
+          setLabel(savedLabelAccel);
+          return;
+        }
+        // Refuse Tab — it traps focus navigation and is rarely a useful global hotkey.
+        if (k === 'Tab') return;
+        const accel = accelFromEvent(e);
+        if (!accel) return;
+        finish();
+        let res;
+        try {
+          res = await window.overlay.setHotkey(accel);
+        } catch (err) {
+          setLabel(savedLabelAccel);
+          showStatus(`Couldn't bind ${prettyAccel(accel)} — ${err && err.message || err}`, 'error');
+          return;
+        }
+        if (res && res.ok) {
+          savedLabelAccel = res.hotkey;
+          setLabel(res.hotkey);
+          showStatus(`Overlay hotkey set to ${prettyAccel(res.hotkey)}`);
+        } else {
+          setLabel((res && res.hotkey) || savedLabelAccel);
+          showStatus(`Couldn't bind ${prettyAccel(accel)} — ${(res && res.error) || 'in use by another app'}`, 'error');
+        }
+      };
+      function finish() {
+        capturing = false;
+        hotkeyBtn.classList.remove('capturing');
+        document.removeEventListener('keydown', onKey, true);
+        window.removeEventListener('blur', onBlur, true);
+        clearTimeout(safetyTimer);
+        // Restore the OS-level hotkey. If setHotkey succeeded, main rebound to
+        // the new accel before this call so resume is effectively a no-op;
+        // otherwise it restores the previous binding.
+        Promise.resolve(window.overlay.resumeHotkey()).catch(() => {});
+      }
+      // Window losing focus mid-capture (user clicked away) cancels cleanly.
+      const onBlur = () => {
+        if (!capturing) return;
+        finish();
+        setLabel(savedLabelAccel);
+      };
+      document.addEventListener('keydown', onKey, true);
+      window.addEventListener('blur', onBlur, true);
+    });
+  }
+
+  if (logsBtn) {
+    logsBtn.addEventListener('click', async () => {
+      const res = await window.overlay.openLogs();
+      if (res && !res.ok) showStatus(`Couldn't open logs: ${res.error}`, 'error');
+    });
+  }
+})();

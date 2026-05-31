@@ -1437,12 +1437,14 @@ body {
   align-items: center;
 }
 /* ─── Chat window picker (Chrome multi-window selector) ─── */
+/* View hidden — JS / IPC / data layer kept intact for a future feature that
+   reuses this picker; restore by removing the display:none override below. */
 .chat-window-picker {
   position: relative;
   width: 100%;
   max-width: 768px;
   margin-bottom: 8px;
-  display: flex;
+  display: none !important;
   justify-content: flex-start;
 }
 .chat-window-picker[hidden] { display: none; }
@@ -1776,6 +1778,43 @@ body {
   white-space: nowrap;
 }
 .chat-file-pill-static {
+  animation: none;
+  cursor: default;
+  max-width: 220px;
+}
+
+/* ─── Inline app-reference pill (/app) ─── */
+.chat-app-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  vertical-align: baseline;
+  margin: 0 1px;
+  padding: 1px 8px 1px 6px;
+  border-radius: var(--r-pill, 12px);
+  background: color-mix(in oklch, #a855f7 14%, transparent);
+  border: 1px solid color-mix(in oklch, #a855f7 42%, transparent);
+  color: var(--text, #e4e4e7);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  max-width: 240px;
+  white-space: nowrap;
+  cursor: default;
+  user-select: none;
+  animation: filePillIn .18s ease-out both;
+}
+.chat-app-pill .chat-app-pill-icon {
+  display: flex;
+  flex-shrink: 0;
+  color: #a855f7;
+}
+.chat-app-pill .chat-app-pill-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-app-pill-static {
   animation: none;
   cursor: default;
   max-width: 220px;
@@ -2489,5 +2528,633 @@ body {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Overlay mode — frameless hotkey launcher
+   ═══════════════════════════════════════════════════════════════ */
+body[data-mode="overlay"] {
+  background: transparent;
+  height: 100vh;
+  overflow: hidden;
+}
+/* Everything that belongs to the full settings window is hidden in overlay. */
+body[data-mode="overlay"] .navbar,
+body[data-mode="overlay"] .drawer,
+body[data-mode="overlay"] .drawer-scrim,
+body[data-mode="overlay"] #page-workspace,
+body[data-mode="overlay"] #page-inspector,
+body[data-mode="overlay"] .codex-modal,
+body[data-mode="overlay"] .status-bar { display: none !important; }
+
+/* ── Launcher shell ── */
+.launcher {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;   /* bar pinned to the bottom; grows upward */
+  align-items: center;
+  padding: 16px;
+  z-index: 50;
+}
+.launcher[hidden] { display: none; }
+.launcher-backdrop {
+  position: fixed;
+  inset: 0;
+  -webkit-app-region: no-drag;
+}
+
+.launcher-card {
+  position: relative;
+  width: 100%;
+  flex-shrink: 0;            /* keep natural height; the window resizes to fit it */
+  /* Solid opaque card in launcher view; chat view re-transparentizes below
+     so the message area can show the desktop through the transparent window. */
+  background: var(--bg-elev-1);
+  border: 1px solid oklch(1 0 0 / 0.08);
+  border-radius: 18px;
+  /* Soft, tight shadow. Larger blurs feather visibly as a dark halo on the
+     desktop because the frameless window is transparent — keep blur small
+     and opacity low so the card reads as floating, not framed. */
+  box-shadow: 0 6px 16px -8px oklch(0.05 0.01 250 / 0.35),
+              0 2px 6px -3px oklch(0.05 0.01 250 / 0.25),
+              inset 0 1px 0 oklch(1 0 0 / 0.04);
+  overflow: hidden;
+  -webkit-app-region: drag;
+  display: flex;
+  flex-direction: column;
+}
+/* Bar-static entrance: card fades + faint scale, NO translate.
+   The launcher-row sits at the bottom of the card; translating the card
+   would yank the bar across the screen on every summon. */
+.launcher-card.anim { animation: launcherIn 220ms var(--ease-out); }
+@keyframes launcherIn {
+  from { opacity: 0; transform: scale(0.988); }
+  to   { opacity: 1; transform: none; }
+}
+
+.launcher-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 14px 14px 16px;
+}
+.launcher-logo {
+  display: inline-flex;
+  color: var(--accent);
+  flex-shrink: 0;
+  position: relative;
+  align-items: center;
+  justify-content: center;
+}
+.launcher-logo-ring {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 32px;
+  height: 32px;
+  margin: -16px 0 0 -16px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+.launcher-logo-ring.is-active { opacity: 1; }
+.launcher-logo-ring circle {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  transform: rotate(-90deg);
+  transform-origin: 50% 50%;
+}
+.launcher-logo-ring .track { stroke: rgba(255,255,255,0.14); }
+.launcher-logo-ring .arc   { stroke: var(--accent); }
+.launcher-input-stack {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.launcher-input,
+.launcher-ghost {
+  font-family: var(--font-sans);
+  font-size: 17px;
+  line-height: 24px;
+  letter-spacing: -0.2px;
+  padding: 0;
+  border: 0;
+}
+.launcher-input {
+  width: 100%;
+  background: transparent;
+  color: var(--text);
+  outline: none;
+  -webkit-app-region: no-drag;
+  position: relative;
+  z-index: 2;
+}
+.launcher-input::placeholder { color: var(--text-faint); }
+.launcher-ghost {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  color: var(--text-faint);
+  pointer-events: none;
+  white-space: pre;
+  overflow: hidden;
+  z-index: 1;
+}
+
+.launcher-app-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--accent-strong);
+  border-radius: var(--r-pill);
+  padding: 4px 6px 4px 8px;
+  font-size: 13px;
+  font-weight: 600;
+  max-width: 200px;
+  flex-shrink: 0;
+  -webkit-app-region: no-drag;
+  animation: pillPop 200ms var(--ease-out);
+}
+@keyframes pillPop {
+  from { opacity: 0; transform: scale(0.8); }
+  to   { opacity: 1; transform: none; }
+}
+.launcher-app-pill[hidden] { display: none; }
+.launcher-app-pill-icon { width: 16px; height: 16px; border-radius: 4px; object-fit: contain; }
+.launcher-app-pill-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.launcher-app-pill-x {
+  border: 0; background: transparent; color: var(--accent-strong);
+  cursor: pointer; font-size: 15px; line-height: 1; padding: 0 2px; opacity: 0.7;
+}
+.launcher-app-pill-x:hover { opacity: 1; }
+
+.launcher-mode-chip {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 4px 9px;
+  border-radius: var(--r-pill);
+  background: var(--bg-elev-2);
+  color: var(--text-soft);
+  border: 1px solid var(--border);
+  -webkit-app-region: no-drag;
+  transition: background var(--dur-1), color var(--dur-1);
+}
+.launcher-mode-chip[data-mode="automation"] {
+  background: oklch(0.72 0.13 245 / 0.16);
+  color: var(--info);
+  border-color: oklch(0.72 0.13 245 / 0.4);
+}
+
+.launcher-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 14px 10px 16px;
+  -webkit-app-region: no-drag;
+  cursor: move; /* JS-driven drag handle: drag here to move the frameless overlay */
+}
+.launcher-foot:active { cursor: grabbing; }
+.launcher-hint { font-size: 11.5px; color: var(--text-faint); cursor: move; }
+.launcher-settings-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; border-radius: var(--r-1);
+  background: transparent; border: 0; color: var(--text-muted); cursor: pointer;
+  transition: background var(--dur-1), color var(--dur-1);
+}
+.launcher-settings-btn:hover { background: var(--bg-elev-2); color: var(--text); }
+.launcher-close-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; border-radius: var(--r-1);
+  background: transparent; border: 0; color: var(--text-muted); cursor: pointer;
+  transition: background var(--dur-1), color var(--dur-1);
+}
+.launcher-close-btn:hover { background: var(--bg-elev-2); color: var(--text); }
+.launcher-close-btn[hidden] { display: none; }
+
+/* ── Launcher dropdown (above the bar) ── */
+.launcher-dropdown {
+  -webkit-app-region: no-drag;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border-soft);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* No scrollbar — navigation is arrow-key only; active row scrolls into view. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.launcher-dropdown::-webkit-scrollbar { width: 0; height: 0; display: none; }
+.launcher-dropdown[hidden] { display: none; }
+.ld-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 11px;
+  border-radius: var(--r-2);
+  cursor: pointer;
+  animation: ldRowIn 160ms var(--ease-out) both;
+}
+@keyframes ldRowIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+.ld-row:hover { background: var(--bg-elev-2); }
+.ld-row.active { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.ld-icon-img, .ld-icon-fallback, .ld-icon {
+  width: 28px; height: 28px; border-radius: 7px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  object-fit: contain;
+}
+.ld-icon-fallback, .ld-icon { background: var(--bg-elev-2); color: var(--text-muted); }
+.ld-icon { color: var(--accent); }
+.ld-text { display: flex; flex-direction: column; min-width: 0; }
+.ld-name { font-size: 14px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ld-sub  { font-size: 11.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ld-enter {
+  margin-left: auto;
+  flex-shrink: 0;
+  display: none;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.ld-row.active .ld-enter { display: inline-flex; }
+.ld-enter kbd {
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 5px;
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  color: var(--accent);
+}
+
+/* ── Inline chat (static composer) ──
+   Composer = .launcher-row (always visible). #chat-input is slotted into
+   .launcher-input-stack on enter, #chat-scroll + #chat-window-picker are
+   reparented above .launcher-row. The #page-chat container itself is
+   hidden in overlay mode (see Static-composer block further down). */
+body[data-mode="overlay"][data-overlay-view="chat"] #launcher-dropdown { display: none; }
+body[data-mode="overlay"][data-overlay-view="chat"] .launcher-card {
+  overflow: visible;
+  /* Card sizes to its children (chat-scroll + lRow + foot) and the window
+     resizes to fit it. Letting flex-grow expand the card would create a dead
+     gap at the bottom whenever the window is taller than the content. */
+  flex: 0 0 auto;
+  min-height: 0;
+}
+body[data-mode="overlay"][data-overlay-view="chat"] .launcher {
+  align-items: stretch;
+}
+body[data-mode="overlay"][data-overlay-view="chat"] .launcher-foot {
+  padding: 6px 14px 8px 16px;
+}
+
+/* Main-window flex layout for #page-chat (settings/inspector window). The
+   overlay flow hides #page-chat entirely; these rules only apply when the
+   main window is showing the chat tab. */
+#page-chat.active {
+  display: flex;
+  flex-direction: column;
+}
+#page-chat.active > #chat-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+#page-chat.active > .chat-composer {
+  flex: 0 0 auto;
+}
+
+@keyframes bubbleEnter {
+  from { opacity: 0; transform: translateY(28px) scaleY(0.6); transform-origin: bottom center; }
+  to   { opacity: 1; transform: translateY(0) scaleY(1); }
+}
+.chat-msg.bubble-enter {
+  animation: bubbleEnter 220ms cubic-bezier(.2,.7,.2,1) both;
+  transform-origin: bottom center;
+}
+
+@keyframes streamingPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(120, 160, 255, 0.0); }
+  50%      { box-shadow: 0 0 0 6px rgba(120, 160, 255, 0.10); }
+}
+.chat-msg.chat-msg-assistant.streaming {
+  animation: streamingPulse 1400ms ease-in-out infinite;
+  border-radius: inherit;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #page-chat.chat-enter,
+  #page-chat.chat-leave,
+  .chat-msg.bubble-enter,
+  .chat-msg.chat-msg-assistant.streaming,
+  #page-chat.chat-empty .chat-empty-back {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+/* No-drag for reparented overlay chat surfaces (chat-tab-menu opens above
+   the composer slot; messages/scroll are interactive). */
+body[data-mode="overlay"] #chat-scroll,
+body[data-mode="overlay"] #chat-scroll .chat-messages,
+body[data-mode="overlay"] #chat-tab-menu,
+body[data-mode="overlay"] #chat-app-menu,
+body[data-mode="overlay"] #chat-window-picker { -webkit-app-region: no-drag; }
+
+/* "Just chat with GPT-5.5" skip-app row — accented as a distinct action. */
+.ld-row-gpt .ld-icon { background: var(--accent-soft); color: var(--accent); }
+.ld-row-gpt .ld-name { color: var(--text); }
+
+/* Web-search citation chips at the foot of a direct-chat assistant turn. */
+.chat-sources { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border, rgba(255,255,255,0.08)); }
+.chat-sources-label { font-size: 11px; opacity: 0.6; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+.chat-sources-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.chat-source-chip {
+  display: inline-flex; align-items: center; padding: 3px 8px; font-size: 11.5px;
+  border-radius: 999px; background: var(--accent-soft, rgba(120,140,255,0.12));
+  color: var(--accent, #8aa); text-decoration: none; max-width: 240px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer;
+  border: 1px solid transparent;
+}
+.chat-source-chip:hover { border-color: var(--accent, #8aa); }
+
+/* ═══════════════════════════════════════════════════════════════
+   Overlay glass mode — translucent inner surfaces + composer-as-bar
+   ═══════════════════════════════════════════════════════════════
+   Scoped under body[data-mode="overlay"] so the main settings window
+   keeps its solid look. Two goals:
+   1. Inner shells (composer pill, window-picker, message bubbles)
+      should not read as opaque islands floating on the glass card.
+   2. The bottom "message box" appears static across launcher↔chat by
+      styling .chat-composer (chat input) to occupy the same pixel
+      slot and visual treatment as .launcher-row (suggestion input).
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Suggestion rows under glass: hover/selected must lift off the
+   backdrop-blurred desktop without going fully opaque. */
+body[data-mode="overlay"] .ld-row:hover {
+  background: oklch(1 0 0 / 0.05);
+}
+body[data-mode="overlay"] .ld-row.active {
+  background: oklch(0.78 0.16 145 / 0.12);
+  outline: 1px solid oklch(0.78 0.16 145 / 0.35);
+  outline-offset: -1px;
+}
+
+/* Window-picker trigger pill and panel sit ABOVE the composer.
+   Drop solid bg for translucent + match card glass language. */
+body[data-mode="overlay"] .cwp-trigger {
+  background: oklch(1 0 0 / 0.06);
+  border-color: oklch(1 0 0 / 0.10);
+}
+body[data-mode="overlay"] .cwp-trigger:hover {
+  background: oklch(1 0 0 / 0.10);
+  border-color: oklch(1 0 0 / 0.16);
+}
+body[data-mode="overlay"] .cwp-trigger[aria-expanded="true"] {
+  background: oklch(1 0 0 / 0.10);
+  border-color: oklch(0.78 0.16 145 / 0.4);
+}
+body[data-mode="overlay"] .cwp-panel {
+  background: oklch(0.18 0.006 250 / 0.78);
+  backdrop-filter: blur(24px) saturate(150%);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  border-color: oklch(1 0 0 / 0.10);
+}
+body[data-mode="overlay"] .cwp-row:hover {
+  background: oklch(1 0 0 / 0.06);
+}
+body[data-mode="overlay"] .cwp-row.selected {
+  background: oklch(0.78 0.16 145 / 0.16);
+}
+
+/* Tab- and app-reference menus also spill above the composer. Match glass. */
+body[data-mode="overlay"] .chat-tab-menu,
+body[data-mode="overlay"] #chat-app-menu {
+  background: oklch(0.18 0.006 250 / 0.78);
+  backdrop-filter: blur(24px) saturate(150%);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  border-color: oklch(1 0 0 / 0.10);
+}
+
+/* User message pill — keep readable but soften the slab. */
+body[data-mode="overlay"] .chat-msg-user {
+  background: oklch(1 0 0 / 0.08);
+  border: 1px solid oklch(1 0 0 / 0.06);
+}
+
+/* Inline tool-call status chip on glass. */
+body[data-mode="overlay"] .chat-tool-line {
+  background: oklch(1 0 0 / 0.05);
+  border: 1px solid oklch(1 0 0 / 0.06);
+}
+
+/* Code blocks in chat — keep dark but match glass tint. */
+body[data-mode="overlay"] .chat-code-block {
+  background: oklch(0.12 0.006 250 / 0.75);
+  border-color: oklch(1 0 0 / 0.08);
+}
+body[data-mode="overlay"] .chat-code-header {
+  background: oklch(1 0 0 / 0.04);
+  border-bottom-color: oklch(1 0 0 / 0.06);
+}
+body[data-mode="overlay"] .chat-inline-code {
+  background: oklch(1 0 0 / 0.08);
+}
+
+/* "Thought for Xs" reasoning panel and live thinking pill. */
+body[data-mode="overlay"] .chat-reasoning-body {
+  background: oklch(1 0 0 / 0.04);
+  border-left-color: oklch(1 0 0 / 0.10);
+}
+body[data-mode="overlay"] .chat-clarify-card {
+  background: oklch(1 0 0 / 0.04);
+  border-color: oklch(1 0 0 / 0.10);
+}
+
+/* ── Static-composer mode ──
+   Plan: keep .launcher-row visible across both launcher and chat.
+   On chat enter renderer.js slots #chat-input into .launcher-input-stack
+   and reparents #chat-scroll + #chat-window-picker into .launcher-card
+   above .launcher-row. The original .chat-composer + .chat-header are
+   left empty inside #page-chat (off-screen) and hidden here. The chat
+   composer never appears — lRow is the only composer the user sees.
+   ──────────────────────────────────────────────── */
+
+/* Hide the legacy chat composer + header in overlay chat. (They still
+   exist in the DOM because #page-chat lives in the main-window tree;
+   we just guarantee nothing from #page-chat ever renders in overlay.) */
+body[data-mode="overlay"] #page-chat { display: none !important; }
+
+/* lInput + ghost vanish while .has-chat-input is active so the slotted
+   contenteditable owns the input-stack pixel slot. */
+.launcher-input-stack.has-chat-input > .launcher-input,
+.launcher-input-stack.has-chat-input > .launcher-ghost { display: none !important; }
+
+/* The slotted #chat-input inherits the launcher-input type scale + colours
+   so the composer is pixel-identical to launcher mode. */
+.launcher-input-stack.has-chat-input > #chat-input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  outline: none;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 17px;
+  line-height: 24px;
+  letter-spacing: -0.2px;
+  padding: 0;
+  max-height: 144px;       /* multi-line cap before inner scroll */
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-app-region: no-drag;
+  position: relative;
+  z-index: 2;
+}
+.launcher-input-stack.has-chat-input > #chat-input:empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-faint);
+  pointer-events: none;
+}
+.launcher-input-stack.has-chat-input > #chat-input.is-disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* App pill × is locked while a chat is open — changing scope mid-thread
+   would orphan history. The pill itself stays visible as scope indicator. */
+body[data-mode="overlay"][data-overlay-view="chat"] .launcher-app-pill-x {
+  display: none !important;
+}
+
+/* Reparented chat scroll lives directly under .launcher-card now. Cap at
+   72% of available screen height so long threads still leave the desktop
+   visible above the overlay. */
+.launcher-card > #chat-scroll {
+  -webkit-app-region: no-drag;
+  /* Height is driven by JS (sizeForChat sets max-height inline) so card +
+     window resize together with no dead gap. flex:0 0 auto keeps the scroll
+     sized to its content (capped by the inline max-height). */
+  flex: 0 0 auto;
+  min-height: 0;
+  overflow-y: auto;
+  background: oklch(0.16 0.006 250 / 0.96);
+  border: 0;
+  border-radius: 18px 18px 0 0;
+  margin: 0;
+}
+.launcher-card > #chat-scroll .chat-messages {
+  max-width: 100%;
+  padding: 16px 18px 18px;
+  background: transparent;
+}
+/* Empty state: collapse chat-scroll entirely so only lRow + foot show
+   (mirrors image 13 — composer is the whole UI before any message). */
+.launcher-card.chat-empty > #chat-scroll { display: none; }
+
+/* Reparented multi-window picker sits flush above the scroll. */
+.launcher-card > #chat-window-picker {
+  -webkit-app-region: no-drag;
+  padding: 6px 14px 4px;
+  margin: 0;
+  max-width: 100%;
+}
+
+/* Enter/leave for the reparented chat-scroll. The composer itself never
+   animates (static-bar guarantee); only the message panel rises from
+   the composer's top edge. */
+@keyframes panelGrowIn {
+  from { opacity: 0; transform: translateY(8px) scaleY(0.92); transform-origin: bottom center; }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes panelShrinkOut {
+  from { opacity: 1; transform: none; transform-origin: bottom center; }
+  to   { opacity: 0; transform: translateY(4px) scaleY(0.96); }
+}
+.launcher-card > #chat-scroll.chat-enter {
+  animation: panelGrowIn 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.launcher-card > #chat-scroll.chat-leave {
+  animation: panelShrinkOut 140ms ease-in both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .launcher-card > #chat-scroll.chat-enter,
+  .launcher-card > #chat-scroll.chat-leave {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+/* Gear menu popover. Anchored to the gear button in launcher-foot; opens
+   upward so it doesn't clip the bottom-pinned overlay. */
+.launcher-gear-menu {
+  position: absolute;
+  right: 14px;
+  bottom: 38px;
+  z-index: 60;
+  min-width: 180px;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-2);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  box-shadow: 0 12px 40px -8px oklch(0.05 0.01 250 / 0.55),
+              0 4px 14px -4px oklch(0.05 0.01 250 / 0.4);
+  -webkit-app-region: no-drag;
+}
+.launcher-gear-menu[hidden] { display: none; }
+.launcher-gear-item {
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-1);
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text-soft);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+}
+.launcher-gear-item:hover { background: var(--bg-elev-2); color: var(--text); }
+.launcher-gear-item[hidden] { display: none; }
+
+/* Suggestion dropdown enter — fade in from below the bar so it reads
+   as "grew from the message box" on first summon. Per-row rowIn keeps
+   its existing stagger; this wraps the container. */
+@keyframes dropdownGrowIn {
+  from { opacity: 0; transform: translateY(6px); transform-origin: bottom center; }
+  to   { opacity: 1; transform: none; }
+}
+body[data-mode="overlay"] .launcher-card.anim .launcher-dropdown:not([hidden]) {
+  animation: dropdownGrowIn 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  body[data-mode="overlay"] .launcher-card.anim .launcher-dropdown:not([hidden]) {
+    animation-duration: 1ms !important;
   }
 }
