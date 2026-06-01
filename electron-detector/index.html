@@ -9,6 +9,14 @@
   <link rel="stylesheet" href="./node_modules/katex/dist/katex.min.css">
 </head>
 <body>
+  <script>
+    // Set data-mode synchronously, before the parser reaches any UI elements,
+    // so body[data-mode="overlay"] CSS (hide navbar/pages, transparent bg)
+    // matches on the FIRST paint. Without this, the default settings-style UI
+    // (navbar with "Autobot", "My apps" page, opaque bg) flashes behind the
+    // overlay for one frame before renderer.js sets the attribute later.
+    document.body.dataset.mode = new URLSearchParams(location.search).get('mode') || 'settings';
+  </script>
   <!-- Overlay launcher (quick-entry). Shown only in overlay mode. Input pinned
        at the bottom; the dropdown + (later) chat grow upward above it. -->
   <div class="launcher" id="launcher" hidden>
@@ -26,7 +34,7 @@
         </span>
         <span class="launcher-input-stack">
           <span class="launcher-ghost" id="launcher-ghost" aria-hidden="true"></span>
-          <input class="launcher-input" id="launcher-input" type="text" autocomplete="off" spellcheck="false" placeholder="Search an app or type a prompt…">
+          <div class="launcher-input" id="launcher-input" contenteditable="true" spellcheck="false" data-placeholder="Search an app or type a promptâ€¦"></div>
         </span>
         <span class="launcher-mode-chip" id="launcher-mode-chip" data-mode="chat">Chat</span>
       </div>
@@ -35,7 +43,7 @@
         <div class="launcher-gear-menu" id="launcher-gear-menu" role="menu" hidden>
           <button class="launcher-gear-item" id="launcher-gear-reset" type="button" role="menuitem">Reset chat</button>
           <button class="launcher-gear-item" id="launcher-gear-pick" type="button" role="menuitem">Pick a different app</button>
-          <button class="launcher-gear-item" id="launcher-gear-settings" type="button" role="menuitem">Settings…</button>
+          <button class="launcher-gear-item" id="launcher-gear-settings" type="button" role="menuitem">Settingsâ€¦</button>
         </div>
         <button class="launcher-close-btn" id="launcher-close-btn" type="button" title="Close overlay" hidden>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
@@ -58,10 +66,10 @@
     </button>
     <div class="nav-brand">Autobot</div>
     <div class="nav-right">
-      <button class="nav-link-btn" id="nav-hotkey" title="Change overlay hotkey">Hotkey: …</button>
+      <button class="nav-link-btn" id="nav-hotkey" title="Change overlay hotkey">Hotkey: â€¦</button>
       <button class="nav-link-btn" id="nav-logs" title="Open chat logs folder">Logs</button>
       <button class="nav-link-btn" id="nav-inspector" title="Open Inspector">Inspector</button>
-      <button class="codex-login-btn" id="codex-login-btn" disabled>Checking…</button>
+      <button class="codex-login-btn" id="codex-login-btn" disabled>Checkingâ€¦</button>
       <div class="codex-install-error" id="codex-install-error"></div>
     </div>
   </nav>
@@ -69,7 +77,7 @@
   <div class="codex-modal" id="codex-modal" role="dialog" aria-modal="true">
     <div class="codex-modal-box">
       <div class="codex-modal-title">Signing in to ChatGPT</div>
-      <div class="codex-modal-msg" id="codex-modal-msg">Browser opening — complete sign-in there.</div>
+      <div class="codex-modal-msg" id="codex-modal-msg">Browser opening â€” complete sign-in there.</div>
       <div class="spinner codex-modal-spinner"></div>
       <button class="codex-modal-cancel" id="codex-modal-cancel">Cancel</button>
     </div>
@@ -83,7 +91,7 @@
     <div class="drawer-head">
       <div class="drawer-title">
         <span>All apps</span>
-        <span class="drawer-count" id="drawer-count">—</span>
+        <span class="drawer-count" id="drawer-count">â€”</span>
       </div>
       <button class="drawer-close" id="drawer-close" title="Close (Esc)">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
@@ -91,13 +99,13 @@
     </div>
     <div class="drawer-search">
       <svg class="drawer-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><line x1="20" y1="20" x2="16.65" y2="16.65"></line></svg>
-      <input type="text" id="drawer-filter" placeholder="Filter apps…" autocomplete="off" spellcheck="false">
+      <input type="text" id="drawer-filter" placeholder="Filter appsâ€¦" autocomplete="off" spellcheck="false">
       <button class="drawer-refresh" id="drawer-refresh" title="Refresh">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
       </button>
     </div>
     <div class="drawer-list" id="drawer-list">
-      <div class="loading"><div class="spinner"></div><p>Detecting apps…</p></div>
+      <div class="loading"><div class="spinner"></div><p>Detecting appsâ€¦</p></div>
     </div>
     <div class="drawer-status" id="drawer-status" aria-live="polite"></div>
   </aside>
@@ -107,7 +115,7 @@
     <div class="header">
       <div class="header-left">
         <h1 class="page-title" id="workspace-title">My apps</h1>
-        <span class="subtitle" id="workspace-badge">—</span>
+        <span class="subtitle" id="workspace-badge">â€”</span>
       </div>
       <div class="header-right">
         <div class="view-toggle" id="workspace-view-toggle" role="tablist">
@@ -126,7 +134,7 @@
     </div>
 
     <div class="app-list" id="workspace-list">
-      <div class="loading"><div class="spinner"></div><p>Loading your apps…</p></div>
+      <div class="loading"><div class="spinner"></div><p>Loading your appsâ€¦</p></div>
     </div>
 
     <div class="status-bar" id="status-bar"></div>
@@ -141,7 +149,7 @@
           Back
         </button>
         <h1 class="page-title">Inspector</h1>
-        <span class="subtitle" id="inspector-badge">—</span>
+        <span class="subtitle" id="inspector-badge">â€”</span>
       </div>
       <button class="ghost-btn" id="inspector-refresh-btn" title="Refresh">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
@@ -149,7 +157,7 @@
       </button>
     </div>
     <div class="elements-list" id="elements-list">
-      <div class="loading"><div class="spinner"></div><p>Detecting apps…</p></div>
+      <div class="loading"><div class="spinner"></div><p>Detecting appsâ€¦</p></div>
     </div>
   </div>
 
@@ -199,6 +207,12 @@
         </div>
       </div>
       <div class="chat-input-wrap">
+        <div class="chat-tab-menu" id="chat-slash-menu" hidden role="listbox" aria-label="Slash command">
+          <div class="chat-tab-menu-head">
+            <span class="chat-tab-menu-title">Slash command</span>
+          </div>
+          <div class="chat-tab-menu-list" id="chat-slash-menu-list"></div>
+        </div>
         <div class="chat-tab-menu" id="chat-tab-menu" hidden role="listbox" aria-label="Reference a tab">
           <div class="chat-tab-menu-head">
             <span class="chat-tab-menu-title">Reference a tab</span>
@@ -257,9 +271,9 @@
   <!-- Automation: codex generating spinner -->
   <div class="auto-modal" id="auto-progress-modal" role="dialog" aria-modal="true">
     <div class="auto-modal-box auto-modal-box-narrow">
-      <div class="auto-modal-title">ChatGPT is writing the recipe…</div>
+      <div class="auto-modal-title">ChatGPT is writing the recipeâ€¦</div>
       <div class="spinner" style="margin: 18px auto;"></div>
-      <div class="auto-modal-progress" id="auto-progress-text">Connecting…</div>
+      <div class="auto-modal-progress" id="auto-progress-text">Connectingâ€¦</div>
       <div class="auto-modal-foot auto-modal-foot-center">
         <button class="ghost-btn" id="auto-progress-cancel">Cancel</button>
       </div>
@@ -304,7 +318,7 @@
   <div class="auto-modal" id="auto-run-modal" role="dialog" aria-modal="true">
     <div class="auto-modal-box">
       <div class="auto-modal-head">
-        <div class="auto-modal-title" id="auto-run-title">Running automation…</div>
+        <div class="auto-modal-title" id="auto-run-title">Running automationâ€¦</div>
         <button class="auto-modal-x" id="auto-run-close" title="Close" style="display:none">×</button>
       </div>
       <div class="auto-modal-body">

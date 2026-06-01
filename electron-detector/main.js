@@ -375,6 +375,8 @@ let appConfig = appConfigModule.load();
 let settingsWindow = null;   // decorated management window (app mgmt, auth, hotkey, logs)
 let overlayWindow = null;    // frameless transparent quick-entry overlay (primary surface)
 let overlayDragging = false; // true while the user drags the overlay by its footer (suppress blur-dismiss)
+let overlayClosing = false;  // true while the close animation is playing; suppress duplicate hides + blur loops
+let overlayCloseTimer = null; // fallback timer in case the renderer never acks the animation end
 let tray = null;
 let isQuitting = false;
 
@@ -499,7 +501,8 @@ function createSettingsWindow({ show = true } = {}) {
     minHeight: 400,
     show,
     backgroundColor: '#0f0f0f',
-    titleBarStyle: 'default',
+    frame: false,
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -538,11 +541,16 @@ function createOverlayWindow() {
     fullscreenable: false,
     show: false,
     hasShadow: false,            // shadow drawn in CSS (Windows ignores hasShadow for transparent)
-    titleBarStyle: 'hidden',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Hidden preloaded overlay: Chromium throttles timers in background
+      // windows, so the renderer's warm-up refreshApps() (a 50 ms setTimeout)
+      // gets deferred well past the first hotkey press. Disabling throttling
+      // lets that detection start immediately at preload time so the first
+      // overlay summon has currentApps already populated.
+      backgroundThrottling: false,
     },
   });
   overlayWindow.loadFile('index.html', { query: { mode: 'overlay' } });
@@ -550,6 +558,9 @@ function createOverlayWindow() {
     // Auto-dismiss on blur, unless DevTools is what stole focus or a footer
     // drag is in progress (moving the window can transiently steal focus).
     if (overlayDragging) return;
+    // Already animating closed → don't restart the close pipeline (would clobber
+    // the renderer's transition with a duplicate fade).
+    if (overlayClosing) return;
     // Respect config: when allowOverlayClose=false the user must dismiss via
     // the launcher X button or the global hotkey.
     if (appConfig.allowOverlayClose === false) return;
@@ -697,6 +708,10 @@ function animateOverlayTo(width, height, { center = false, anchor = 'bottom', in
 // ── Overlay show / hide / toggle ──
 function showOverlay(mode /* 'chat' | 'automation' */) {
   const ov = createOverlayWindow();
+  // Cancel any pending close: if the user resummons during the fade we abort
+  // the hide and let the renderer reset its opacity/transform back to 1.
+  if (overlayCloseTimer) { clearTimeout(overlayCloseTimer); overlayCloseTimer = null; }
+  overlayClosing = false;
   const width = appConfig.overlay.width;
   const height = appConfig.overlay.collapsedHeight;
   const pos = overlayTargetPos(width, height);
@@ -714,10 +729,21 @@ function showOverlay(mode /* 'chat' | 'automation' */) {
 }
 function hideOverlay() {
   if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  if (overlayClosing) return;                  // already animating
+  if (!overlayWindow.isVisible()) return;      // nothing to do
+  overlayClosing = true;
   saveOverlayPos();
   overlayWindow.setAlwaysOnTop(false);
   try { overlayWindow.webContents.send('overlay:hide'); } catch {}
-  overlayWindow.hide();
+  // Fallback: if the renderer never acks (DevTools paused, transition cancelled,
+  // etc.) force the window down a hair after the CSS transition would have ended.
+  overlayCloseTimer = setTimeout(() => { finalizeHideOverlay(); }, 240);
+}
+function finalizeHideOverlay() {
+  if (overlayCloseTimer) { clearTimeout(overlayCloseTimer); overlayCloseTimer = null; }
+  overlayClosing = false;
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  if (overlayWindow.isVisible()) overlayWindow.hide();
 }
 
 // ── Hotkey + double-tap detection ──
@@ -732,7 +758,9 @@ function onHotkey() {
   const dt = now - lastHotkeyAt;
   lastHotkeyAt = now;
   if (dt < HOTKEY_DEBOUNCE_MS) return; // repeat artifact
-  const visible = overlayWindow && !overlayWindow.isDestroyed() && overlayWindow.isVisible();
+  // Mid-close: treat the tap as a re-summon, not a "visible → hide" toggle.
+  // Calling showOverlay() also clears overlayClosing + the fallback timer.
+  const visible = overlayWindow && !overlayWindow.isDestroyed() && overlayWindow.isVisible() && !overlayClosing;
   if (visible) {
     if (dt < DOUBLE_TAP_MS) {
       // Second tap → Automation Mode (morph the already-open overlay).
@@ -854,7 +882,28 @@ if ($isBrowser) {
     }
 }
 
-# Kill all instances of the target so the profile unlocks.
+# Kill all instances of the target so the profile unlocks. For Chromium
+# browsers, try a graceful WM_CLOSE first so Chrome can flush cookies / auth
+# tokens / DBSC state - Stop-Process -Force on a cookie SQLite mid-write
+# causes silent decryption failures on next launch and the user gets signed
+# out of their Google account. Electron apps skip the graceful step (their
+# beforeunload prompts would hang up to 4s for no benefit).
+if ($isBrowser) {
+    $targets = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -eq $targetExe -and $_.Id -ne $myPid } catch { $false }
+    }
+    foreach ($p in $targets) {
+        try { if (-not $p.HasExited) { [void]$p.CloseMainWindow() } } catch {}
+    }
+    $gracefulDeadline = (Get-Date).AddSeconds(4)
+    while ((Get-Date) -lt $gracefulDeadline) {
+        $still = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -eq $targetExe -and $_.Id -ne $myPid } catch { $false }
+        }
+        if (-not $still) { break }
+        Start-Sleep -Milliseconds 200
+    }
+}
 Get-Process -ErrorAction SilentlyContinue | Where-Object {
     try { $_.Path -eq $targetExe -and $_.Id -ne $myPid } catch { $false }
 } | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -1861,13 +1910,13 @@ function resolveRegionScope(region) {
 
 function buildScopedTreeExpr(scopeSelector) {
   const scopeJson = JSON.stringify(String(scopeSelector || ''));
-  return `(function(){function clean(s){return (s||'').replace(/[\\u0000-\\u001F\\u007F-\\u009F]+/g,' ');}function sel(el){if(el.id){var s='#'+CSS.escape(el.id);try{if(document.querySelectorAll(s).length===1)return s;}catch(e){}}var t=el.getAttribute('data-testid');if(t){var ts='[data-testid="'+t.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(ts).length===1)return ts;}catch(e){}}var dli=el.getAttribute('data-list-item-id');if(dli){var ds='[data-list-item-id="'+dli.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(ds).length===1)return ds;}catch(e){}}var href=el.tagName==='A'?el.getAttribute('href'):null;if(href){var hs='a[href="'+href.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(hs).length===1)return hs;}catch(e){}}var al=el.getAttribute('aria-label');if(al){var ae=al.replace(/\\\\/g,'\\\\\\\\').replace(/"/g,'\\\\"');var ai=el.tagName.toLowerCase()+'[aria-label="'+ae+'"]';try{if(document.querySelectorAll(ai).length===1)return ai;}catch(e){}}var cur=el,parts=[];for(var i=0;cur&&cur.nodeType===1&&cur!==document.body&&i<30;i++){var p=cur.tagName.toLowerCase();if(cur.parentNode){var idx=Array.prototype.indexOf.call(cur.parentNode.children,cur)+1;if(idx>0)p+=':nth-child('+idx+')';}parts.unshift(p);try{if(document.querySelectorAll(parts.join(' > ')).length===1)return parts.join(' > ');}catch(e){}cur=cur.parentNode;}return parts.join(' > ');}var SCOPE=${scopeJson};var root=null;try{root=document.querySelector(SCOPE);}catch(e){root=null;}if(!root)root=document;var nodes=Array.from(root.querySelectorAll('button,input,select,textarea,a,[role],[aria-label],[contenteditable]'));nodes=nodes.filter(function(el){var r=el.getAttribute('role');return r!=='log'&&r!=='listitem'&&r!=='article';});return JSON.stringify(nodes.slice(0,500).map(function(el){var cn=typeof el.className==='string'?el.className:'';return{Tag:el.tagName,Text:clean(el.textContent).trim().slice(0,100),Id:clean(el.id),Class:clean(cn).split(' ').filter(Boolean).slice(0,3).join(' '),Role:clean(el.getAttribute('role')),AriaLabel:clean(el.getAttribute('aria-label')),Selector:sel(el)}}));})()`;
+  return `(function(){function clean(s){return (s||'').replace(/[\\u0000-\\u001F\\u007F-\\u009F]+/g,' ');}function sel(el){if(el.id){var s='#'+CSS.escape(el.id);try{if(document.querySelectorAll(s).length===1)return s;}catch(e){}}var t=el.getAttribute('data-testid');if(t){var ts='[data-testid="'+t.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(ts).length===1)return ts;}catch(e){}}var dli=el.getAttribute('data-list-item-id');if(dli){var ds='[data-list-item-id="'+dli.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(ds).length===1)return ds;}catch(e){}}var href=el.tagName==='A'?el.getAttribute('href'):null;if(href){var hs='a[href="'+href.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(hs).length===1)return hs;}catch(e){}}var al=el.getAttribute('aria-label');if(al){var ae=al.replace(/\\\\/g,'\\\\\\\\').replace(/"/g,'\\\\"');var ai=el.tagName.toLowerCase()+'[aria-label="'+ae+'"]';try{if(document.querySelectorAll(ai).length===1)return ai;}catch(e){}}var cur=el,parts=[];for(var i=0;cur&&cur.nodeType===1&&cur!==document.body&&i<30;i++){var p=cur.tagName.toLowerCase();if(cur.parentNode){var idx=Array.prototype.indexOf.call(cur.parentNode.children,cur)+1;if(idx>0)p+=':nth-child('+idx+')';}parts.unshift(p);try{if(document.querySelectorAll(parts.join(' > ')).length===1)return parts.join(' > ');}catch(e){}cur=cur.parentNode;}return parts.join(' > ');}var SCOPE=${scopeJson};var root=null;try{root=document.querySelector(SCOPE);}catch(e){root=null;}if(!root)root=document;var nodes=Array.from(root.querySelectorAll('button,input,select,textarea,a,[role],[aria-label],[placeholder],[contenteditable]'));nodes=nodes.filter(function(el){var r=el.getAttribute('role');return r!=='log'&&r!=='listitem'&&r!=='article';});return JSON.stringify(nodes.slice(0,500).map(function(el){var cn=typeof el.className==='string'?el.className:'';var txt=clean(el.textContent).trim().slice(0,100);var ph=clean(el.getAttribute('placeholder'));var label=txt||ph||'';return{Tag:el.tagName,Text:label,Id:clean(el.id),Class:clean(cn).split(' ').filter(Boolean).slice(0,3).join(' '),Role:clean(el.getAttribute('role')),AriaLabel:clean(el.getAttribute('aria-label')),Placeholder:ph,Selector:sel(el)}}));})()`;
 }
 
 function buildFindExpr(needle, limit) {
   const needleJson = JSON.stringify(String(needle || ''));
   const lim = Math.max(1, Math.min(50, parseInt(limit, 10) || 20));
-  return `(function(){var NEEDLE=${needleJson};var LIMIT=${lim};var needleLower=NEEDLE.toLowerCase();function clean(s){return (s||'').replace(/[\\u0000-\\u001F\\u007F-\\u009F]+/g,' ');}function sel(el){if(el.id){var s='#'+CSS.escape(el.id);try{if(document.querySelectorAll(s).length===1)return s;}catch(e){}}var t=el.getAttribute('data-testid');if(t){var ts='[data-testid="'+t.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(ts).length===1)return ts;}catch(e){}}var dli=el.getAttribute('data-list-item-id');if(dli){var ds='[data-list-item-id="'+dli.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(ds).length===1)return ds;}catch(e){}}var href=el.tagName==='A'?el.getAttribute('href'):null;if(href){var hs='a[href="'+href.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(hs).length===1)return hs;}catch(e){}}var al=el.getAttribute('aria-label');if(al){var ae=al.replace(/\\\\/g,'\\\\\\\\').replace(/"/g,'\\\\"');var ai=el.tagName.toLowerCase()+'[aria-label="'+ae+'"]';try{if(document.querySelectorAll(ai).length===1)return ai;}catch(e){}}var cur=el,parts=[];for(var i=0;cur&&cur.nodeType===1&&cur!==document.body&&i<30;i++){var p=cur.tagName.toLowerCase();if(cur.parentNode){var idx=Array.prototype.indexOf.call(cur.parentNode.children,cur)+1;if(idx>0)p+=':nth-child('+idx+')';}parts.unshift(p);try{if(document.querySelectorAll(parts.join(' > ')).length===1)return parts.join(' > ');}catch(e){}cur=cur.parentNode;}return parts.join(' > ');}var nodes=Array.from(document.querySelectorAll('button,input,select,textarea,a,[role],[aria-label],[contenteditable]'));nodes=nodes.filter(function(el){var r=el.getAttribute('role');return r!=='log'&&r!=='listitem'&&r!=='article';});var matched=[];for(var i=0;i<nodes.length&&matched.length<LIMIT;i++){var el=nodes[i];var text=clean(el.textContent).trim().slice(0,200);var aria=clean(el.getAttribute('aria-label'));var id=clean(el.id);var role=clean(el.getAttribute('role'));var hay=(text+' '+aria+' '+id+' '+role).toLowerCase();if(hay.indexOf(needleLower)===-1)continue;var cn=typeof el.className==='string'?el.className:'';matched.push({Tag:el.tagName,Text:text.slice(0,100),Id:id,Class:clean(cn).split(' ').filter(Boolean).slice(0,3).join(' '),Role:role,AriaLabel:aria,Selector:sel(el)});}return JSON.stringify(matched);})()`;
+  return `(function(){var NEEDLE=${needleJson};var LIMIT=${lim};var needleLower=NEEDLE.toLowerCase();function clean(s){return (s||'').replace(/[\\u0000-\\u001F\\u007F-\\u009F]+/g,' ');}function sel(el){if(el.id){var s='#'+CSS.escape(el.id);try{if(document.querySelectorAll(s).length===1)return s;}catch(e){}}var t=el.getAttribute('data-testid');if(t){var ts='[data-testid="'+t.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(ts).length===1)return ts;}catch(e){}}var dli=el.getAttribute('data-list-item-id');if(dli){var ds='[data-list-item-id="'+dli.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(ds).length===1)return ds;}catch(e){}}var href=el.tagName==='A'?el.getAttribute('href'):null;if(href){var hs='a[href="'+href.replace(/"/g,'\\\\"')+'"]';try{if(document.querySelectorAll(hs).length===1)return hs;}catch(e){}}var al=el.getAttribute('aria-label');if(al){var ae=al.replace(/\\\\/g,'\\\\\\\\').replace(/"/g,'\\\\"');var ai=el.tagName.toLowerCase()+'[aria-label="'+ae+'"]';try{if(document.querySelectorAll(ai).length===1)return ai;}catch(e){}}var cur=el,parts=[];for(var i=0;cur&&cur.nodeType===1&&cur!==document.body&&i<30;i++){var p=cur.tagName.toLowerCase();if(cur.parentNode){var idx=Array.prototype.indexOf.call(cur.parentNode.children,cur)+1;if(idx>0)p+=':nth-child('+idx+')';}parts.unshift(p);try{if(document.querySelectorAll(parts.join(' > ')).length===1)return parts.join(' > ');}catch(e){}cur=cur.parentNode;}return parts.join(' > ');}var nodes=Array.from(document.querySelectorAll('button,input,select,textarea,a,[role],[aria-label],[placeholder],[contenteditable]'));nodes=nodes.filter(function(el){var r=el.getAttribute('role');return r!=='log'&&r!=='listitem'&&r!=='article';});var matched=[];for(var i=0;i<nodes.length&&matched.length<LIMIT;i++){var el=nodes[i];var text=clean(el.textContent).trim().slice(0,200);var aria=clean(el.getAttribute('aria-label'));var id=clean(el.id);var role=clean(el.getAttribute('role'));var ph=clean(el.getAttribute('placeholder'));var hay=(text+' '+aria+' '+id+' '+role+' '+ph).toLowerCase();if(hay.indexOf(needleLower)===-1)continue;var label=text||aria||ph||'';var cn=typeof el.className==='string'?el.className:'';matched.push({Tag:el.tagName,Text:label.slice(0,100),Id:id,Class:clean(cn).split(' ').filter(Boolean).slice(0,3).join(' '),Role:role,AriaLabel:aria,Placeholder:ph,Selector:sel(el)});}return JSON.stringify(matched);})()`;
 }
 
 function buildCdpExprScript(port, jsExpr) {
@@ -1949,10 +1998,12 @@ function buildClickCoordsExpr(selector) {
   return `(function(){var sel=${JSON.stringify(selector)};var el=document.querySelector(sel);if(!el)return JSON.stringify({error:'element_not_found'});var svgLike={svg:1,path:1,g:1,circle:1,rect:1,polygon:1,line:1,use:1,polyline:1};var target=el;var hops=0;while(target&&target!==document.body&&hops<8){var tg=(target.tagName||'').toLowerCase();var r=target.getAttribute&&target.getAttribute('role');if(tg==='button'||tg==='a'||tg==='input'||tg==='label')break;if(r&&/^(button|link|menuitem|menuitemcheckbox|menuitemradio|tab|treeitem|option|checkbox|radio|switch)$/.test(r))break;if(target.onclick)break;if(svgLike[tg]||(target.getAttribute&&target.getAttribute('aria-hidden')==='true')){target=target.parentElement;hops++;continue;}break;}if(!target)target=el;var rect=target.getBoundingClientRect();var ih=window.innerHeight||0,iw=window.innerWidth||0;var inView=rect.top>=0&&rect.left>=0&&rect.bottom<=ih&&rect.right<=iw;var scrolled=false;if(!inView){try{target.scrollIntoView({block:'center',inline:'nearest'});scrolled=true;}catch(e){}rect=target.getBoundingClientRect();}if(rect.width===0&&rect.height===0)return JSON.stringify({error:'zero_size'});return JSON.stringify({x:Math.round(rect.left+rect.width/2),y:Math.round(rect.top+rect.height/2),tag:target.tagName,walked:target!==el,scrolled:scrolled});})()`;
 }
 
-function buildCdpClickScript(port, selector) {
+function buildCdpClickScript(port, selector, modifiersMask = 0, button = 'left') {
   const coordsJs = buildClickCoordsExpr(selector);
   const jsBase64 = Buffer.from(coordsJs, 'utf8').toString('base64');
   const settleMs = CLICK_SETTLE_MS;
+  const mods = Number(modifiersMask) || 0;
+  const btn = String(button || 'left').replace(/[^a-zA-Z]/g, '') || 'left';
   return `
 function Send-Cmd { param($ws, $cts, $cmd)
     $bytes = [Text.Encoding]::UTF8.GetBytes($cmd)
@@ -2015,32 +2066,35 @@ try {
     }
     $x = [double]$coords.x
     $y = [double]$coords.y
-    $cmd2 = (@{ id=2; method='Input.dispatchMouseEvent'; params=@{ type='mouseMoved'; x=$x; y=$y; button='none' } } | ConvertTo-Json -Compress -Depth 5)
+    $cmd2 = (@{ id=2; method='Input.dispatchMouseEvent'; params=@{ type='mouseMoved'; x=$x; y=$y; button='none'; modifiers=${mods} } } | ConvertTo-Json -Compress -Depth 5)
     Send-Cmd $ws $cts $cmd2
     [void](Recv-Id $ws $cts 2)
     Start-Sleep -Milliseconds 20
-    $cmd3 = (@{ id=3; method='Input.dispatchMouseEvent'; params=@{ type='mousePressed'; x=$x; y=$y; button='left'; clickCount=1 } } | ConvertTo-Json -Compress -Depth 5)
+    $cmd3 = (@{ id=3; method='Input.dispatchMouseEvent'; params=@{ type='mousePressed'; x=$x; y=$y; button='${btn}'; clickCount=1; modifiers=${mods} } } | ConvertTo-Json -Compress -Depth 5)
     Send-Cmd $ws $cts $cmd3
     [void](Recv-Id $ws $cts 3)
     Start-Sleep -Milliseconds 40
-    $cmd4 = (@{ id=4; method='Input.dispatchMouseEvent'; params=@{ type='mouseReleased'; x=$x; y=$y; button='left'; clickCount=1 } } | ConvertTo-Json -Compress -Depth 5)
+    $cmd4 = (@{ id=4; method='Input.dispatchMouseEvent'; params=@{ type='mouseReleased'; x=$x; y=$y; button='${btn}'; clickCount=1; modifiers=${mods} } } | ConvertTo-Json -Compress -Depth 5)
     Send-Cmd $ws $cts $cmd4
     [void](Recv-Id $ws $cts 4)
     Start-Sleep -Milliseconds 400
     try { [void]$ws.CloseAsync([Net.WebSockets.WebSocketCloseStatus]::NormalClosure, '', [Threading.CancellationToken]::None).GetAwaiter().GetResult() } catch {}
     try { $ws.Dispose() } catch {}
-    Write-Output ('{"ok":true,"x":' + $x + ',"y":' + $y + ',"tag":"' + $coords.tag + '","walked":' + $coords.walked.ToString().ToLower() + '}')
+    Write-Output ('{"ok":true,"x":' + $x + ',"y":' + $y + ',"tag":"' + $coords.tag + '","walked":' + $coords.walked.ToString().ToLower() + ',"modifiers":${mods},"button":"${btn}"}')
 } catch {
     Write-Output ('{"error":"' + ($_.Exception.Message -replace '"', "'") + '"}')
 }
 `;
 }
 
-async function cdpClickReal(port, selector) {
+async function cdpClickReal(port, selector, clickOpts = {}) {
+  const mods = Number(clickOpts.modifiers) || 0;
+  const allowedBtn = { left: 1, middle: 1, right: 1, back: 1, forward: 1 };
+  const btn = allowedBtn[String(clickOpts.button || 'left').toLowerCase()] ? String(clickOpts.button).toLowerCase() : 'left';
   if (process.env.WINDOWS_AUTOBOT_FORCE_PS === '1') {
-    return cdpClickRealPS(port, selector);
+    return cdpClickRealPS(port, selector, { modifiers: mods, button: btn });
   }
-  debugLog(`[cdpClick native] port=${port} sel=${selector.slice(0, 100)}`);
+  debugLog(`[cdpClick native] port=${port} sel=${selector.slice(0, 100)} mods=${mods} btn=${btn}`);
   try {
     // Step 1: Runtime.evaluate to get coords of the clickable element. If the
     // element was off-screen, buildClickCoordsExpr centers it and reports
@@ -2063,24 +2117,28 @@ async function cdpClickReal(port, selector) {
     }
     const x = Number(coords.x), y = Number(coords.y);
     // Step 2: dispatch mouse events in sequence. Bundled in one WS session
-    // so the native fast-path is one round-trip per click.
+    // so the native fast-path is one round-trip per click. `modifiers` is the
+    // CDP bitmask (Alt=1,Ctrl=2,Meta=4,Shift=8) — required so Notion's React
+    // handlers see event.ctrlKey/metaKey for "open in new tab" via Ctrl+click.
     await cdpNativeWsSession(port, [
-      { method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x, y, button: 'none' } },
-      { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: 'left', clickCount: 1 } },
-      { method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 } },
+      { method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x, y, button: 'none', modifiers: mods } },
+      { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: btn, clickCount: 1, modifiers: mods } },
+      { method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: btn, clickCount: 1, modifiers: mods } },
     ]);
     // SPA settle delay (matches PS path — Discord's React router re-renders async).
     await new Promise(r => setTimeout(r, 400));
-    return { ok: true, x, y, tag: coords.tag, walked: !!coords.walked };
+    return { ok: true, x, y, tag: coords.tag, walked: !!coords.walked, modifiers: mods, button: btn };
   } catch (err) {
     debugLog(`[cdpClick native err] ${err.message} — falling back to PowerShell`);
-    return cdpClickRealPS(port, selector);
+    return cdpClickRealPS(port, selector, { modifiers: mods, button: btn });
   }
 }
 
-function cdpClickRealPS(port, selector) {
+function cdpClickRealPS(port, selector, clickOpts = {}) {
   return new Promise((resolve, reject) => {
-    const script = buildCdpClickScript(port, selector);
+    const mods = Number(clickOpts.modifiers) || 0;
+    const btn = clickOpts.button || 'left';
+    const script = buildCdpClickScript(port, selector, mods, btn);
     debugLog(`[cdpClickReal ps] port=${port} sel=${selector.slice(0, 100)}`);
     execFile('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-Command', script
@@ -2864,16 +2922,15 @@ async function listCdpBrowserWindows(port) {
   return windows.filter(w => (w.title && w.title.trim()) || (w.url && w.url.trim()));
 }
 
-// Tabs of the *currently selected* browser window — the set the chat composer's
-// `/tab` picker offers. The window picker (cdp_select_window / chat:select-window)
-// binds CDP_ACTIVE_TARGET to a representative tab of the chosen window; here we
-// map every page target to its parent OS window (Browser.getWindowForTarget),
-// find the window the active target lives in, and return only that window's tabs.
-// Falls back to all page targets when the browser endpoint can't map windows.
+// All tabs across all browser windows for `port` — the set the chat composer's
+// `/tab` picker offers. Each tab carries a stable 1-based `windowIndex` (windows
+// sorted ascending by CDP windowId) so the UI can group/label tabs by window.
+// Returns `{ tabs, windowCount }`. Falls back to a single bucket
+// (windowIndex: 1, windowCount: 1) when the browser endpoint can't map windows.
 async function listCdpWindowTabs(port) {
   const arr = await fetchCdpTargets(port);
   const pages = arr.filter(p => p.type === 'page' && p.webSocketDebuggerUrl);
-  if (pages.length === 0) return [];
+  if (pages.length === 0) return { tabs: [], windowCount: 1 };
 
   const activeId = CDP_ACTIVE_TARGET.get(port) || null;
 
@@ -2884,27 +2941,35 @@ async function listCdpWindowTabs(port) {
     const res = await cdpWsCommandsAtUrl(browserUrl, cmds);
     winIds = res.map(r => (r && !r.__error && r.windowId !== undefined) ? r.windowId : null);
   } catch {
-    winIds = null; // browser endpoint unavailable — return every tab below
+    winIds = null; // browser endpoint unavailable — bucket every tab into window 1
   }
 
-  const mapped = pages
-    .map((p, i) => ({
-      id: p.id,
-      title: p.title || '',
-      url: p.url || '',
-      active: activeId ? p.id === activeId : false,
-      windowId: (winIds && winIds[i] != null) ? winIds[i] : `solo:${p.id}`,
-    }))
+  let windowIndexMap = null;
+  let windowCount = 1;
+  if (winIds) {
+    const distinct = Array.from(new Set(winIds.filter(w => typeof w === 'number')))
+      .sort((a, b) => a - b);
+    windowCount = distinct.length || 1;
+    windowIndexMap = new Map(distinct.map((wid, i) => [wid, i + 1]));
+  }
+
+  const tabs = pages
+    .map((p, i) => {
+      const wid = winIds ? winIds[i] : null;
+      const windowIndex = (windowIndexMap && typeof wid === 'number' && windowIndexMap.has(wid))
+        ? windowIndexMap.get(wid)
+        : 1;
+      return {
+        id: p.id,
+        title: p.title || '',
+        url: p.url || '',
+        active: activeId ? p.id === activeId : false,
+        windowIndex,
+      };
+    })
     .filter(t => (t.title && t.title.trim()) || (t.url && t.url.trim()));
 
-  if (!winIds) return mapped.map(({ windowId, ...t }) => t);
-
-  // Selected window = window holding the active target; else the first tab's window.
-  const activeTab = mapped.find(t => t.active) || mapped[0];
-  const selWin = activeTab ? activeTab.windowId : null;
-  return mapped
-    .filter(t => t.windowId === selWin)
-    .map(({ windowId, ...t }) => t);
+  return { tabs, windowCount };
 }
 
 async function fetchCdpPageWsUrl(port) {
@@ -3111,12 +3176,46 @@ function checkCdpAlive(port) {
   });
 }
 
+// In-flight cache so renderer's first detect-apps call after launch reuses the
+// main-side warm-up promise instead of kicking off a second PowerShell scan.
+// Without this the overlay's first hotkey press lands before the renderer's
+// own (timer-throttled) refresh finishes, so the suggestions dropdown shows
+// "no selected apps" until the user dismisses and re-summons. TTL keeps the
+// cache short-lived — drawer refresh / explicit re-detect must hit fresh data.
+const DETECT_CACHE_TTL_MS = 3000;
+let _electronDetectInflight = null;
+let _electronDetectAt = 0;
+let _uiaDetectInflight = null;
+let _uiaDetectAt = 0;
+
+function detectElectronAppsCached() {
+  const now = Date.now();
+  if (_electronDetectInflight && (now - _electronDetectAt) < DETECT_CACHE_TTL_MS) {
+    return _electronDetectInflight;
+  }
+  _electronDetectAt = now;
+  _electronDetectInflight = detectElectronApps();
+  _electronDetectInflight.catch(() => { _electronDetectInflight = null; });
+  return _electronDetectInflight;
+}
+
+function detectUiaAppsCached() {
+  const now = Date.now();
+  if (_uiaDetectInflight && (now - _uiaDetectAt) < DETECT_CACHE_TTL_MS) {
+    return _uiaDetectInflight;
+  }
+  _uiaDetectAt = now;
+  _uiaDetectInflight = detectUiaApps();
+  _uiaDetectInflight.catch(() => { _uiaDetectInflight = null; });
+  return _uiaDetectInflight;
+}
+
 ipcMain.handle('detect-apps', async () => {
-  return detectElectronApps();
+  return detectElectronAppsCached();
 });
 
 ipcMain.handle('detect-uia-apps', async () => {
-  return detectUiaApps();
+  return detectUiaAppsCached();
 });
 
 ipcMain.handle('enable-cdp-app', async (_event, exe) => {
@@ -4039,6 +4138,49 @@ than the currently active in-app tab.
   TASKLIST" instead of "TEST TASKLIST") because of column width — that
   is NOT a different page. Use the known page id directly via
   \`cdp_open_notion_page\` and skip the sidebar entirely.
+- **"Open page X in a new tab"** — PREFERRED: call
+  \`cdp_open_in_new_tab({ pageId })\` for known ids (e.g. \`TEST
+  TASKLIST\`, \`TEST CALENDAR\` above) or \`cdp_open_in_new_tab({
+  pageName: "X" })\` for sidebar pages whose id you do not know. The
+  tool tries three paths in order — Ctrl+T to the active Notion
+  page (fires Notion's accelerator), the Tab Bar "+" button click,
+  then \`Target.createTarget\` — followed by a final consolidated
+  poll, so a single call covers ~40s of retry. It binds all subsequent \`cdp_*\` tools to the new tab and
+  navigates atomically; you do NOT need \`cdp_list_windows\` /
+  \`cdp_select_window\` around it.
+  **Critical rules:**
+  1. **Wait for the tool to return.** It can take ~10–40s while
+     Notion's main process spawns the BrowserView and binds its CDP
+     debugger WS URL (two-stage detection: target id appears first,
+     attachable WS URL follows; a final 10s consolidated poll catches
+     late-publish cases). Do not abandon it mid-call and try other
+     paths.
+  2. **Never fall back to Ctrl+click / middle-click / Ctrl+P** — past
+     log proved Notion's React swallows modifier clicks on
+     \`role="treeitem"\` rows and Ctrl+P opens the "Move page to…"
+     dialog (wrong dialog) from blank/restore tabs.
+  3. **If the tool errors, DO NOT claim success.** A response like
+     "Done — I opened the Work page in a separate Notion tab" after
+     an error is a lie. Report the error to the user verbatim and
+     suggest they retry or focus Notion manually.
+  Recipe (known id): \`cdp_open_in_new_tab({ pageId:"3701..." })\`.
+  Recipe (by name): \`cdp_open_in_new_tab({ pageName:"Work" })\` —
+  requires a real Notion workspace tab to be active (the sidebar must
+  be present); if currently on the blank/restore tab, call
+  \`cdp_list_windows\` and \`cdp_select_window\` to switch onto a
+  Notion page tab first, then call the new-tab tool.
+- **Notion quick-find / "Open in new tab" dialog (Ctrl+P)** — Notion's
+  Ctrl+P (or Ctrl+Shift+P) opens a portal'd dialog with a text input
+  whose **placeholder** is \`"Open in new tab..."\`. The dialog is
+  attached at \`document.body\`, NOT inside \`<main>\` or \`<nav>\`, so
+  \`cdp_get_tree("main")\` does NOT see it. Scope to the dialog
+  explicitly: \`cdp_get_tree("[role='dialog']")\`. The input is
+  findable by its placeholder via \`cdp_find("Open in new tab")\` —
+  \`cdp_find\` now indexes \`placeholder\` text. Recipe: press Ctrl+P
+  → \`cdp_find("Open in new tab")\` → \`cdp_paste(<input ref>, "Example Page")\`
+  → \`cdp_press_key("Enter")\`. This opens the highlighted result in a
+  new tab (that's what the dialog DOES — its placeholder names the
+  action). Use this whenever the page id is unknown.
 - **"What's on this page?"** → \`cdp_get_tree("main")\` or
   \`cdp_get_tree("[role='main']")\` for the editor body. Avoid an
   unscoped \`cdp_get_tree\` — Notion's full DOM is huge.
@@ -4223,6 +4365,37 @@ function loadAgentForPrompt(meta) {
 
 function escapePipe(s) {
   return String(s || '').replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
+}
+
+// Build a short human label for a tool pill from the refInfo captured at
+// tool-call time. Prefer accessible name (aria) → UIA name → visible text →
+// automationId → id. Append role/control-type hint ("Send button") when the
+// label doesn't already mention it. Returns null when nothing usable exists;
+// callers fall back to "an element".
+function humanLabelFromRefInfo(refInfo) {
+  if (!refInfo) return null;
+  const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const aria = clean(refInfo.aria);
+  const text = clean(refInfo.text);
+  const name = clean(refInfo.name);
+  const autoId = clean(refInfo.automationId);
+  const id = clean(refInfo.id);
+  const role = clean(refInfo.role).toLowerCase();
+  const ctrl = clean(refInfo.controlType).toLowerCase();
+  const tag = clean(refInfo.tag).toLowerCase();
+  let label = aria || name || text || autoId || id;
+  if (!label) return null;
+  if (label.length > 60) label = label.slice(0, 57) + '…';
+  let kind = '';
+  if (role === 'button' || ctrl === 'button' || tag === 'button') kind = 'button';
+  else if (role === 'link' || ctrl === 'hyperlink' || tag === 'a') kind = 'link';
+  else if (role === 'textbox' || role === 'searchbox' || ctrl === 'edit' || tag === 'input' || tag === 'textarea') kind = 'field';
+  else if (role === 'checkbox' || ctrl === 'checkbox') kind = 'checkbox';
+  else if (role === 'tab' || ctrl === 'tabitem') kind = 'tab';
+  else if (role === 'menuitem') kind = 'menu item';
+  else if (role === 'listitem' || role === 'option') kind = 'item';
+  if (kind && !label.toLowerCase().includes(kind)) label = `${label} ${kind}`;
+  return label;
 }
 
 function renderCdpSnapshot(elements) {
@@ -4465,8 +4638,9 @@ function resolvePendingAsk(exe, value) {
 const CDP_TOOLS = [
   { type: 'function', name: 'cdp_list_windows', description: 'List EVERY open browser window/tab this app exposes over CDP (one row per page target), not just the one you are currently looking at. Returns { count, active, windows:[{ index, id, title, url, active }] }. REQUIRED to answer "what windows/tabs do you see", "how many windows are open", or any request that spans more than the active window — a normal snapshot (cdp_get_tree/cdp_find) only sees the single active page, so without this you will wrongly report just one window. For a browser like Chrome this enumerates windows across ALL open profiles in the same browser session. After listing, switch to a specific one with cdp_select_window before reading/acting on it.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { type: 'function', name: 'cdp_select_window', description: 'Bind all subsequent snapshot/click/type/scroll tools to a specific open window/tab. Pass either `index` (the integer from cdp_list_windows) or `id` (the target id). Until you call this, the tools operate on the first page target. Call cdp_list_windows first to see the choices, select one, then cdp_get_tree to snapshot it. Returns { ok, active:{ index, id, title, url } }. Use when the user refers to a different window/profile than the one currently in view, or when iterating over every window (select index 0, read; select index 1, read; …).', parameters: { type: 'object', properties: { index: { type: 'integer', description: 'Zero-based index from cdp_list_windows.windows[].index.' }, id: { type: 'string', description: 'Target id from cdp_list_windows.windows[].id. Use this OR index.' } }, additionalProperties: false } },
-  { type: 'function', name: 'cdp_click', description: 'Click a DOM element by ref from the live snapshot table.', parameters: { type: 'object', properties: { ref: { type: 'string', description: 'Element ref like e12 from the snapshot table.' } }, required: ['ref'], additionalProperties: false } },
+  { type: 'function', name: 'cdp_click', description: 'Click a DOM element by ref from the live snapshot table. Pass `modifiers` to hold keys during the click (e.g. ["ctrl"]). Pass `button:"middle"` for middle-click or `button:"right"` for the contextmenu event. NOTE: for "open page/link X in a new tab", use `cdp_open_in_new_tab` instead — many Electron apps (Notion in particular) swallow Ctrl+click / middle-click on links so cdp_click cannot satisfy that request reliably across apps.', parameters: { type: 'object', properties: { ref: { type: 'string', description: 'Element ref like e12 from the snapshot table.' }, modifiers: { type: 'array', items: { type: 'string', enum: ['alt', 'ctrl', 'shift', 'meta'] }, description: 'Optional modifier keys held during the click.' }, button: { type: 'string', enum: ['left', 'middle', 'right'], description: 'Mouse button. Default "left".' } }, required: ['ref'], additionalProperties: false } },
   { type: 'function', name: 'cdp_open_notion_page', description: 'Navigate the active Notion window directly to a page by Notion page id. Use this in preference to clicking sidebar entries — it works even when the sidebar is collapsed.', parameters: { type: 'object', properties: { pageId: { type: 'string', description: 'Notion page id, 32 hex chars (with or without hyphens)' } }, required: ['pageId'], additionalProperties: false } },
+  { type: 'function', name: 'cdp_open_in_new_tab', description: 'Open a URL in a NEW tab of the active app, preserving the current tab. Generic across Chromium-based apps (Chrome, Edge, Brave, any Electron app that exposes a multi-target browser endpoint). When the app exposes a Notion-style Tab Bar (a CDP page target whose URL ends in `/tabs/index.html`), the tool tries THREE paths in cascade so transient main-process delays do not lose the tab: (1) Ctrl+T dispatched as a real CDP key event on the active main page — Notion\'s accelerator catches this and spawns a strip tab, (2) click the Tab Bar\'s "+" button via real CDP mouse events (DOM-anchored fallback), (3) `Target.createTarget({ url })` at the browser endpoint as last resort. Otherwise it goes straight to `Target.createTarget`. After those three attempts a final 10s consolidated poll catches BrowserViews that publish their target id late (a single Notion run measured ~14s click-to-publish), so the whole cascade can take up to ~40s. WAIT FOR IT TO RETURN, do not retry mid-call. On success it binds all subsequent `cdp_*` tools to the new tab (no need to call `cdp_select_window` after) and navigates it to the target URL. Returns `{ ok, newTabId, url, route: "tab_bar"|"target_create", attempts? }` on success, or `{ error, attempts, windowsAfter, hint }` on failure. If the tool returns an error, DO NOT claim success in your reply — surface the error to the user. Pass `url` (any http(s):// URL — e.g. an existing tab\'s `url` from `cdp_list_windows`, or the `href` of a link). For Notion you may pass `pageId` (32 hex, with or without hyphens) or `pageName` (visible sidebar title) instead — the tool builds the Notion URL or resolves it from the active page\'s sidebar `<a role="treeitem">` href. Never try Ctrl+click, middle-click, or Ctrl+P as a manual workaround — Notion\'s React swallows modifier link clicks and Ctrl+P opens the unrelated "Move page to…" dialog.', parameters: { type: 'object', properties: { url: { type: 'string', description: 'Absolute URL to open. Use this for browsers (Chrome, Edge, …) and any non-Notion app. For "open the link X is pointing at", pass the link\'s href.' }, pageId: { type: 'string', description: 'Notion page id (32 hex, dashed or unhyphenated). Shorthand for url=`https://www.notion.so/<pageId>`.' }, pageName: { type: 'string', description: 'Notion-only: visible sidebar page name. Resolved to a pageId via the active tab\'s sidebar `<a role="treeitem">` hrefs (case-insensitive substring; exact match wins). Requires a real Notion workspace tab to be active so the sidebar is mounted.' } }, additionalProperties: false } },
   { type: 'function', name: 'notion_tasklist_read', description: 'Read the task list on the currently-open Notion page. Returns the rows in display order with structured fields: { rowId, content, checked, displayIndex }. Use this instead of cdp_get_tree + manual ref discovery when the user asks to count tasks, find a task by text, or identify which tasks are checked/unchecked. Works on both to_do-block pages and database task tables.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { type: 'function', name: 'notion_task_toggle', description: 'Toggle (or set) the checked state of a specific Notion task row by Notion row id. Reliably dispatches a real React click on the checkbox of that row — works for both inline to_do blocks and database task rows. If `checked` is omitted, the current state is flipped. Prefer this over cdp_click on a ref when the user asks to check/uncheck a specific task — refs are positional and easy to misread, row ids are stable.', parameters: { type: 'object', properties: { rowId: { type: 'string', description: 'Notion row id, 32 hex (with or without hyphens), from notion_tasklist_read.rowId' }, checked: { type: 'boolean', description: 'Optional target state. Omit to flip current state.' } }, required: ['rowId'], additionalProperties: false } },
   { type: 'function', name: 'cdp_type', description: 'Focus an input/textarea/contenteditable by ref and set its text.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' } }, required: ['ref', 'text'], additionalProperties: false } },
@@ -4661,7 +4835,10 @@ async function executeTool(name, args, meta, refMapHolder) {
     const r = lookup(args.ref);
     if (r.error) return r;
     if (!r.selector) return { error: 'no_selector', hint: 'This ref has no CSS selector — UI may have changed.' };
-    return cdpClickReal(meta.port, r.selector);
+    const modsMask = resolveCdpModifiers(args && args.modifiers);
+    const btn = (args && typeof args.button === 'string' && /^(left|middle|right|back|forward)$/i.test(args.button))
+      ? args.button.toLowerCase() : 'left';
+    return cdpClickReal(meta.port, r.selector, { modifiers: modsMask, button: btn });
   }
   if (name === 'cdp_open_notion_page') {
     const rawId = (args && typeof args.pageId === 'string') ? args.pageId.trim() : '';
@@ -4699,6 +4876,363 @@ async function executeTool(name, args, meta, refMapHolder) {
       return { ok: false, error: 'nav_timeout', last: last || null };
     } catch (e) {
       return { ok: false, error: String(e && e.message || e) };
+    }
+  }
+  if (name === 'cdp_open_in_new_tab' || name === 'cdp_open_notion_page_in_new_tab') {
+    const rawUrl = (args && typeof args.url === 'string') ? args.url.trim() : '';
+    const rawId = (args && typeof args.pageId === 'string') ? args.pageId.trim() : '';
+    const rawName = (args && typeof args.pageName === 'string') ? args.pageName.trim() : '';
+    if (!rawUrl && !rawId && !rawName) return { error: 'missing_arg', hint: 'Pass url, pageId (32 hex, Notion only), or pageName (Notion only).' };
+    let pageId = '';
+    let targetUrl = '';
+    if (rawUrl) {
+      if (!/^https?:\/\//i.test(rawUrl)) return { error: 'bad_url', hint: 'url must be an absolute http(s):// URL.' };
+      targetUrl = rawUrl;
+    } else if (rawId) {
+      const noHy = rawId.replace(/-/g, '').toLowerCase();
+      if (!/^[0-9a-f]{32}$/.test(noHy)) return { error: 'bad_pageId', hint: 'pageId must be 32 hex chars (dashed or unhyphenated).' };
+      pageId = noHy;
+      targetUrl = `https://www.notion.so/${noHy}`;
+    }
+    try {
+      // Resolve pageId/URL from pageName via sidebar treeitem hrefs on the active page (Notion-only path).
+      if (!targetUrl) {
+        const resolveExpr = `(function(){
+          try {
+            var needle=${JSON.stringify(rawName)}.toLowerCase().trim();
+            if(!needle) return JSON.stringify({error:'empty_name'});
+            var as=document.querySelectorAll('a[href]');
+            var hits=[];
+            for (var i=0;i<as.length;i++) {
+              var a=as[i];
+              var role=(a.getAttribute('role')||'').toLowerCase();
+              if (role!=='treeitem' && role!=='link') continue;
+              var text=(a.textContent||'').replace(/\\s+/g,' ').trim();
+              var lcText=text.toLowerCase();
+              if (lcText.indexOf(needle)<0) continue;
+              var href=a.getAttribute('href')||'';
+              var m=href.match(/[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+              if (!m) continue;
+              hits.push({text:text.slice(0,120),href:href,pageId:m[0].replace(/-/g,'').toLowerCase(),role:role,exact:(lcText===needle)});
+            }
+            return JSON.stringify({hits:hits});
+          } catch(e) { return JSON.stringify({error:String(e&&e.message||e)}); }
+        })()`;
+        const rawRead = await cdpEvalRaw(meta.port, resolveExpr);
+        let s = rawRead;
+        if (typeof s === 'string' && s.startsWith('"') && s.endsWith('"')) { try { s = JSON.parse(s); } catch {} }
+        let parsed;
+        try { parsed = JSON.parse(s); } catch { return { error: 'resolve_parse_failed', raw: String(rawRead).slice(0, 200) }; }
+        if (parsed.error) return { error: 'resolve_failed', detail: parsed.error };
+        const hits = parsed.hits || [];
+        if (hits.length === 0) return { error: 'page_not_found', hint: `No sidebar treeitem matched "${rawName}". Make sure a Notion workspace page tab is active (not the blank/restore page and not the Tab Bar), then retry. Or pass pageId/url directly.` };
+        const exact = hits.find(h => h.exact);
+        pageId = (exact || hits[0]).pageId;
+        targetUrl = `https://www.notion.so/${pageId}`;
+      }
+      // Auto-route: when the app exposes a Notion-style Tab Bar, try in order:
+      //   1) Ctrl+T to the active main page (Notion's accelerator → new strip
+      //      tab) — proven path; key events reach Notion handlers (see log
+      //      where Ctrl+P opened the Move dialog).
+      //   2) Click the Tab Bar's "+" button (DOM-anchored fallback).
+      //   3) CDP Target.createTarget (last resort — won't join the strip but
+      //      will at least surface the page).
+      // For non-Tab-Bar apps (Chrome, Edge, Brave, generic Electron), go
+      // straight to Target.createTarget.
+      const beforeRaw = await fetchCdpTargets(meta.port);
+      const tabBar = beforeRaw.find(p => p.type === 'page' && p.webSocketDebuggerUrl && /\/tabs\/index\.html/i.test(p.url || ''));
+      const isTabBarUrl = (u) => /\/tabs\/index\.html/i.test(u || '');
+      // Include every baseline target id (not just type==='page'). The poll
+      // predicate is relaxed below to find any new non-Tab-Bar target — if
+      // beforeIds only tracked page-type baseline, a pre-existing worker /
+      // iframe target could leak through as "new" when its type later changes.
+      const beforeIds = new Set(beforeRaw.map(p => p.id));
+      let freshTarget = null;
+      let route = '';
+      const attempts = [];
+
+      // Poll /json for a brand-new target (excluding the Tab Bar itself).
+      // Detect by id alone — Notion's BrowserView can transiently publish with
+      // type:"other" before settling on type:"page", and it publishes the id
+      // BEFORE binding webSocketDebuggerUrl. Both checks live in
+      // waitForWsUrl(), not here, so this stage is responsible only for
+      // "something new appeared." Workers/iframes are filtered explicitly to
+      // avoid bogus matches on background processes.
+      const pollForNewTarget = async (deadline) => {
+        while (Date.now() < deadline) {
+          await new Promise(r => setTimeout(r, 250));
+          const cur = await fetchCdpTargets(meta.port);
+          const fresh = cur.find(p => !beforeIds.has(p.id)
+            && !isTabBarUrl(p.url)
+            && p.type !== 'iframe'
+            && p.type !== 'worker'
+            && p.type !== 'service_worker'
+            && p.type !== 'shared_worker');
+          if (fresh) return fresh;
+        }
+        return null;
+      };
+
+      // Two-stage detection helper: once a new target id is seen, wait for it
+      // to acquire a webSocketDebuggerUrl (i.e. become attachable). Returns the
+      // updated target object, or null if it never binds.
+      const waitForWsUrl = async (targetId, deadline) => {
+        while (Date.now() < deadline) {
+          const cur = await fetchCdpTargets(meta.port);
+          const t = cur.find(p => p.id === targetId);
+          if (t && t.webSocketDebuggerUrl) return t;
+          await new Promise(r => setTimeout(r, 200));
+        }
+        return null;
+      };
+
+      // Dispatch Ctrl+T to the currently-active main page (NOT the Tab Bar).
+      // Notion's main process owns the Ctrl+T accelerator and creates a new
+      // strip tab when it fires from a Notion BrowserView.
+      const dispatchCtrlT = async () => {
+        const activeId = CDP_ACTIVE_TARGET.get(meta.port);
+        let activeTarget = beforeRaw.find(p => p.id === activeId && p.webSocketDebuggerUrl && !isTabBarUrl(p.url));
+        if (!activeTarget) {
+          activeTarget = beforeRaw.find(p => p.type === 'page' && p.webSocketDebuggerUrl && !isTabBarUrl(p.url));
+        }
+        if (!activeTarget) return { ok: false, reason: 'no_active_main_target' };
+        const kd = { type: 'rawKeyDown', windowsVirtualKeyCode: 84, nativeVirtualKeyCode: 84, code: 'KeyT', key: 't', modifiers: 2 };
+        const ku = { type: 'keyUp', windowsVirtualKeyCode: 84, nativeVirtualKeyCode: 84, code: 'KeyT', key: 't', modifiers: 2 };
+        try {
+          await cdpWsCommandsAtUrl(activeTarget.webSocketDebuggerUrl, [
+            { method: 'Input.dispatchKeyEvent', params: kd },
+            { method: 'Input.dispatchKeyEvent', params: ku },
+          ]);
+          return { ok: true, targetId: activeTarget.id };
+        } catch (e) {
+          return { ok: false, reason: String(e && e.message || e) };
+        }
+      };
+
+      // Click the Tab Bar's "+" button via real CDP mouse events.
+      const clickNewTabButton = async () => {
+        if (!tabBar) return { ok: false, reason: 'no_tab_bar' };
+        const findBtnExpr = `(function(){
+          try {
+            var sels=['[aria-label="New Tab"]','[aria-label="New tab"]','button[aria-label*="ew Tab"]','div[aria-label*="ew Tab"]','[data-testid*="ew-tab" i]','[data-testid*="ew_tab" i]','[class*="newTab" i]','[class*="new-tab" i]','[class*="addTab" i]','[class*="add-tab" i]'];
+            var el=null;
+            for (var i=0;i<sels.length && !el;i++) { el=document.querySelector(sels[i]); }
+            if (!el) {
+              var all=document.querySelectorAll('[aria-label],[title]');
+              for (var j=0;j<all.length;j++) {
+                var lbl=((all[j].getAttribute('aria-label')||'')+' '+(all[j].getAttribute('title')||'')).toLowerCase();
+                if (lbl.indexOf('new tab')>=0 || lbl.indexOf('add tab')>=0) { el=all[j]; break; }
+              }
+            }
+            if (!el) {
+              var btns=document.querySelectorAll('button,div[role="button"]');
+              for (var k=0;k<btns.length;k++) {
+                var t=(btns[k].textContent||'').trim();
+                if (t==='+' || t==='+') { el=btns[k]; break; }
+              }
+            }
+            if (!el) return JSON.stringify({error:'no_button'});
+            try { el.scrollIntoView({block:'center'}); } catch(_) {}
+            var r=el.getBoundingClientRect();
+            return JSON.stringify({ok:true,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),tag:el.tagName});
+          } catch(e) { return JSON.stringify({error:String(e&&e.message||e)}); }
+        })()`;
+        let coordsRes;
+        try {
+          coordsRes = await cdpWsCommandsAtUrl(tabBar.webSocketDebuggerUrl, [
+            { method: 'Runtime.evaluate', params: { expression: findBtnExpr, returnByValue: true } },
+          ]);
+        } catch (e) { return { ok: false, reason: String(e && e.message || e) }; }
+        const coordsVal = coordsRes && coordsRes[0] && coordsRes[0].result && coordsRes[0].result.value;
+        if (coordsVal === undefined || coordsVal === null) return { ok: false, reason: 'no_coords' };
+        let coords;
+        try { coords = JSON.parse(coordsVal); } catch { return { ok: false, reason: 'coords_parse_failed' }; }
+        if (!coords.ok) return { ok: false, reason: coords.error || 'button_not_found' };
+        try {
+          await cdpWsCommandsAtUrl(tabBar.webSocketDebuggerUrl, [
+            { method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: coords.x, y: coords.y, button: 'none' } },
+            { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: coords.x, y: coords.y, button: 'left', clickCount: 1 } },
+            { method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: coords.x, y: coords.y, button: 'left', clickCount: 1 } },
+          ]);
+        } catch (e) { return { ok: false, reason: String(e && e.message || e) }; }
+        return { ok: true, coords };
+      };
+
+      if (tabBar) {
+        route = 'tab_bar';
+        // 1) Ctrl+T to active main page.
+        const ctrlT = await dispatchCtrlT();
+        attempts.push({ method: 'ctrl_t', ok: ctrlT.ok, detail: ctrlT.reason || ctrlT.targetId });
+        freshTarget = await pollForNewTarget(Date.now() + 6000);
+        if (freshTarget && !freshTarget.webSocketDebuggerUrl) {
+          const upgraded = await waitForWsUrl(freshTarget.id, Date.now() + 8000);
+          if (upgraded) freshTarget = upgraded;
+          else {
+            attempts.push({ method: 'ws_url_wait', ok: false, detail: freshTarget.id });
+            freshTarget = null;
+          }
+        }
+
+        // 2) "+" button click on the Tab Bar.
+        if (!freshTarget) {
+          const clickRes = await clickNewTabButton();
+          attempts.push({ method: 'plus_click', ok: clickRes.ok, detail: clickRes.reason || clickRes.coords });
+          // 12s poll (was 8s): observed Notion publish the BrowserView target
+          // id to /json ~14s after the "+" click in a prior log, which fell
+          // outside the 8s window and the final error payload's windowsAfter
+          // contradicted the error itself.
+          freshTarget = await pollForNewTarget(Date.now() + 12000);
+          if (freshTarget && !freshTarget.webSocketDebuggerUrl) {
+            const upgraded = await waitForWsUrl(freshTarget.id, Date.now() + 8000);
+            if (upgraded) freshTarget = upgraded;
+            else {
+              attempts.push({ method: 'ws_url_wait', ok: false, detail: freshTarget.id });
+              freshTarget = null;
+            }
+          }
+        }
+
+        // 3) Last resort: Target.createTarget — surfaces the page even if it
+        // doesn't join Notion's strip.
+        if (!freshTarget) {
+          try {
+            const browserWs = await fetchCdpBrowserWsUrl(meta.port);
+            const createRes = await cdpWsCommandsAtUrl(browserWs, [
+              { method: 'Target.createTarget', params: { url: targetUrl } },
+            ]);
+            const created = createRes && createRes[0];
+            if (created && !created.__error && created.targetId) {
+              attempts.push({ method: 'target_create', ok: true, detail: created.targetId });
+              // Two-stage: wait for the id to appear in /json, then wait for
+              // it to acquire a webSocketDebuggerUrl (Notion binds the WS late).
+              const tcDeadline = Date.now() + 8000;
+              let seen = null;
+              while (Date.now() < tcDeadline) {
+                await new Promise(r => setTimeout(r, 200));
+                const cur = await fetchCdpTargets(meta.port);
+                seen = cur.find(p => p.id === created.targetId);
+                if (seen) break;
+              }
+              if (seen) {
+                if (seen.webSocketDebuggerUrl) { freshTarget = seen; route = 'target_create'; }
+                else {
+                  const upgraded = await waitForWsUrl(created.targetId, Date.now() + 8000);
+                  if (upgraded) { freshTarget = upgraded; route = 'target_create'; }
+                  else attempts.push({ method: 'ws_url_wait', ok: false, detail: created.targetId });
+                }
+              }
+            } else {
+              attempts.push({ method: 'target_create', ok: false, detail: created && created.__error ? String(created.__error) : 'no_target_id' });
+            }
+          } catch (e) {
+            attempts.push({ method: 'target_create', ok: false, detail: String(e && e.message || e) });
+          }
+        }
+
+        // Final consolidated poll: any of the three prior attempts may have
+        // succeeded in spawning a BrowserView whose target id surfaced on /json
+        // only after that attempt's own poll window closed. A prior log showed
+        // the new tab visible in the error payload's windowsAfter but never
+        // returned by the per-attempt polls. This catches late-publish cases
+        // regardless of which trigger fired.
+        if (!freshTarget) {
+          const lateFound = await pollForNewTarget(Date.now() + 10000);
+          if (lateFound) {
+            attempts.push({ method: 'final_poll', ok: true, detail: lateFound.id });
+            if (lateFound.webSocketDebuggerUrl) freshTarget = lateFound;
+            else {
+              const upgraded = await waitForWsUrl(lateFound.id, Date.now() + 8000);
+              if (upgraded) freshTarget = upgraded;
+              else attempts.push({ method: 'ws_url_wait', ok: false, detail: lateFound.id });
+            }
+          }
+        }
+
+        if (!freshTarget) {
+          const after = await fetchCdpTargets(meta.port);
+          return {
+            error: 'new_tab_did_not_appear',
+            hint: 'Tried Ctrl+T (active main page), Tab Bar "+" click, Target.createTarget, then a final 10s consolidated poll. None spawned an attachable page target in ~40s (id may have appeared but webSocketDebuggerUrl never bound). The user may need to focus Notion manually, or the app may have lost its CDP browser endpoint.',
+            attempts,
+            windowsAfter: after.filter(p => p.type === 'page').map(p => ({ id: p.id, url: (p.url || '').slice(0, 200) })),
+          };
+        }
+      } else {
+        // Generic Chromium path: spawn a new tab via Target.createTarget on the
+        // browser endpoint. Works for Chrome, Edge, Brave, and any Electron app
+        // that exposes a multi-target browser endpoint.
+        route = 'target_create';
+        let browserWs;
+        try { browserWs = await fetchCdpBrowserWsUrl(meta.port); }
+        catch (e) { return { error: 'no_browser_ws', hint: 'CDP browser endpoint unavailable — this app may not support multi-tab. Got: ' + String(e && e.message || e) }; }
+        const createRes = await cdpWsCommandsAtUrl(browserWs, [
+          { method: 'Target.createTarget', params: { url: targetUrl } },
+        ]);
+        const created = createRes && createRes[0];
+        if (!created || created.__error || !created.targetId) {
+          return { error: 'target_create_failed', detail: created && created.__error ? String(created.__error) : created };
+        }
+        // Two-stage: wait for the target id to appear in /json, then wait for
+        // it to acquire a webSocketDebuggerUrl. Some Chromium/Electron apps
+        // publish the id before binding the debugger WS URL.
+        const newDeadline = Date.now() + 8000;
+        let seen = null;
+        while (Date.now() < newDeadline) {
+          await new Promise(r => setTimeout(r, 200));
+          const cur = await fetchCdpTargets(meta.port);
+          seen = cur.find(p => p.id === created.targetId);
+          if (seen) break;
+        }
+        if (!seen) return { error: 'new_target_not_visible', hint: `Target.createTarget returned ${created.targetId} but it never surfaced on /json.` };
+        if (seen.webSocketDebuggerUrl) freshTarget = seen;
+        else {
+          freshTarget = await waitForWsUrl(created.targetId, Date.now() + 8000);
+          if (!freshTarget) return { error: 'new_target_no_ws_url', hint: `Target ${created.targetId} surfaced on /json but never acquired a webSocketDebuggerUrl within 8s.` };
+        }
+      }
+      // Bind subsequent cdp_* tools to the new tab.
+      CDP_ACTIVE_TARGET.set(meta.port, freshTarget.id);
+      CDP_WS_TARGETS.delete(meta.port);
+      // Let the new tab settle — the renderer needs a moment before
+      // location.href assignment takes hold.
+      await new Promise(r => setTimeout(r, 400));
+      // For the tab_bar path the new tab spawns blank — set its URL now.
+      // For target_create the new tab is already loading targetUrl, but we
+      // still retry set + poll the read so both paths verify the same way.
+      const setExpr = `(function(){try{window.location.href=${JSON.stringify(targetUrl)};return JSON.stringify({ok:true});}catch(e){return JSON.stringify({ok:false,error:String(e&&e.message||e)});}})()`;
+      const matchKey = (pageId || targetUrl).toLowerCase().replace(/-/g, '');
+      const readExpr = `(function(){try{var url=(location&&location.href)||'';var key=${JSON.stringify(matchKey)};return JSON.stringify({ok:url.toLowerCase().replace(/-/g,'').indexOf(key)>=0,url:url});}catch(e){return JSON.stringify({ok:false,error:String(e&&e.message||e)});}})()`;
+      const setDeadline = Date.now() + 5000;
+      while (Date.now() < setDeadline) {
+        try {
+          const rawSet = await cdpEvalRaw(meta.port, setExpr);
+          let ss = rawSet;
+          if (typeof ss === 'string' && ss.startsWith('"') && ss.endsWith('"')) { try { ss = JSON.parse(ss); } catch {} }
+          const parsed = JSON.parse(ss);
+          if (parsed && parsed.ok) break;
+        } catch (_) {}
+        await new Promise(r => setTimeout(r, 250));
+      }
+      const navDeadline = Date.now() + 12000;
+      let lastRead = null;
+      while (Date.now() < navDeadline) {
+        await new Promise(r => setTimeout(r, 300));
+        try {
+          const rawRead = await cdpEvalRaw(meta.port, readExpr);
+          let s = rawRead;
+          if (typeof s === 'string' && s.startsWith('"') && s.endsWith('"')) { try { s = JSON.parse(s); } catch {} }
+          lastRead = JSON.parse(s);
+          if (lastRead && lastRead.ok) {
+            const out = { ok: true, newTabId: freshTarget.id, url: lastRead.url, route };
+            if (pageId) out.pageId = pageId;
+            if (attempts && attempts.length) out.attempts = attempts;
+            return out;
+          }
+        } catch (_) {}
+      }
+      return { error: 'nav_timeout', last: lastRead, newTabId: freshTarget.id, route, pageId: pageId || undefined, targetUrl, attempts: attempts && attempts.length ? attempts : undefined };
+    } catch (e) {
+      return { error: String(e && e.message || e) };
     }
   }
   if (name === 'notion_tasklist_read') {
@@ -5182,16 +5716,18 @@ ipcMain.handle('chat:select-window', async (_event, payload) => {
   }
 });
 
-// Tabs of the selected window — backs the chat composer's `/tab` mention picker.
-// Tab ids are CDP page-target ids, the same ids cdp_select_window({id}) accepts,
-// so a `[tab:<id>]` reference the user inserts maps straight to a model action.
+// All tabs across all browser windows for the port — backs the chat composer's
+// `/tab` mention picker. Each tab carries a 1-based `windowIndex`; `windowCount`
+// is the total number of distinct windows. Tab ids are CDP page-target ids, the
+// same ids cdp_select_window({id}) accepts, so a `[tab:<id>]` reference the user
+// inserts maps straight to a model action.
 ipcMain.handle('chat:list-tabs', async (_event, port) => {
-  if (!port) return { count: 0, tabs: [] };
+  if (!port) return { count: 0, tabs: [], windowCount: 1 };
   try {
-    const tabs = await listCdpWindowTabs(port);
-    return { count: tabs.length, tabs };
+    const result = await listCdpWindowTabs(port);
+    return { count: result.tabs.length, tabs: result.tabs, windowCount: result.windowCount };
   } catch (e) {
-    return { error: 'list_tabs_failed', hint: String((e && e.message) || e), count: 0, tabs: [] };
+    return { error: 'list_tabs_failed', hint: String((e && e.message) || e), count: 0, tabs: [], windowCount: 1 };
   }
 });
 
@@ -5434,7 +5970,7 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
         // the search happening; final sources land in output_item.done below.
         const it = parsed.item;
         const query = (it.action && (it.action.query || it.action.search_query)) || '';
-        try { sender.send('chat:tool', { exe: meta.exe, name: 'web_search', args: { query } }); } catch {}
+        try { sender.send('chat:tool', { exe: meta.exe, callId: it.id || null, name: 'web_search', args: { query }, label: null }); } catch {}
       } else if (t === 'response.output_item.done' && parsed.item && parsed.item.type === 'web_search_call') {
         const it = parsed.item;
         const query = (it.action && (it.action.query || it.action.search_query)) || '';
@@ -5446,8 +5982,12 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
         try {
           sender.send('chat:tool-result', {
             exe: meta.exe,
+            callId: it.id || null,
             name: 'web_search',
+            args: { query },
             result: { ok: true, query, sources, count: sources.length },
+            label: null,
+            errorRaw: null,
           });
         } catch {}
       } else if (t === 'response.output_text.annotation.added' && parsed.annotation) {
@@ -5534,6 +6074,18 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
       settled = true;
       clearInterval(heartbeatTimer);
       reject(new Error(`Stream connection error: ${err.message}`));
+    });
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(heartbeatTimer);
+      reject(new Error(`Stream request error: ${err.message}`));
+    });
+    req.on('close', () => {
+      if (settled) return;
+      settled = true;
+      clearInterval(heartbeatTimer);
+      reject(new Error('Stream aborted before response.'));
     });
 
     activeChats.set(meta.exe, req);
@@ -5778,39 +6330,10 @@ async function runChatSend(event, payload) {
         let parsedArgs = {};
         try { parsedArgs = JSON.parse(tc.args || '{}'); } catch { parsedArgs = {}; }
         debugLog(`[tool] ${tc.name} ${JSON.stringify(parsedArgs)}`);
-        event.sender.send('chat:tool', { exe, name: tc.name, args: parsedArgs });
-
-        // Clarification: suspend the loop, render a question card in the renderer,
-        // and resume this same turn once the user clicks a choice or types an answer.
-        if (tc.name === 'ask_user') {
-          const opts = Array.isArray(parsedArgs.options)
-            ? parsedArgs.options.slice(0, 4).map(o => String(o).replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 120)).filter(Boolean)
-            : [];
-          const question = String(parsedArgs.question || '').replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 1000);
-          event.sender.send('chat:ask', { exe, callId: tc.call_id, question, options: opts });
-          const ans = await Promise.race([
-            waitForUserAnswer(exe),
-            new Promise((r) => setTimeout(() => r({ timedOut: true }), 10 * 60_000)), // zombie guard
-          ]);
-          chatPendingAsks.delete(exe);
-          let askResult;
-          if (ans.aborted || chatAbortFlags.get(exe)) askResult = { aborted: true };
-          else if (ans.timedOut) askResult = { error: 'no_answer', hint: 'User did not answer in time. Proceed with a safe default or stop and explain what you need.' };
-          else askResult = { answer: ans.answer };
-          event.sender.send('chat:tool-result', { exe, name: tc.name, result: askResult });
-          turnTrail.push({ name: tc.name, args: parsedArgs, result: askResult, refInfo: null });
-          input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
-          input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(askResult) });
-          if (ans.aborted || chatAbortFlags.get(exe)) break; // exit toolCalls loop; round loop sees abort flag
-          continue;
-        }
 
         // Snapshot the target element BEFORE the call. cdp_get_tree / cdp_find
         // overwrite refMapHolder.current, so this is the only chance to capture
-        // what the ref pointed to. Recipe generator uses this to write specific
-        // cdp_find queries instead of guessing from the user prompt.
-        // Route to whichever app is currently active (primary unless the model
-        // called select_app). Each app has its own ref snapshot holder.
+        // what the ref pointed to. Same snapshot drives the humanized pill label.
         const activeMeta = routerActiveMeta(router) || meta;
         const activeHolder = routerRefHolder(router, router.activeKey);
         let refInfo = null;
@@ -5830,6 +6353,34 @@ async function runChatSend(event, payload) {
             };
           }
         }
+        const startLabel = humanLabelFromRefInfo(refInfo);
+        event.sender.send('chat:tool', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, label: startLabel });
+
+        // Clarification: suspend the loop, render a question card in the renderer,
+        // and resume this same turn once the user clicks a choice or types an answer.
+        if (tc.name === 'ask_user') {
+          const opts = Array.isArray(parsedArgs.options)
+            ? parsedArgs.options.slice(0, 4).map(o => String(o).replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 120)).filter(Boolean)
+            : [];
+          const question = String(parsedArgs.question || '').replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 1000);
+          event.sender.send('chat:ask', { exe, callId: tc.call_id, question, options: opts });
+          const ans = await Promise.race([
+            waitForUserAnswer(exe),
+            new Promise((r) => setTimeout(() => r({ timedOut: true }), 10 * 60_000)), // zombie guard
+          ]);
+          chatPendingAsks.delete(exe);
+          let askResult;
+          if (ans.aborted || chatAbortFlags.get(exe)) askResult = { aborted: true };
+          else if (ans.timedOut) askResult = { error: 'no_answer', hint: 'User did not answer in time. Proceed with a safe default or stop and explain what you need.' };
+          else askResult = { answer: ans.answer };
+          event.sender.send('chat:tool-result', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, result: askResult, label: null, errorRaw: askResult.error || null });
+          turnTrail.push({ name: tc.name, args: parsedArgs, result: askResult, refInfo: null, callId: tc.call_id, label: null });
+          input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
+          input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(askResult) });
+          if (ans.aborted || chatAbortFlags.get(exe)) break; // exit toolCalls loop; round loop sees abort flag
+          continue;
+        }
+
         let result;
         try {
           if (tc.name === 'select_app') {
@@ -5845,8 +6396,9 @@ async function runChatSend(event, payload) {
         } catch (err) {
           result = { error: String(err.message || err) };
         }
-        event.sender.send('chat:tool-result', { exe, name: tc.name, result });
-        turnTrail.push({ name: tc.name, args: parsedArgs, result, refInfo });
+        const errorRaw = (result && result.error) ? String(result.error) : null;
+        event.sender.send('chat:tool-result', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, result, label: startLabel, errorRaw });
+        turnTrail.push({ name: tc.name, args: parsedArgs, result, refInfo, callId: tc.call_id, label: startLabel });
         input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
         input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(result) });
       }
@@ -6062,7 +6614,29 @@ async function runDirectChat(event, payload) {
         let parsedArgs = {};
         try { parsedArgs = JSON.parse(tc.args || '{}'); } catch { parsedArgs = {}; }
         debugLog(`[direct-tool] ${tc.name} ${JSON.stringify(parsedArgs)}`);
-        event.sender.send('chat:tool', { exe, name: tc.name, args: parsedArgs });
+
+        // Resolve ref label BEFORE emit so cdp_get_tree mid-turn can't invalidate it.
+        const directActiveMeta = routerActiveMeta(router);
+        const directHolder = directActiveMeta ? routerRefHolder(router, router.activeKey) : null;
+        let refInfo = null;
+        if (typeof parsedArgs.ref === 'string' && directHolder && directHolder.current) {
+          const r = directHolder.current[parsedArgs.ref];
+          if (r) {
+            refInfo = {
+              ref: parsedArgs.ref,
+              tag: r.tag || '',
+              text: (r.text || '').slice(0, 160),
+              aria: (r.aria || '').slice(0, 160),
+              role: r.role || '',
+              id: r.id || '',
+              name: r.name || '',
+              automationId: r.automationId || '',
+              controlType: r.controlType || '',
+            };
+          }
+        }
+        const startLabel = humanLabelFromRefInfo(refInfo);
+        event.sender.send('chat:tool', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, label: startLabel });
 
         if (tc.name === 'ask_user') {
           const opts = Array.isArray(parsedArgs.options)
@@ -6079,8 +6653,8 @@ async function runDirectChat(event, payload) {
           if (ans.aborted || chatAbortFlags.get(exe)) askResult = { aborted: true };
           else if (ans.timedOut) askResult = { error: 'no_answer', hint: 'User did not answer in time. Proceed with a safe default or stop and explain what you need.' };
           else askResult = { answer: ans.answer };
-          event.sender.send('chat:tool-result', { exe, name: tc.name, result: askResult });
-          turnTrail.push({ name: tc.name, args: parsedArgs, result: askResult, refInfo: null });
+          event.sender.send('chat:tool-result', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, result: askResult, label: null, errorRaw: askResult.error || null });
+          turnTrail.push({ name: tc.name, args: parsedArgs, result: askResult, refInfo: null, callId: tc.call_id, label: null });
           input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
           input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(askResult) });
           if (ans.aborted || chatAbortFlags.get(exe)) break;
@@ -6094,15 +6668,14 @@ async function runDirectChat(event, payload) {
           if (tc.name === 'select_app') {
             result = await routerSelectApp(router, parsedArgs.app);
           } else if (toolBackend(tc.name) !== 'any') {
-            const activeMeta = routerActiveMeta(router);
-            if (!activeMeta) {
+            if (!directActiveMeta) {
               result = { error: 'no_active_app', hint: 'No app is active. Call select_app({ app: "<key>" }) with a key from the Referenced apps table before using cdp_*/uia_* tools.' };
             } else {
-              const tb = toolBackend(tc.name), ab = backendForMeta(activeMeta);
+              const tb = toolBackend(tc.name), ab = backendForMeta(directActiveMeta);
               if (tb !== ab) {
-                result = { error: 'wrong_backend', hint: `Active app "${activeMeta.name}" is a ${ab} app, but ${tc.name} is a ${tb} tool. select_app a ${tb} app or use ${ab}_* tools.` };
+                result = { error: 'wrong_backend', hint: `Active app "${directActiveMeta.name}" is a ${ab} app, but ${tc.name} is a ${tb} tool. select_app a ${tb} app or use ${ab}_* tools.` };
               } else {
-                result = await executeTool(tc.name, parsedArgs, activeMeta, routerRefHolder(router, router.activeKey));
+                result = await executeTool(tc.name, parsedArgs, directActiveMeta, directHolder);
               }
             }
           } else {
@@ -6112,8 +6685,9 @@ async function runDirectChat(event, payload) {
         } catch (err) {
           result = { error: String(err.message || err) };
         }
-        event.sender.send('chat:tool-result', { exe, name: tc.name, result });
-        turnTrail.push({ name: tc.name, args: parsedArgs, result, refInfo: null });
+        const errorRaw = (result && result.error) ? String(result.error) : null;
+        event.sender.send('chat:tool-result', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, result, label: startLabel, errorRaw });
+        turnTrail.push({ name: tc.name, args: parsedArgs, result, refInfo, callId: tc.call_id, label: startLabel });
         input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
         input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(result) });
       }
@@ -7854,6 +8428,12 @@ app.whenReady().then(() => {
     debugLog(`[hotkey] bound "${bound}"`);
   }
   createOverlayWindow();                                   // preload hidden overlay for instant show
+  // Warm the detect caches now so the first hotkey press has populated
+  // currentApps/cachedUiaApps the moment the renderer's IPC call resolves —
+  // otherwise PowerShell detection (~2–5 s) loses the race against the user
+  // and the launcher shows "no selected apps" until a second summon.
+  try { detectElectronAppsCached(); } catch {}
+  try { detectUiaAppsCached(); } catch {}
   // If nothing bound, force the settings window open (don't strand the user with
   // a hidden tray icon and no summon key).
   createSettingsWindow({ show: hotkeyStranded || !appConfig.startMinimized });
@@ -7956,6 +8536,14 @@ ipcMain.on('overlay:set-dragging', (event, { active } = {}) => {
 });
 
 ipcMain.handle('overlay:dismiss', () => { hideOverlay(); return true; });
+ipcMain.on('overlay:hide-finished', (event) => {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  if (event.sender !== overlayWindow.webContents) return;
+  // Drop stale acks from a close that was cancelled by a re-summon mid-fade;
+  // otherwise the ack would hide() the freshly-shown window.
+  if (!overlayClosing) return;
+  finalizeHideOverlay();
+});
 
 // Drive the tray icon's circular progress overlay from the renderer while the
 // user is mid-ESC-hold to reset the chat. progress is in [0,1]; anything <=0

@@ -98,7 +98,26 @@ param(
 
 $StatePath = Join-Path $PSScriptRoot "cdp-state.json"
 $ShortcutBackupPath = Join-Path $PSScriptRoot "cdp-shortcut-backup.json"
+$CdpPolicyStatePath = Join-Path $PSScriptRoot "cdp-policy-state.json"
 $TaskName = "ElectronCDP-Persistent"
+
+# Chromium 127+ App-Bound Encryption (ABE) seals cookie keys to the running
+# user-data-dir path. Chromium 136+ refuses --remote-debugging-port on the
+# default profile (security hardening against infostealers). The combination
+# means autobot's dedicated sandbox profile CANNOT decrypt cookies robocopied
+# from the user's default profile, so every site signs the user out the first
+# time CDP is enabled. Disabling these two policies forces cookies back to the
+# pre-127 DPAPI v10 path (per-user, no path binding), which copies cleanly
+# across user-data-dirs.
+#
+# Trade-off (the user accepted explicitly): while CDP is on, ALL Chrome
+# instances on this Windows account write/read cookies under the weaker DPAPI
+# v10 protection - malware running as this user could harvest them. Restored
+# to the user's original value on -Disable / Start-AppNormally.
+$CdpPolicyValues = @(
+    'ApplicationBoundEncryptionEnabled',
+    'DeviceBoundSessionCredentialsEnabled'
+)
 
 # Standalone Chromium browsers ignore --remote-debugging-port on their DEFAULT
 # user-data-dir (Chromium 136+ hardening), so the debug port never opens. They
@@ -255,6 +274,123 @@ function Remove-BrowserLinkRedirect {
 # Arguments of every Chrome .lnk in user-writable locations so the FIRST
 # launch already lands in the sandbox profile with --remote-debugging-port set.
 # Originals are saved to cdp-shortcut-backup.json and restored on disable.
+
+function Get-BrowserPolicyRoot {
+    param([string]$ExePath)
+    switch ([IO.Path]::GetFileName($ExePath).ToLower()) {
+        'chrome.exe'   { return 'HKCU:\Software\Policies\Google\Chrome' }
+        'msedge.exe'   { return 'HKCU:\Software\Policies\Microsoft\Edge' }
+        'brave.exe'    { return 'HKCU:\Software\Policies\BraveSoftware\Brave' }
+        'chromium.exe' { return 'HKCU:\Software\Policies\Chromium' }
+        default        { return $null }
+    }
+}
+
+function Get-CdpPolicyState {
+    if (-not (Test-Path $CdpPolicyStatePath)) { return @{} }
+    try {
+        $raw = Get-Content $CdpPolicyStatePath -Raw -ErrorAction Stop
+        if (-not $raw) { return @{} }
+        $obj = $raw | ConvertFrom-Json
+        $top = @{}
+        foreach ($p in $obj.PSObject.Properties) {
+            $inner = @{}
+            if ($p.Value) {
+                foreach ($v in $p.Value.PSObject.Properties) { $inner[$v.Name] = $v.Value }
+            }
+            $top[$p.Name] = $inner
+        }
+        return $top
+    } catch { return @{} }
+}
+
+function Save-CdpPolicyState {
+    param([hashtable]$State)
+    if (-not $State -or $State.Count -eq 0) {
+        if (Test-Path $CdpPolicyStatePath) { Remove-Item $CdpPolicyStatePath -Force -ErrorAction SilentlyContinue }
+        return
+    }
+    ($State | ConvertTo-Json -Depth 4) | Set-Content -Path $CdpPolicyStatePath -Encoding utf8
+}
+
+# Disable ABE / DBSC for the given browser so cookies stay portable between the
+# user's default profile and autobot's sandbox profile. Remembers each value's
+# pre-existing state ('__absent__' or original DWORD) so Remove-BrowserCdpPolicy
+# can restore exactly what was there before, never clobbering an admin-pushed
+# policy with our absence.
+function Set-BrowserCdpPolicy {
+    param([string]$ExePath)
+    if (-not (Test-IsBrowser -ExePath $ExePath)) { return }
+    $key = Get-BrowserPolicyRoot -ExePath $ExePath
+    if (-not $key) { return }
+    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+
+    $exeBase = [IO.Path]::GetFileName($ExePath).ToLower()
+    $state = Get-CdpPolicyState
+    $ownership = $state[$exeBase]
+    if (-not $ownership) { $ownership = @{} }
+
+    $touched = $false
+    foreach ($name in $CdpPolicyValues) {
+        $cur = $null
+        try { $cur = (Get-ItemProperty -Path $key -Name $name -ErrorAction Stop).$name } catch {}
+        if (-not $ownership.ContainsKey($name)) {
+            if ($null -eq $cur) { $ownership[$name] = '__absent__' }
+            else                { $ownership[$name] = [int]$cur }
+        }
+        if ($cur -ne 0) {
+            Set-ItemProperty -Path $key -Name $name -Value 0 -Type DWord
+            $touched = $true
+        }
+    }
+
+    $state[$exeBase] = $ownership
+    Save-CdpPolicyState -State $state
+    if ($touched) { Write-Host "  CDP policy: $exeBase ABE/DBSC disabled (cookies portable across sandbox profile)" }
+}
+
+function Remove-BrowserCdpPolicy {
+    param([string]$ExePath)
+    if (-not (Test-IsBrowser -ExePath $ExePath)) { return }
+    $key = Get-BrowserPolicyRoot -ExePath $ExePath
+    if (-not $key) { return }
+    $exeBase = [IO.Path]::GetFileName($ExePath).ToLower()
+    $state = Get-CdpPolicyState
+    if (-not $state.ContainsKey($exeBase)) { return }
+    $ownership = $state[$exeBase]
+
+    if (Test-Path $key) {
+        foreach ($name in $CdpPolicyValues) {
+            if (-not $ownership.ContainsKey($name)) { continue }
+            $orig = $ownership[$name]
+            if ($orig -eq '__absent__') {
+                Remove-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue
+            } else {
+                Set-ItemProperty -Path $key -Name $name -Value ([int]$orig) -Type DWord
+            }
+        }
+        # Prune the policy key if we made it (no remaining values / subkeys).
+        $remaining = @((Get-Item $key -ErrorAction SilentlyContinue).Property).Count
+        $children = @(Get-ChildItem $key -ErrorAction SilentlyContinue).Count
+        if ($remaining -eq 0 -and $children -eq 0) {
+            # Walk up our created path, stop at first key that still has data.
+            $cursor = $key
+            while ($cursor -and $cursor -match '^HKCU:\\Software\\Policies\\') {
+                if (-not (Test-Path $cursor)) { $cursor = Split-Path $cursor -Parent; continue }
+                $r = @((Get-Item $cursor -ErrorAction SilentlyContinue).Property).Count
+                $c = @(Get-ChildItem $cursor -ErrorAction SilentlyContinue).Count
+                if ($r -eq 0 -and $c -eq 0) {
+                    Remove-Item -Path $cursor -Force -ErrorAction SilentlyContinue
+                    $cursor = Split-Path $cursor -Parent
+                } else { break }
+            }
+        }
+    }
+
+    $state.Remove($exeBase)
+    Save-CdpPolicyState -State $state
+    Write-Host "  CDP policy: $exeBase restored"
+}
 
 function Get-BrowserShortcutSearchDirs {
     @(
@@ -457,7 +593,30 @@ function Stop-AppByExe {
     }
     if (-not $procs) { return 0 }
     $count = $procs.Count
-    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+
+    # For Chromium browsers, try a graceful WM_CLOSE first so Chrome flushes
+    # cookies / auth tokens / DBSC state to disk before exit. Stop-Process -Force
+    # is SIGKILL-equivalent: it can leave the cookie SQLite DB mid-write, which
+    # Chrome treats on next launch as decryption failure and silently drops the
+    # affected rows - the user perceives this as being signed out of Google.
+    # Electron apps skip this branch to avoid 4s hangs from beforeunload prompts.
+    if (Test-IsBrowser -ExePath $ExePath) {
+        foreach ($p in $procs) {
+            try { if (-not $p.HasExited) { [void]$p.CloseMainWindow() } } catch {}
+        }
+        $gracefulDeadline = (Get-Date).AddSeconds(4)
+        while ((Get-Date) -lt $gracefulDeadline) {
+            $still = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+                try { $_.Path -eq $ExePath } catch { $false }
+            }
+            if (-not $still) { return $count }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+
+    Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -eq $ExePath } catch { $false }
+    } | Stop-Process -Force -ErrorAction SilentlyContinue
     $deadline = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $deadline) {
         $still = Get-Process -ErrorAction SilentlyContinue | Where-Object {
@@ -482,7 +641,13 @@ function Start-AppWithCdp {
         if ($killed -gt 0) { Write-Host "  Stopped $killed process(es) for $name" }
     }
 
-    if (Test-IsBrowser -ExePath $ExePath) { Initialize-CdpBrowserProfile -ExePath $ExePath -SrcDir $srcDir | Out-Null }
+    if (Test-IsBrowser -ExePath $ExePath) {
+        # Policy MUST be set before launch - Chrome reads ABE/DBSC policy at
+        # startup. Without this, copied cookies cannot decrypt in the sandbox
+        # profile and sites force re-login.
+        Set-BrowserCdpPolicy -ExePath $ExePath
+        Initialize-CdpBrowserProfile -ExePath $ExePath -SrcDir $srcDir | Out-Null
+    }
 
     $launchArgs = Get-CdpLaunchArgs -ExePath $ExePath -Port $Port
     Write-Host "  Launching $name with $launchArgs"
@@ -513,10 +678,11 @@ function Start-AppNormally {
     $killed = Stop-AppByExe -ExePath $ExePath
     if ($killed -gt 0) { Write-Host "  Stopped $killed process(es) for $name" }
 
-    # Restore default-profile link handling (undo the sandbox redirect).
+    # Restore default-profile link handling and ABE/DBSC policy.
     if (Test-IsBrowser -ExePath $ExePath) {
         Remove-BrowserLinkRedirect -ExePath $ExePath
         Remove-BrowserShortcutRedirect -ExePath $ExePath
+        Remove-BrowserCdpPolicy -ExePath $ExePath
     }
 
     Write-Host "  Launching $name normally (no CDP)"
@@ -670,10 +836,11 @@ if ($Enable) {
         $port++
     }
 
-    # Ensure link redirect is on for every tracked browser (covers the
-    # already-had-CDP branch that skips Start-AppWithCdp).
+    # Ensure link redirect AND ABE/DBSC policy are on for every tracked browser
+    # (covers the already-had-CDP branch that skips Start-AppWithCdp).
     foreach ($r in $results) {
         if (Test-IsBrowser -ExePath $r.Exe) {
+            Set-BrowserCdpPolicy -ExePath $r.Exe
             Set-BrowserLinkRedirect -ExePath $r.Exe
             Set-BrowserShortcutRedirect -ExePath $r.Exe -Port $r.Port
         }
@@ -707,11 +874,13 @@ if ($Disable) {
     Write-Host "Disabling persistent CDP..."
 
     foreach ($app in $state.apps) {
-        # Always undo the link / shortcut redirects, even if the browser isn't
-        # running now (Start-AppNormally only runs for live apps).
+        # Always undo the link / shortcut redirects and ABE/DBSC policy, even
+        # if the browser isn't running now (Start-AppNormally only runs for
+        # live apps).
         if (Test-IsBrowser -ExePath $app.exe) {
             Remove-BrowserLinkRedirect -ExePath $app.exe
             Remove-BrowserShortcutRedirect -ExePath $app.exe
+            Remove-BrowserCdpPolicy -ExePath $app.exe
         }
 
         $isRunning = Get-Process -ErrorAction SilentlyContinue | Where-Object {
@@ -929,7 +1098,24 @@ if ($Watch) {
         $srcDir = $null
         if (-not $sandboxRunning) { $srcDir = Get-BrowserSourceUserData -ExePath $ExePath }
 
-        $default | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        # Graceful close first so Chrome can flush cookies / auth tokens to
+        # disk; Stop-Process -Force on a mid-write cookie SQLite DB causes
+        # silent decryption failures = perceived sign-out from Google.
+        foreach ($p in $default) {
+            try {
+                $proc = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
+                if ($proc -and -not $proc.HasExited) { [void]$proc.CloseMainWindow() }
+            } catch {}
+        }
+        $gracefulDeadline = (Get-Date).AddSeconds(4)
+        while ((Get-Date) -lt $gracefulDeadline) {
+            if ((Get-DefaultBrowserProcs -ExePath $ExePath).Count -eq 0) { break }
+            Start-Sleep -Milliseconds 200
+        }
+        # Force-kill any default-profile stragglers (renderer children whose
+        # main already exited, or hung processes).
+        Get-DefaultBrowserProcs -ExePath $ExePath |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         $deadline = (Get-Date).AddSeconds(5)
         while ((Get-Date) -lt $deadline) {
             if ((Get-DefaultBrowserProcs -ExePath $ExePath).Count -eq 0) { break }
@@ -1047,8 +1233,10 @@ if ($Watch) {
             $exe = ($procs | Where-Object { $_.ExecutablePath } | Select-Object -First 1).ExecutablePath
             if (-not $exe) { continue }
             if (Test-IsBrowser -ExePath $exe) {
-                # Keep the link redirect asserted (Chrome can rewrite its
-                # registration on update/launch); cheap - skips redundant writes.
+                # Keep the ABE/DBSC policy and link redirect asserted (Chrome
+                # can rewrite its registration on update/launch); cheap - skips
+                # redundant writes.
+                Set-BrowserCdpPolicy -ExePath $exe
                 Set-BrowserLinkRedirect -ExePath $exe
                 # Re-assert .lnk shortcut redirect to current port so taskbar /
                 # Start menu launches stay aligned with the live sandbox port.

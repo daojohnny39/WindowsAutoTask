@@ -1148,6 +1148,13 @@ body {
   font-size: 13px;
   color: var(--text-muted);
 }
+.chat-thinking-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  opacity: 0.7;
+  margin-left: 6px;
+}
 .chat-thinking-sub {
   font-size: 11.5px;
   color: var(--text-faint);
@@ -1204,6 +1211,83 @@ body {
   border-radius: var(--r-1);
   word-break: break-all;
   animation: chatFadeIn var(--dur-2) var(--ease-out);
+}
+
+/* Live activity strip — one persistent block per in-flight turn, replaces
+   the per-tool flood of chat-tool-line rows. Top line = current action,
+   toggle expands the full pill history below. */
+.chat-live-activity {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 4px;
+  padding: 6px 8px;
+  background: var(--bg-elev-1);
+  border-radius: var(--r-1);
+  animation: chatFadeIn var(--dur-2) var(--ease-out);
+}
+.chat-live-current {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  min-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-live-current.error { color: var(--danger, oklch(0.65 0.18 25)); }
+.chat-live-glyph {
+  flex: 0 0 auto;
+  display: inline-block;
+  min-width: 12px;
+  text-align: center;
+}
+.chat-live-phrase {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: opacity var(--dur-1) var(--ease-out);
+}
+.chat-live-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: color var(--dur-1) var(--ease-out);
+}
+.chat-live-toggle:hover { color: var(--text-soft); }
+.chat-live-chevron {
+  display: inline-block;
+  transition: transform var(--dur-2) var(--ease-out);
+}
+.chat-live-toggle.open .chat-live-chevron { transform: rotate(90deg); }
+.chat-live-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border, oklch(1 0 0 / 0.08));
+  max-height: min(40vh, 360px);
+  overflow: auto;
+}
+.chat-live-body[hidden] { display: none; }
+.chat-live-body-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 /* Clarifying-question card (mid-turn ask_user) */
@@ -2012,10 +2096,13 @@ body {
 .auto-modal-body {
   padding: 14px 20px;
   overflow-y: auto;
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;          /* allow flex shrink so content stays inside the body's slot and never overlaps .auto-modal-foot's hit area */
   display: flex;
   flex-direction: column;
   gap: 14px;
+  position: relative;
+  z-index: 0;
 }
 .auto-modal-body::-webkit-scrollbar { width: 8px; }
 .auto-modal-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
@@ -2307,6 +2394,9 @@ body {
   padding: 12px 20px 16px;
   border-top: 1px solid var(--border-soft);
   flex-shrink: 0;
+  position: relative;
+  z-index: 2;             /* keep Discard/Save above any body overflow so hover/click hit-test always lands on the visible buttons */
+  background: var(--bg-elev-1);
 }
 .auto-modal-foot-center { justify-content: center; }
 
@@ -2539,6 +2629,18 @@ body[data-mode="overlay"] {
   height: 100vh;
   overflow: hidden;
 }
+/* Smooth dismiss animation. Transition is only present while .overlay-closing
+   is set, so the first paint on summon stays instant (no fade-in flicker).
+   will-change keeps the compositor layer warm so the fade does not jank.
+   Pointer events off during the close so a stray click cannot retrigger
+   anything on the disappearing surface. */
+body[data-mode="overlay"].overlay-closing {
+  opacity: 0;
+  transform: scale(0.985) translateY(6px);
+  transition: opacity 140ms ease-out, transform 140ms ease-out;
+  pointer-events: none;
+  will-change: opacity, transform;
+}
 /* Everything that belongs to the full settings window is hidden in overlay. */
 body[data-mode="overlay"] .navbar,
 body[data-mode="overlay"] .drawer,
@@ -2654,8 +2756,17 @@ body[data-mode="overlay"] .status-bar { display: none !important; }
   -webkit-app-region: no-drag;
   position: relative;
   z-index: 2;
+  min-height: 24px;
+  white-space: pre;
+  overflow: hidden;
+  caret-color: var(--text);
 }
 .launcher-input::placeholder { color: var(--text-faint); }
+.launcher-input:empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-faint);
+  pointer-events: none;
+}
 .launcher-ghost {
   position: absolute;
   inset: 0;
@@ -2878,6 +2989,7 @@ body[data-mode="overlay"] #chat-scroll,
 body[data-mode="overlay"] #chat-scroll .chat-messages,
 body[data-mode="overlay"] #chat-tab-menu,
 body[data-mode="overlay"] #chat-app-menu,
+body[data-mode="overlay"] #chat-slash-menu,
 body[data-mode="overlay"] #chat-window-picker { -webkit-app-region: no-drag; }
 
 /* "Just chat with GPT-5.5" skip-app row — accented as a distinct action. */
@@ -2949,7 +3061,8 @@ body[data-mode="overlay"] .cwp-row.selected {
 
 /* Tab- and app-reference menus also spill above the composer. Match glass. */
 body[data-mode="overlay"] .chat-tab-menu,
-body[data-mode="overlay"] #chat-app-menu {
+body[data-mode="overlay"] #chat-app-menu,
+body[data-mode="overlay"] #chat-slash-menu {
   background: oklch(0.18 0.006 250 / 0.78);
   backdrop-filter: blur(24px) saturate(150%);
   -webkit-backdrop-filter: blur(24px) saturate(150%);
@@ -2966,6 +3079,15 @@ body[data-mode="overlay"] .chat-msg-user {
 body[data-mode="overlay"] .chat-tool-line {
   background: oklch(1 0 0 / 0.05);
   border: 1px solid oklch(1 0 0 / 0.06);
+}
+
+/* Live activity strip on glass. */
+body[data-mode="overlay"] .chat-live-activity {
+  background: oklch(1 0 0 / 0.05);
+  border: 1px solid oklch(1 0 0 / 0.06);
+}
+body[data-mode="overlay"] .chat-live-body {
+  border-top-color: oklch(1 0 0 / 0.08);
 }
 
 /* Code blocks in chat — keep dark but match glass tint. */
@@ -2989,6 +3111,16 @@ body[data-mode="overlay"] .chat-reasoning-body {
 body[data-mode="overlay"] .chat-clarify-card {
   background: oklch(1 0 0 / 0.04);
   border-color: oklch(1 0 0 / 0.10);
+}
+
+/* Overlay window is transparent and sized to the rounded launcher card. A
+   full-viewport scrim paints a dark rectangle in the transparent region
+   outside the card's rounded corners, reading as a black frame around the
+   overlay. Drop the scrim in overlay mode — the modal box itself is opaque
+   and already provides focus. */
+body[data-mode="overlay"] .auto-modal {
+  background: transparent;
+  animation: none;
 }
 
 /* ── Static-composer mode ──
@@ -3087,8 +3219,8 @@ body[data-mode="overlay"][data-overlay-view="chat"] .launcher-app-pill-x {
    animates (static-bar guarantee); only the message panel rises from
    the composer's top edge. */
 @keyframes panelGrowIn {
-  from { opacity: 0; transform: translateY(8px) scaleY(0.92); transform-origin: bottom center; }
-  to   { opacity: 1; transform: none; }
+  from { transform: translateY(8px) scaleY(0.92); transform-origin: bottom center; }
+  to   { transform: none; }
 }
 @keyframes panelShrinkOut {
   from { opacity: 1; transform: none; transform-origin: bottom center; }

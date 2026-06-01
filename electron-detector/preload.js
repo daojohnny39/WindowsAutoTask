@@ -84,6 +84,8 @@ contextBridge.exposeInMainWorld('overlay', {
   // Suppress blur-dismiss while a footer drag is in progress.
   setDragging: (active) => ipcRenderer.send('overlay:set-dragging', { active: !!active }),
   dismiss: () => ipcRenderer.invoke('overlay:dismiss'),
+  // Renderer acks the close animation finished → main hides the BrowserWindow.
+  finishHide: () => ipcRenderer.send('overlay:hide-finished'),
   setResetProgress: (progress) => ipcRenderer.send('tray:reset-progress', progress),
   openSettings: (section) => ipcRenderer.invoke('overlay:open-settings', section),
   getConfig: () => ipcRenderer.invoke('config:get'),

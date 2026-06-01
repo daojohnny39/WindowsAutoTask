@@ -896,6 +896,7 @@ function resolveAppMeta(exe, name) {
 }
 
 async function openChat(appName, exe, metaOverride) {
+  if (typeof destroyLiveActivity === 'function') destroyLiveActivity();
   chatCurrentExe = exe;
   chatAppNameEl.textContent = appName;
   if (!chatStore[exe]) chatStore[exe] = [];
@@ -934,6 +935,7 @@ async function openChat(appName, exe, metaOverride) {
 // hands off to the same chat UI the app-scoped flow uses. The window picker is
 // hidden and agent.ensure is skipped — direct mode has no app context.
 async function openDirectChat() {
+  if (typeof destroyLiveActivity === 'function') destroyLiveActivity();
   chatCurrentExe = DIRECT_CHAT_ID;
   chatAppNameEl.textContent = DIRECT_CHAT_NAME;
   const meta = { exe: DIRECT_CHAT_ID, name: 'GPT-5.5', type: 'direct', pid: null, port: null };
@@ -983,6 +985,43 @@ const CWP_CHECK_SVG = '<svg width="15" height="15" viewBox="0 0 24 24" fill="non
 
 function hostFromUrl(u) {
   try { return new URL(u).host || ''; } catch { return ''; }
+}
+
+// Build a Set of hosts that appear more than once across the tab list.
+// Used to decide row primary: host-first by default, title-first when many
+// tabs share the same host (e.g. 5 GitHub repos).
+function tabSharedHostSet(tabs) {
+  const counts = new Map();
+  for (const t of tabs) {
+    const h = hostFromUrl(t.url);
+    if (!h) continue;
+    counts.set(h, (counts.get(h) || 0) + 1);
+  }
+  const shared = new Set();
+  for (const [h, n] of counts) if (n > 1) shared.add(h);
+  return shared;
+}
+
+function tabPrimaryLabel(tab, sharedHosts) {
+  const url = (tab.url || '').trim();
+  if (url === 'chrome://newtab/' || url.startsWith('chrome://new-tab')) return 'New Tab';
+  if (url === 'about:blank' || url === '') {
+    return (tab.title || '').trim() || 'Untitled tab';
+  }
+  const host = hostFromUrl(url);
+  const title = (tab.title || '').trim();
+  // Many tabs from same host AND we have a title → prefer the title so the
+  // user can tell them apart (e.g. 5 github.com repos).
+  if (host && sharedHosts && sharedHosts.has(host) && title) return title;
+  return host || title || 'Untitled tab';
+}
+
+function tabSecondaryLabel(tab, windowCount, primary) {
+  const title = (tab.title || '').trim();
+  const parts = [];
+  if (title && title !== primary) parts.push(title);
+  if ((windowCount || 1) > 1 && tab.windowIndex) parts.push(`Window ${tab.windowIndex}`);
+  return parts.join(' · ');
 }
 
 function hideWindowPicker() {
@@ -1139,6 +1178,7 @@ async function resetCurrentChat() {
   thinkingBuffer = '';
   reasoningStartMs = 0;
   hideThinking();
+  if (typeof destroyLiveActivity === 'function') destroyLiveActivity();
   setChatBusy(false);
   lastRenderedCount = 0;
   renderChat();
@@ -1384,6 +1424,7 @@ function showThinking(subtext) {
       <div class="chat-thinking-head">
         <div class="chat-thinking-spinner"></div>
         <span class="chat-thinking-label">Thinking…</span>
+        <span class="chat-thinking-hint">Esc to stop</span>
       </div>
       <div class="chat-thinking-sub" id="chat-thinking-sub"></div>`;
     chatMessagesEl.appendChild(el);
@@ -1483,15 +1524,50 @@ window.chat.onTool((data) => {
   if (data.exe !== chatCurrentExe) return;
   if (data.name === 'ask_user') return; // rendered as a clarify card, not a tool line
   hideThinking();
-  if (data.name === 'web_search') {
-    const q = (data.args && typeof data.args.query === 'string') ? data.args.query.slice(0, 120) : '';
-    thinkingFallback = q ? `searching the web for "${q}"…` : 'searching the web…';
-    appendToolLine(`🌐 web_search ${escapeHtml(q ? `"${q}"` : '')}`);
-    return;
+  // Cancel any pending error-flash revert; the new start phrase takes over the top line.
+  if (liveErrorFlashTimer) { clearTimeout(liveErrorFlashTimer); liveErrorFlashTimer = null; }
+  const args = data.args || {};
+  const label = data.label || null;
+  const ctx = { args, label, result: null };
+  const phrase = phraseForToolStart(data.name, ctx);
+  thinkingFallback = `${phrase.charAt(0).toLowerCase() + phrase.slice(1)}…`;
+
+  ensureLiveActivity();
+  const entry = getOrCreateTrailEntry(data.callId, {
+    name: data.name,
+    args,
+    label,
+    result: null,
+    refInfo: null,
+    _startPhrase: phrase,
+  });
+  // If the call id was re-fired (defensive), refresh start fields.
+  entry.name = data.name;
+  entry.args = args;
+  entry.label = label;
+  entry._startPhrase = phrase;
+  liveActivity.topEntry = entry;
+  clearTopLineError();
+  const glyph = data.name === 'web_search' ? '🌐' : '⚙';
+  setTopLine(glyph, phrase, '');
+  if (liveActivity.expanded) {
+    // If this is a re-fired callId, update the existing row; otherwise append.
+    if (entry.callId && liveActivity.bodyEl.querySelector(
+      `.chat-live-body-row[data-call-id="${CSS.escape(entry.callId)}"]`
+    )) {
+      updateBodyRow(entry);
+    } else {
+      appendBodyRow(entry);
+    }
   }
-  thinkingFallback = `running ${data.name}…`;
-  const summary = formatToolCall(data.name, data.args);
-  appendToolLine(`⚙ ${summary}`);
+  refreshLiveToggle();
+  repinAboveThinking();
+
+  // pendingToolPills back-fills sparse result payloads (args/label may not be re-sent).
+  if (data.callId) {
+    pendingToolPills.set(data.callId, { name: data.name, args, label, exe: data.exe });
+  }
+  scrollChatToBottom();
 });
 
 // Inline URL citations from the hosted web_search tool. Collected for the
@@ -1505,58 +1581,74 @@ window.chat.onCitation((data) => {
 });
 
 window.chat.onToolResult((data) => {
+  // Always settle the pending pill — even if this result belongs to a stale
+  // exe (user switched chats mid-turn). Otherwise the Map leaks one entry
+  // per orphaned tool call until reload.
+  const pending = data.callId ? pendingToolPills.get(data.callId) : null;
+  if (data.callId) pendingToolPills.delete(data.callId);
   if (data.exe !== chatCurrentExe) return;
   if (data.name === 'ask_user') return; // card already reflects the answer
-  const ok = data.result && data.result.ok;
-  const err = data.result && data.result.error;
-  let msg, fallback;
-  if (data.name === 'web_search' && !err) {
-    const n = (data.result && (data.result.count || (Array.isArray(data.result.sources) && data.result.sources.length))) || 0;
-    msg = `✓ web_search → ${n} source${n === 1 ? '' : 's'}`;
-    fallback = `web search returned ${n} source${n === 1 ? '' : 's'}`;
-    if (data.result && Array.isArray(data.result.sources)) {
-      for (const s of data.result.sources) {
-        if (s && s.url && !chatStreamSources.some(x => x.url === s.url)) {
-          chatStreamSources.push({ url: s.url, title: s.title || '' });
-        }
+  const args = data.args || (pending && pending.args) || {};
+  const label = data.label || (pending && pending.label) || null;
+  const errorRaw = data.errorRaw || (data.result && data.result.error) || null;
+  const ctx = { args, label, result: data.result || null, error: errorRaw };
+
+  // Side-effect for web_search: thread the sources into the in-flight bubble.
+  if (data.name === 'web_search' && !errorRaw && data.result && Array.isArray(data.result.sources)) {
+    for (const s of data.result.sources) {
+      if (s && s.url && !chatStreamSources.some(x => x.url === s.url)) {
+        chatStreamSources.push({ url: s.url, title: s.title || '' });
       }
     }
-    appendToolLine(msg);
-    thinkingFallback = fallback;
-    thinkingBuffer = '';
-    showThinking(fallback);
-    return;
   }
-  if (err) {
-    msg = `✕ ${escapeHtml(data.name)}: ${escapeHtml(err)}`;
-    fallback = `after ${data.name} → error: ${err}`;
-  } else if (data.result && data.result.text !== undefined) {
-    const t = String(data.result.text).slice(0, 200).replace(/\n/g, ' ');
-    msg = `✓ ${escapeHtml(data.name)} → ${escapeHtml(t)}`;
-    fallback = `after ${data.name} → "${t.slice(0, 80)}"`;
-  } else if (data.result && data.result.snapshot !== undefined) {
-    msg = `✓ ${escapeHtml(data.name)} → refreshed (${data.result.refs || 0} refs)`;
-    fallback = `after ${data.name} → ${data.result.refs || 0} refs`;
-  } else if (data.result && data.result.messages) {
-    const n = data.result.count || data.result.messages.length;
-    msg = `✓ ${escapeHtml(data.name)} → ${n} messages`;
-    fallback = `after ${data.name} → ${n} messages`;
-  } else if (data.result && data.result.results) {
-    const n = data.result.count || data.result.results.length;
-    const sort = data.result.sortMode ? ` (${data.result.sortMode})` : '';
-    msg = `✓ ${escapeHtml(data.name)} → ${n} results${escapeHtml(sort)}`;
-    fallback = `after ${data.name} → ${n} results${sort}`;
-  } else if (ok) {
-    msg = `✓ ${escapeHtml(data.name)} ok`;
-    fallback = `after ${data.name} → ok`;
-  } else {
-    msg = `… ${escapeHtml(data.name)} done`;
-    fallback = `after ${data.name} → done`;
-  }
-  appendToolLine(msg);
-  thinkingFallback = fallback;
+
+  const donePhrase = errorRaw ? phraseForToolFail(data.name, ctx) : phraseForToolDone(data.name, ctx);
+  thinkingFallback = donePhrase.charAt(0).toLowerCase() + donePhrase.slice(1);
   thinkingBuffer = '';
-  showThinking(fallback);
+
+  // Update / settle the live trail entry. If this result arrives without a
+  // matching start (rare — sparse payload, or strip rebuilt after a renderChat
+  // wipe lost in-flight entries), synthesize one so the body still shows it.
+  ensureLiveActivity();
+  let entry = data.callId ? liveActivity.byCallId.get(data.callId) : null;
+  if (!entry) {
+    entry = getOrCreateTrailEntry(data.callId, {
+      name: data.name,
+      args,
+      label,
+      result: null,
+      refInfo: null,
+      _startPhrase: phraseForToolStart(data.name, ctx),
+    });
+  }
+  entry.result = data.result || { ok: !errorRaw };
+  entry.args = entry.args || args;
+  entry.label = entry.label || label;
+  if (errorRaw) entry._failPhrase = donePhrase;
+  else entry._donePhrase = donePhrase;
+  updateBodyRow(entry);
+  refreshLiveToggle();
+
+  if (errorRaw) {
+    // Flash ✕ + raw-error tooltip on top line for ~1.2s, then revert to the
+    // last-known running start phrase (or the just-settled start phrase if
+    // nothing else is in flight). Next onTool cancels the timer.
+    setTopLineError(donePhrase, String(errorRaw));
+    if (liveErrorFlashTimer) clearTimeout(liveErrorFlashTimer);
+    const revertEntry = entry;
+    liveErrorFlashTimer = setTimeout(() => {
+      liveErrorFlashTimer = null;
+      if (!liveActivity || !liveActivity.flashingFail) return;
+      clearTopLineError();
+      const glyph = revertEntry.name === 'web_search' ? '🌐' : '⚙';
+      setTopLine(glyph, revertEntry._startPhrase || phraseForToolStart(revertEntry.name, ctx), '');
+    }, 1200);
+  }
+  // On success, top line stays as last-started action (user choice). When the
+  // model goes back to reasoning between tools, the thinking pill paints below.
+
+  showThinking(thinkingFallback);
+  repinAboveThinking();
 });
 
 // Clarifying-question card (mid-turn). Appended directly to the message list like
@@ -1643,6 +1735,514 @@ function answerClarify(card, answer) {
   showThinking(thinkingFallback);
 }
 
+// ── Tool pill phrasebook ─────────────────────────────────────────────────────
+// Turns raw tool calls into plain English a non-technical user can follow.
+// Each entry has start/done/fail producers; each takes a ctx
+// { args, label, result, error } and returns a plain string.
+// All ctx fields are optional — old saved trails lacking `label`/`callId`
+// still render gracefully via fallbacks.
+function _truncate(s, n) {
+  s = String(s == null ? '' : s);
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+function _cap(s) {
+  s = String(s == null ? '' : s);
+  return s ? s[0].toUpperCase() + s.slice(1) : '';
+}
+function _modsPrefix(mods) {
+  if (!Array.isArray(mods) || !mods.length) return '';
+  return mods.map(_cap).join('+') + '+';
+}
+function _humanizeUnknownTool(name) {
+  return String(name || '')
+    .replace(/^(cdp|uia|notion)_/, '')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase()) || 'tool';
+}
+
+const TOOL_PHRASES = {
+  cdp_list_windows: {
+    start: () => 'Checking open windows',
+    done: ({ result }) => {
+      const n = (result && (result.count || (Array.isArray(result.windows) && result.windows.length))) || 0;
+      return n ? `Found ${n} open window${n === 1 ? '' : 's'}` : 'Found no open windows';
+    },
+    fail: () => "Couldn't list open windows",
+  },
+  cdp_select_window: {
+    start: ({ args = {} }) => typeof args.index === 'number' ? `Switching to window #${args.index + 1}` : 'Switching window',
+    done: ({ args = {}, result }) => {
+      const title = result && result.active && result.active.title;
+      if (title) return `Switched to "${_truncate(title, 60)}"`;
+      if (typeof args.index === 'number') return `Switched to window #${args.index + 1}`;
+      return 'Switched window';
+    },
+    fail: () => "Couldn't switch window",
+  },
+  cdp_get_tree: {
+    start: ({ args = {} }) => args.region ? `Scanning the ${args.region} area` : 'Scanning the page',
+    done: ({ result }) => `Scanned the page (${(result && result.refs) || 0} elements)`,
+    fail: () => "Couldn't scan the page",
+  },
+  cdp_find: {
+    start: ({ args = {} }) => args.query ? `Searching the page for "${_truncate(args.query, 60)}"` : 'Searching the page',
+    done: ({ args = {}, result }) => {
+      const n = (result && (result.count || (Array.isArray(result.results) && result.results.length))) || 0;
+      const q = args.query ? ` for "${_truncate(args.query, 40)}"` : '';
+      return `Found ${n} match${n === 1 ? '' : 'es'}${q}`;
+    },
+    fail: () => "Couldn't search the page",
+  },
+  cdp_click: {
+    start: ({ args = {}, label }) => {
+      const target = label || 'an element';
+      const mods = _modsPrefix(args.modifiers);
+      if (mods) return `${mods}clicking ${target}`;
+      if (args.button === 'middle') return `Middle-clicking ${target}`;
+      if (args.button === 'right') return `Right-clicking ${target}`;
+      return `Clicking ${target}`;
+    },
+    done: ({ args = {}, label }) => {
+      const target = label || 'an element';
+      const mods = _modsPrefix(args.modifiers);
+      if (mods) return `${mods}clicked ${target}`;
+      if (args.button === 'middle') return `Middle-clicked ${target}`;
+      if (args.button === 'right') return `Right-clicked ${target}`;
+      return `Clicked ${target}`;
+    },
+    fail: ({ label }) => `Couldn't click ${label || 'that element'}`,
+  },
+  cdp_open_notion_page: {
+    start: () => 'Opening a Notion page',
+    done: () => 'Opened the Notion page',
+    fail: () => "Couldn't open the Notion page",
+  },
+  cdp_open_in_new_tab: {
+    start: ({ args = {} }) => {
+      const what = args.pageName ? `"${_truncate(args.pageName, 30)}"` : args.url ? _truncate(args.url, 40) : 'a page';
+      return `Opening ${what} in a new tab`;
+    },
+    done: ({ args = {} }) => {
+      const what = args.pageName ? `"${_truncate(args.pageName, 30)}"` : args.url ? _truncate(args.url, 40) : 'the page';
+      return `Opened ${what} in a new tab`;
+    },
+    fail: ({ args = {} }) => {
+      const what = args.pageName ? `"${_truncate(args.pageName, 30)}"` : args.url ? _truncate(args.url, 40) : 'the page';
+      return `Couldn't open ${what} in a new tab`;
+    },
+  },
+  notion_tasklist_read: {
+    start: () => 'Reading the Notion task list',
+    done: ({ result }) => {
+      const n = (result && (result.count
+        || (Array.isArray(result.tasks) && result.tasks.length)
+        || (Array.isArray(result.rows) && result.rows.length))) || 0;
+      return `Read ${n} task${n === 1 ? '' : 's'}`;
+    },
+    fail: () => "Couldn't read the task list",
+  },
+  notion_task_toggle: {
+    start: ({ args = {} }) => args.checked === false ? 'Unchecking a task' : args.checked === true ? 'Checking off a task' : 'Toggling a task',
+    done: ({ args = {} }) => args.checked === false ? 'Unchecked the task' : args.checked === true ? 'Checked off the task' : 'Toggled the task',
+    fail: () => "Couldn't toggle the task",
+  },
+  cdp_type: {
+    start: ({ args = {}, label }) => `Typing "${_truncate(args.text, 40)}" into ${label || 'a field'}`,
+    done: ({ args = {}, label }) => `Typed "${_truncate(args.text, 40)}" into ${label || 'a field'}`,
+    fail: ({ label }) => `Couldn't type into ${label || 'that field'}`,
+  },
+  cdp_paste: {
+    start: ({ args = {}, label }) => `Pasting "${_truncate(args.text, 40)}" into ${label || 'a field'}`,
+    done: ({ args = {}, label }) => `Pasted "${_truncate(args.text, 40)}" into ${label || 'a field'}`,
+    fail: ({ label }) => `Couldn't paste into ${label || 'that field'}`,
+  },
+  cdp_press_key: {
+    start: ({ args = {} }) => `Pressing ${_modsPrefix(args.modifiers)}${args.key || 'a key'}`,
+    done: ({ args = {} }) => `Pressed ${_modsPrefix(args.modifiers)}${args.key || 'a key'}`,
+    fail: ({ args = {} }) => `Couldn't press ${args.key || 'that key'}`,
+  },
+  cdp_get_text: {
+    start: ({ label }) => `Reading text from ${label || 'an element'}`,
+    done: ({ result }) => {
+      const t = result && typeof result.text === 'string' ? result.text.slice(0, 80).replace(/\n/g, ' ') : '';
+      return t ? `Read "${t}"` : 'Read text';
+    },
+    fail: () => "Couldn't read text",
+  },
+  cdp_get_messages: {
+    start: ({ args = {} }) => `Reading the last ${args.limit || 25} messages`,
+    done: ({ result }) => {
+      const n = (result && (result.count || (Array.isArray(result.messages) && result.messages.length))) || 0;
+      return `Read ${n} message${n === 1 ? '' : 's'}`;
+    },
+    fail: () => "Couldn't read messages",
+  },
+  cdp_react: {
+    start: ({ args = {} }) => `Adding :${args.emoji || 'reaction'}: reaction`,
+    done: ({ args = {} }) => `Reacted with :${args.emoji || 'an emoji'}:`,
+    fail: ({ args = {} }) => `Couldn't react with :${args.emoji || 'that emoji'}:`,
+  },
+  cdp_scroll_to_message: {
+    start: () => 'Jumping to that message',
+    done: () => 'Jumped to that message',
+    fail: () => "Couldn't jump to that message",
+  },
+  cdp_scroll: {
+    start: ({ args = {} }) => `Scrolling ${args.direction || 'up'}`,
+    done: ({ args = {} }) => `Scrolled ${args.direction || 'up'}`,
+    fail: ({ args = {} }) => (`Couldn't scroll ${args.direction || ''}`).trim(),
+  },
+  cdp_scroll_messages: {
+    start: ({ args = {} }) => `Scrolling messages ${args.direction || 'up'}`,
+    done: ({ args = {} }) => `Scrolled messages ${args.direction || 'up'}`,
+    fail: () => "Couldn't scroll messages",
+  },
+  cdp_get_search_results: {
+    start: () => 'Reading the search results panel',
+    done: ({ result }) => {
+      const n = (result && (result.count || (Array.isArray(result.results) && result.results.length))) || 0;
+      const sort = result && result.sortMode ? ` (${result.sortMode})` : '';
+      return `Read ${n} search result${n === 1 ? '' : 's'}${sort}`;
+    },
+    fail: () => "Couldn't read search results",
+  },
+  cdp_set_search_sort: {
+    start: ({ args = {} }) => `Sorting search results by ${args.order || 'newest'}`,
+    done: ({ args = {} }) => `Sorted search results by ${args.order || 'newest'}`,
+    fail: () => "Couldn't change the search sort",
+  },
+  cdp_jump_to_search_result: {
+    start: () => 'Jumping to that search result',
+    done: () => 'Jumped to that search result',
+    fail: () => "Couldn't jump to that search result",
+  },
+  cdp_get_pins: {
+    start: () => 'Reading pinned messages',
+    done: ({ result }) => {
+      const n = (result && (result.count || (Array.isArray(result.pins) && result.pins.length))) || 0;
+      return `Read ${n} pinned message${n === 1 ? '' : 's'}`;
+    },
+    fail: () => "Couldn't read pinned messages",
+  },
+  cdp_jump_to_pin: {
+    start: () => 'Jumping to that pinned message',
+    done: () => 'Jumped to that pinned message',
+    fail: () => "Couldn't jump to that pinned message",
+  },
+  cdp_open_image: {
+    start: () => 'Opening that image full-screen',
+    done: () => 'Opened that image full-screen',
+    fail: () => "Couldn't open that image",
+  },
+  cdp_jump_to_reply_source: {
+    start: () => 'Jumping to the original message',
+    done: () => 'Jumped to the original message',
+    fail: () => "Couldn't find the original message",
+  },
+  uia_invoke: {
+    start: ({ label }) => `Clicking ${label || 'an element'}`,
+    done: ({ label }) => `Clicked ${label || 'an element'}`,
+    fail: ({ label }) => `Couldn't click ${label || 'that element'}`,
+  },
+  uia_set_value: {
+    start: ({ args = {}, label }) => `Typing "${_truncate(args.text, 40)}" into ${label || 'a field'}`,
+    done: ({ args = {}, label }) => `Typed "${_truncate(args.text, 40)}" into ${label || 'a field'}`,
+    fail: ({ label }) => `Couldn't type into ${label || 'that field'}`,
+  },
+  uia_get_tree: {
+    start: () => 'Scanning the window',
+    done: ({ result }) => `Scanned the window (${(result && result.refs) || 0} elements)`,
+    fail: () => "Couldn't scan the window",
+  },
+  web_search: {
+    start: ({ args = {} }) => args.query ? `Searching the web for "${_truncate(args.query, 60)}"` : 'Searching the web',
+    done: ({ result }) => {
+      const n = (result && (result.count || (Array.isArray(result.sources) && result.sources.length))) || 0;
+      return `Found ${n} web source${n === 1 ? '' : 's'}`;
+    },
+    fail: () => 'Web search failed',
+  },
+  select_app: {
+    start: ({ args = {} }) => `Switching to ${args.app || 'another app'}`,
+    done: ({ args = {}, result }) => {
+      const name = (result && (result.activeName || (result.active && result.active.name))) || args.app || 'the app';
+      return `Switched to ${name}`;
+    },
+    fail: ({ args = {} }) => `Couldn't switch to ${args.app || 'that app'}`,
+  },
+};
+
+function phraseForToolStart(name, ctx) {
+  const entry = TOOL_PHRASES[name];
+  if (entry && typeof entry.start === 'function') {
+    try { return entry.start(ctx || {}); } catch {}
+  }
+  return `Running ${_humanizeUnknownTool(name)}`;
+}
+function phraseForToolDone(name, ctx) {
+  const entry = TOOL_PHRASES[name];
+  if (entry && typeof entry.done === 'function') {
+    try { return entry.done(ctx || {}); } catch {}
+  }
+  return `Did ${_humanizeUnknownTool(name)}`;
+}
+function phraseForToolFail(name, ctx) {
+  const entry = TOOL_PHRASES[name];
+  if (entry && typeof entry.fail === 'function') {
+    try { return entry.fail(ctx || {}); } catch {}
+  }
+  return `Couldn't ${_humanizeUnknownTool(name).toLowerCase()}`;
+}
+
+// Pair tool start/result by callId so a sparse `chat:tool-result` payload can
+// recover args/label that were known only at start time. Entries are deleted
+// unconditionally in onToolResult — even when the result belongs to a stale
+// exe — so the Map can't accumulate orphans across chats.
+const pendingToolPills = new Map(); // callId → { name, args, label, exe }
+
+// ── Live activity strip ─────────────────────────────────────────────────────
+// One persistent block per in-flight turn, pinned above the thinking pill.
+// Top line shows the most recently started action (⚙ phrase…); a toggle below
+// expands the full pill history (⚙ start + ✓/✕ result pairs) so the user can
+// inspect what GPT did so far without waiting for chat:done. On chat:done /
+// chat switch / abort, the strip is destroyed and the canonical "Show N
+// actions" trail block (rendered by renderTurn) takes over.
+//
+// Trail entries are shape-compatible with the persisted m.trail entries used
+// by renderTrailPills: { name, args, result, refInfo, callId, label }. State
+// is derived (result == null → running, result.error → failed, else done).
+// Cached phrases live on _startPhrase / _donePhrase / _failPhrase so a later
+// expand paints the right text even after the entry settled.
+let liveActivity = null;
+let liveErrorFlashTimer = null;
+let _liveBodyIdCounter = 0;
+
+function buildLiveActivityEl() {
+  const el = document.createElement('div');
+  el.className = 'chat-live-activity';
+  const bodyId = `chat-live-body-${++_liveBodyIdCounter}`;
+  el.innerHTML = `
+    <div class="chat-live-current" aria-live="polite">
+      <span class="chat-live-glyph">⚙</span>
+      <span class="chat-live-phrase"></span>
+    </div>
+    <button class="chat-live-toggle" type="button" aria-expanded="false" aria-controls="${bodyId}">
+      <span class="chat-live-chevron">›</span>
+      <span class="chat-live-count">Show 0 actions</span>
+    </button>
+    <div class="chat-live-body" id="${bodyId}" hidden></div>`;
+  return {
+    el,
+    phraseEl: el.querySelector('.chat-live-phrase'),
+    glyphEl: el.querySelector('.chat-live-glyph'),
+    currentEl: el.querySelector('.chat-live-current'),
+    toggleEl: el.querySelector('.chat-live-toggle'),
+    countEl: el.querySelector('.chat-live-count'),
+    bodyEl: el.querySelector('.chat-live-body'),
+  };
+}
+
+// Pin the strip directly above the thinking pill so the visual order is
+// stable: [strip] → [thinking pill] → [next message]. Without this, calling
+// chatMessagesEl.appendChild(thinkingEl) (from showThinking) after the strip
+// was already appended would push the strip above thinking — which is what we
+// want — but a later strip rebuild could land below. Re-pin on every mutation.
+function repinAboveThinking() {
+  if (!liveActivity || !liveActivity.el) return;
+  const thinkingEl = document.getElementById('chat-thinking');
+  if (thinkingEl && thinkingEl.parentNode === chatMessagesEl) {
+    if (liveActivity.el.nextSibling !== thinkingEl) {
+      chatMessagesEl.insertBefore(liveActivity.el, thinkingEl);
+    }
+  } else if (liveActivity.el.parentNode !== chatMessagesEl
+             || liveActivity.el !== chatMessagesEl.lastChild) {
+    chatMessagesEl.appendChild(liveActivity.el);
+  }
+}
+
+function ensureLiveActivity() {
+  if (liveActivity && liveActivity.el && liveActivity.el.isConnected) {
+    repinAboveThinking();
+    return liveActivity;
+  }
+  // First call of the turn, or a mid-stream renderChat() wiped the element.
+  // Rebuild DOM from preserved state if any.
+  const prior = liveActivity;
+  const parts = buildLiveActivityEl();
+  liveActivity = {
+    ...parts,
+    expanded: prior ? !!prior.expanded : false,
+    trail: prior ? prior.trail : [],
+    byCallId: prior ? prior.byCallId : new Map(),
+    topEntry: prior ? prior.topEntry || null : null,
+    topStatePhrase: prior ? prior.topStatePhrase || '' : '',
+    topStateGlyph: prior ? prior.topStateGlyph || '⚙' : '⚙',
+    topStateTitle: prior ? prior.topStateTitle || '' : '',
+    flashingFail: prior ? !!prior.flashingFail : false,
+  };
+  // Repaint preserved state.
+  liveActivity.glyphEl.textContent = liveActivity.topStateGlyph || '⚙';
+  liveActivity.phraseEl.textContent = liveActivity.topStatePhrase || '';
+  liveActivity.currentEl.title = liveActivity.topStateTitle || '';
+  liveActivity.currentEl.classList.toggle('error', !!liveActivity.flashingFail);
+  refreshLiveToggle();
+  if (liveActivity.expanded) {
+    liveActivity.bodyEl.hidden = false;
+    liveActivity.toggleEl.setAttribute('aria-expanded', 'true');
+    liveActivity.toggleEl.classList.add('open');
+    repaintLiveBody();
+  }
+  liveActivity.toggleEl.addEventListener('click', onLiveToggleClick);
+  repinAboveThinking();
+  return liveActivity;
+}
+
+function refreshLiveToggle() {
+  if (!liveActivity) return;
+  const n = liveActivity.trail.length;
+  const verb = liveActivity.expanded ? 'Hide' : 'Show';
+  liveActivity.countEl.textContent = `${verb} ${n} action${n === 1 ? '' : 's'}`;
+  // Hide toggle entirely when there's nothing yet.
+  liveActivity.toggleEl.style.display = n > 0 ? '' : 'none';
+}
+
+function onLiveToggleClick() {
+  if (!liveActivity) return;
+  liveActivity.expanded = !liveActivity.expanded;
+  liveActivity.bodyEl.hidden = !liveActivity.expanded;
+  liveActivity.toggleEl.setAttribute('aria-expanded', String(liveActivity.expanded));
+  liveActivity.toggleEl.classList.toggle('open', liveActivity.expanded);
+  if (liveActivity.expanded) repaintLiveBody();
+  refreshLiveToggle();
+  // Don't auto-scroll/auto-focus — streaming content should not steal focus.
+}
+
+// Build the row markup for one trail entry. `running` entries render only the
+// start line (no result row yet); settled entries render the canonical pair.
+function liveBodyRowHtml(entry) {
+  const args = entry.args || {};
+  const label = entry.label || _labelFromRefInfo(entry.refInfo) || null;
+  const result = entry.result || null;
+  const error = (result && result.error) || null;
+  const ctx = { args, label, result, error };
+  const startPhrase = entry._startPhrase || phraseForToolStart(entry.name, ctx);
+  const startLine = `<div class="chat-tool-line">⚙ ${escapeHtml(startPhrase)}…</div>`;
+  if (!result) return startLine;
+  const finalPhrase = error
+    ? (entry._failPhrase || phraseForToolFail(entry.name, ctx))
+    : (entry._donePhrase || phraseForToolDone(entry.name, ctx));
+  const glyph = error ? '✕' : '✓';
+  const titleAttr = error ? ` title="${escapeHtml(String(error))}"` : '';
+  const resultLine = `<div class="chat-tool-line"${titleAttr}>${glyph} ${escapeHtml(finalPhrase)}</div>`;
+  return startLine + resultLine;
+}
+
+function repaintLiveBody() {
+  if (!liveActivity) return;
+  const html = liveActivity.trail.map(entry => {
+    return `<div class="chat-live-body-row" data-call-id="${escapeHtml(entry.callId || '')}">${liveBodyRowHtml(entry)}</div>`;
+  }).join('');
+  liveActivity.bodyEl.innerHTML = html;
+}
+
+function appendBodyRow(entry) {
+  if (!liveActivity || !liveActivity.expanded) return;
+  const row = document.createElement('div');
+  row.className = 'chat-live-body-row';
+  if (entry.callId) row.dataset.callId = entry.callId;
+  row.innerHTML = liveBodyRowHtml(entry);
+  liveActivity.bodyEl.appendChild(row);
+}
+
+function updateBodyRow(entry) {
+  if (!liveActivity || !liveActivity.expanded) return;
+  if (!entry.callId) { repaintLiveBody(); return; }
+  const row = liveActivity.bodyEl.querySelector(
+    `.chat-live-body-row[data-call-id="${CSS.escape(entry.callId)}"]`
+  );
+  if (!row) { appendBodyRow(entry); return; }
+  row.innerHTML = liveBodyRowHtml(entry);
+}
+
+function getOrCreateTrailEntry(callId, init) {
+  if (!liveActivity) return null;
+  let key = callId || `local:${liveActivity.trail.length}`;
+  let entry = liveActivity.byCallId.get(key);
+  if (entry) {
+    Object.assign(entry, init);
+    return entry;
+  }
+  entry = { callId: callId || null, ...init };
+  liveActivity.trail.push(entry);
+  liveActivity.byCallId.set(key, entry);
+  return entry;
+}
+
+function setTopLine(glyph, phrase, title) {
+  if (!liveActivity) return;
+  liveActivity.glyphEl.textContent = glyph;
+  liveActivity.phraseEl.textContent = phrase ? `${phrase}…` : '';
+  liveActivity.currentEl.title = title || '';
+  liveActivity.topStateGlyph = glyph;
+  liveActivity.topStatePhrase = phrase || '';
+  liveActivity.topStateTitle = title || '';
+}
+
+function setTopLineError(phrase, title) {
+  if (!liveActivity) return;
+  liveActivity.glyphEl.textContent = '✕';
+  liveActivity.phraseEl.textContent = phrase || '';
+  liveActivity.currentEl.title = title || '';
+  liveActivity.currentEl.classList.add('error');
+  liveActivity.topStateGlyph = '✕';
+  liveActivity.topStatePhrase = phrase || '';
+  liveActivity.topStateTitle = title || '';
+  liveActivity.flashingFail = true;
+}
+
+function clearTopLineError() {
+  if (!liveActivity) return;
+  liveActivity.currentEl.classList.remove('error');
+  liveActivity.flashingFail = false;
+}
+
+function destroyLiveActivity() {
+  if (liveErrorFlashTimer) { clearTimeout(liveErrorFlashTimer); liveErrorFlashTimer = null; }
+  if (liveActivity && liveActivity.el) {
+    try { liveActivity.toggleEl.removeEventListener('click', onLiveToggleClick); } catch {}
+    try { liveActivity.el.remove(); } catch {}
+  }
+  liveActivity = null;
+}
+
+// Renderer-side mirror of main.js humanLabelFromRefInfo, used to humanize old
+// saved trail entries that pre-date the persisted `label` field.
+function _labelFromRefInfo(refInfo) {
+  if (!refInfo) return null;
+  const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const aria = clean(refInfo.aria);
+  const text = clean(refInfo.text);
+  const name = clean(refInfo.name);
+  const autoId = clean(refInfo.automationId);
+  const id = clean(refInfo.id);
+  const role = clean(refInfo.role).toLowerCase();
+  const ctrl = clean(refInfo.controlType).toLowerCase();
+  const tag = clean(refInfo.tag).toLowerCase();
+  let label = aria || name || text || autoId || id;
+  if (!label) return null;
+  if (label.length > 60) label = label.slice(0, 57) + '…';
+  let kind = '';
+  if (role === 'button' || ctrl === 'button' || tag === 'button') kind = 'button';
+  else if (role === 'link' || ctrl === 'hyperlink' || tag === 'a') kind = 'link';
+  else if (role === 'textbox' || role === 'searchbox' || ctrl === 'edit' || tag === 'input' || tag === 'textarea') kind = 'field';
+  else if (role === 'checkbox' || ctrl === 'checkbox') kind = 'checkbox';
+  else if (role === 'tab' || ctrl === 'tabitem') kind = 'tab';
+  else if (role === 'menuitem') kind = 'menu item';
+  else if (role === 'listitem' || role === 'option') kind = 'item';
+  if (kind && !label.toLowerCase().includes(kind)) label = `${label} ${kind}`;
+  return label;
+}
+
 function renderTrailPills(trail) {
   return trail.map(t => {
     if (t.name === 'ask_user') {
@@ -1651,48 +2251,19 @@ function renderTrailPills(trail) {
       const ans = r.answer !== undefined ? `→ "${String(r.answer)}"` : (r.aborted ? '→ (cancelled)' : (r.error ? '→ (no answer)' : ''));
       return `<div class="chat-tool-line">❓ ${escapeHtml(q)} ${escapeHtml(ans)}</div>`;
     }
-    const callLine = `<div class="chat-tool-line">⚙ ${formatToolCall(t.name, t.args)}</div>`;
-    const r = t.result || {};
-    let resultLine;
-    if (r.error) {
-      resultLine = `<div class="chat-tool-line">✕ ${escapeHtml(t.name)}: ${escapeHtml(r.error)}</div>`;
-    } else if (r.text !== undefined) {
-      const tx = String(r.text).slice(0, 200).replace(/\n/g, ' ');
-      resultLine = `<div class="chat-tool-line">✓ ${escapeHtml(t.name)} → ${escapeHtml(tx)}</div>`;
-    } else if (r.snapshot !== undefined) {
-      resultLine = `<div class="chat-tool-line">✓ ${escapeHtml(t.name)} → refreshed (${r.refs || 0} refs)</div>`;
-    } else if (r.messages) {
-      const n = r.count || r.messages.length;
-      resultLine = `<div class="chat-tool-line">✓ ${escapeHtml(t.name)} → ${n} messages</div>`;
-    } else if (r.results) {
-      const n = r.count || r.results.length;
-      const sort = r.sortMode ? ` (${r.sortMode})` : '';
-      resultLine = `<div class="chat-tool-line">✓ ${escapeHtml(t.name)} → ${n} results${escapeHtml(sort)}</div>`;
-    } else if (r.ok) {
-      resultLine = `<div class="chat-tool-line">✓ ${escapeHtml(t.name)} ok</div>`;
-    } else {
-      resultLine = `<div class="chat-tool-line">… ${escapeHtml(t.name)} done</div>`;
-    }
+    const args = t.args || {};
+    const label = t.label || _labelFromRefInfo(t.refInfo) || null;
+    const result = t.result || null;
+    const error = (result && result.error) || null;
+    const ctx = { args, label, result, error };
+    const startPhrase = phraseForToolStart(t.name, ctx);
+    const finalPhrase = error ? phraseForToolFail(t.name, ctx) : phraseForToolDone(t.name, ctx);
+    const glyph = error ? '✕' : '✓';
+    const titleAttr = error ? ` title="${escapeHtml(String(error))}"` : '';
+    const callLine = `<div class="chat-tool-line">⚙ ${escapeHtml(startPhrase)}…</div>`;
+    const resultLine = `<div class="chat-tool-line"${titleAttr}>${glyph} ${escapeHtml(finalPhrase)}</div>`;
     return callLine + resultLine;
   }).join('');
-}
-
-function formatToolCall(name, args) {
-  const parts = [];
-  if (args && args.ref) parts.push(args.ref);
-  if (args && args.text !== undefined) {
-    const t = String(args.text);
-    parts.push(`"${t.length > 40 ? t.slice(0, 40) + '…' : t}"`);
-  }
-  return `${escapeHtml(name)}(${parts.map(p => typeof p === 'string' ? escapeHtml(p) : p).join(', ')})`;
-}
-
-function appendToolLine(html) {
-  const el = document.createElement('div');
-  el.className = 'chat-tool-line';
-  el.innerHTML = html;
-  chatMessagesEl.appendChild(el);
-  scrollChatToBottom();
 }
 
 window.chat.onDone((data) => {
@@ -1745,6 +2316,9 @@ window.chat.onDone((data) => {
   thinkingFallback = '';
   reasoningStartMs = 0;
   setChatBusy(false);
+  // Destroy live activity strip BEFORE renderChat — the canonical "Show N
+  // actions" trail block on the assistant turn takes over.
+  destroyLiveActivity();
 
   if (targetExe === chatCurrentExe) {
     renderChat();
@@ -1785,6 +2359,9 @@ async function sendChatMessage(forcedText, forcedApps) {
   addChatMessage('user', text);
   lastUserMessage = text;
 
+  // Fresh turn — drop any leftover strip from a previous turn that wasn't
+  // explicitly torn down (defensive; onDone normally clears it).
+  destroyLiveActivity();
   thinkingBuffer = '';
   thinkingFallback = 'reading your request…';
   reasoningStartMs = Date.now();
@@ -1813,6 +2390,7 @@ async function sendChatMessage(forcedText, forcedApps) {
     }
   } catch (err) {
     hideThinking();
+    destroyLiveActivity();
     const streamMsg = document.getElementById('chat-stream-msg');
     if (streamMsg) streamMsg.remove();
     chatStreamContent = '';
@@ -1852,69 +2430,75 @@ chatInput.addEventListener('keydown', (e) => {
           sel.removeAllRanges();
           sel.addRange(newRange);
         }
-        evaluateTabTrigger();
+        evaluateSlash();
         return;
       }
     }
   }
-  // /file command: Space or Tab after `/file` opens the native file picker.
-  if ((e.key === ' ' || e.key === 'Tab') && !chatBusy) {
-    const ctx = getSlashContext();
-    if (ctx && shouldOfferFilePicker(ctx)) {
-      e.preventDefault();
-      openFilePicker(ctx);
-      return;
-    }
-  }
-  // While the /app menu is open, hijack navigation keys (Space falls through so
-  // the user can type a filter after `/app `).
-  if (appMenuState !== 'closed' && appMenuItems.length) {
+  // Slash palette open: arrow keys navigate, Tab/Enter commits highlighted cmd,
+  // Esc closes. Letters fall through to contenteditable so the filter shrinks
+  // or grows naturally; evaluateSlash on the input event keeps the menu in sync.
+  if (slashState === 'palette' && slashPaletteItems.length) {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      appMenuActiveIdx = Math.min(appMenuItems.length - 1, appMenuActiveIdx + 1);
-      renderAppMenu();
+      slashPaletteIdx = Math.min(slashPaletteItems.length - 1, slashPaletteIdx + 1);
+      renderPaletteMenu();
       return;
     }
     if (e.key === 'ArrowUp') {
       e.preventDefault();
-      appMenuActiveIdx = Math.max(0, appMenuActiveIdx - 1);
-      renderAppMenu();
+      slashPaletteIdx = Math.max(0, slashPaletteIdx - 1);
+      renderPaletteMenu();
       return;
     }
     if (e.key === 'Enter' || e.key === 'Tab') {
       e.preventDefault();
-      pickApp(appMenuActiveIdx);
+      const cmd = slashPaletteItems[slashPaletteIdx];
+      if (cmd) commitSlashCmd(cmd);
       return;
     }
     if (e.key === 'Escape') {
       e.preventDefault();
-      closeAppMenu();
+      closeSlash();
       return;
     }
   }
-  // While the /tab menu is open, hijack navigation keys.
-  if (tabMenuState !== 'closed' && tabMenuItems.length) {
-    if (e.key === 'ArrowDown') {
+  // Arg picker open: arrow keys / Tab / Enter pick. Backspace at the splice
+  // anchor with no filter chars exits arg mode (the user has rubbed out the
+  // whole reference; one more Backspace dismisses the picker).
+  if (slashState === 'arg') {
+    if (e.key === 'ArrowDown' && argItems.length) {
       e.preventDefault();
-      tabMenuActiveIdx = Math.min(tabMenuItems.length - 1, tabMenuActiveIdx + 1);
-      renderTabMenu();
+      argIdx = Math.min(argItems.length - 1, argIdx + 1);
+      renderArgMenu();
       return;
     }
-    if (e.key === 'ArrowUp') {
+    if (e.key === 'ArrowUp' && argItems.length) {
       e.preventDefault();
-      tabMenuActiveIdx = Math.max(0, tabMenuActiveIdx - 1);
-      renderTabMenu();
+      argIdx = Math.max(0, argIdx - 1);
+      renderArgMenu();
       return;
     }
-    if (e.key === 'Enter' || e.key === 'Tab') {
+    if ((e.key === 'Enter' || e.key === 'Tab') && argItems.length) {
       e.preventDefault();
-      pickTab(tabMenuActiveIdx);
+      pickArgItem();
       return;
     }
     if (e.key === 'Escape') {
       e.preventDefault();
-      closeTabMenu();
+      closeSlash();
       return;
+    }
+    if (e.key === 'Backspace' && slashAnchor && chatInput.contains(slashAnchor.node)) {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount && sel.isCollapsed) {
+        const r = sel.getRangeAt(0);
+        if (r.startContainer === slashAnchor.node && r.startOffset === slashAnchor.offset) {
+          e.preventDefault();
+          closeSlash();
+          return;
+        }
+      }
     }
   }
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -1938,23 +2522,25 @@ chatInput.addEventListener('input', () => {
   // contenteditable grows on its own (CSS max-height + scroll). Drop any stray
   // <br> left behind when the field is emptied so the :empty placeholder shows.
   if (chatInput.textContent === '' && chatInput.querySelector('br')) chatInput.innerHTML = '';
-  evaluateTabTrigger();
-  evaluateAppTrigger();
+  evaluateSlash();
 });
 
-// ── `/tab` mention: reference Chrome tabs inline as pills ──────────────────────
-// Typing `/tab` (in a CDP/Chrome chat) pops an animated dropdown of the selected
-// window's tabs. Picking one drops an inline pill into the composer. On send the
-// pill serialises to `[tab:<targetId> "<title>"]` — the model resolves it via
-// cdp_select_window({id}), and the logged user message carries the tab id.
-const tabMenuEl     = document.getElementById('chat-tab-menu');
-const tabMenuListEl = document.getElementById('chat-tab-menu-list');
-
-let tabMenuState     = 'closed';   // 'closed' | 'loading' | 'open'
-let tabMenuItems     = [];
-let tabMenuActiveIdx = 0;
-let activeTrigger    = null;        // { node, slashOffset, caretOffset }
-let tabMenuToken     = 0;
+// ── Slash-command palette + arg picker ─────────────────────────────────────
+// Single state machine drives three flows:
+//   phase 'palette' — typing `/` opens a list of commands (/app /tab /file…).
+//                     Type to filter; Tab/Enter commits the highlighted cmd
+//                     and splices the literal `/cmd` text out of the composer.
+//   phase 'arg'     — for commands that take a reference argument (/app, /tab)
+//                     the dropdown swaps to the matching candidate list; chars
+//                     typed at the splice anchor become the filter; Tab/Enter
+//                     inserts the chosen pill at that anchor.
+//   /file commits straight to the OS file dialog — no arg phase.
+// Pill DOM and on-the-wire serialisation are unchanged; this only restructures
+// the input UX that used to live in three separate detectors (/app, /tab, /file).
+const slashMenuEl     = document.getElementById('chat-slash-menu');
+const slashMenuListEl = document.getElementById('chat-slash-menu-list');
+const tabMenuEl       = document.getElementById('chat-tab-menu');
+const tabMenuListEl   = document.getElementById('chat-tab-menu-list');
 
 const TAB_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"></rect><path d="M2 9h20"></path><path d="M6 6.5h.01M9 6.5h.01"></path></svg>';
 
@@ -2004,102 +2590,201 @@ function clearChatInput() {
 
 // Is the caret sitting right after a `/tab`-style slash token? Returns its text
 // node + offsets so we can later splice in a pill.
-function getSlashContext() {
+const SLASH_COMMANDS = [
+  { name: 'app',  label: '/app',  hint: 'Reference a running app', glyph: APP_GLYPH_SVG,  arg: 'app'  },
+  { name: 'tab',  label: '/tab',  hint: 'Reference a Chrome tab',  glyph: TAB_GLYPH_SVG,  arg: 'tab',
+    guard: () => {
+      // Caret-after-`/app`-pill scopes to that app instead of the chat's primary.
+      const meta = scopedMetaForSlash();
+      return !!(meta && meta.type === 'electron' && meta.port);
+    } },
+  { name: 'file', label: '/file', hint: 'Attach a file',           glyph: FILE_GLYPH_SVG, arg: 'file' },
+];
+
+// When a slash sits to the right of a `/app` pill in the composer, subsequent
+// `/`-commands (e.g. `/tab`) scope to THAT app rather than the chat's primary
+// exe. Returns the scoping exe, or null if the caret has no preceding /app pill.
+let slashScopedExe = null;
+
+function findScopedExeFromCtx(ctx) {
+  if (!ctx || !ctx.node || !chatInput.contains(ctx.node)) return null;
+  const pills = chatInput.querySelectorAll('.chat-app-pill');
+  let last = null;
+  for (const p of pills) {
+    if (p.compareDocumentPosition(ctx.node) & Node.DOCUMENT_POSITION_FOLLOWING) last = p;
+  }
+  return last ? (last.dataset.appExe || null) : null;
+}
+
+function scopedMetaForSlash() {
+  const exe = slashScopedExe || chatCurrentExe;
+  if (!exe) return null;
+  return chatMetaStore[exe] || resolveAppMeta(exe);
+}
+
+const appMenuEl     = document.getElementById('chat-app-menu');
+const appMenuListEl = document.getElementById('chat-app-menu-list');
+
+// Two-phase slash machine.
+//  palette  user sees `/cmd` while typing; Tab/Enter commits.
+//  arg      `/cmd` text already removed; caret sits at `slashAnchor`,
+//           subsequent text up to the caret is the filter.
+let slashState        = 'closed';   // 'closed' | 'palette' | 'arg'
+let slashCmd          = null;       // 'app' | 'tab' (no arg phase for /file)
+let slashAnchor       = null;       // { node, offset } where the spliced /cmd was
+let slashFilter       = '';
+let slashPaletteCtx   = null;       // { node, slashOffset, caretOffset, query }
+let slashPaletteItems = [];
+let slashPaletteIdx   = 0;
+let argItems          = [];
+let argIdx            = 0;
+let tabFetchToken     = 0;
+let cachedTabs        = [];
+let cachedWindowCount = 1;
+let isComposingChat   = false;
+
+function detectSlashAtCaret() {
+  if (chatBusy || isComposingChat) return null;
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return null;
   const range = sel.getRangeAt(0);
   const node = range.startContainer;
   if (node.nodeType !== Node.TEXT_NODE || !chatInput.contains(node)) return null;
   const before = node.nodeValue.slice(0, range.startOffset);
+  // Slash must sit at start-of-node OR after whitespace -- filters URLs
+  // (`https://`), Windows-ish path runs, and accidental mid-word slashes.
   const m = /(^|\s)\/([a-zA-Z]*)$/.exec(before);
   if (!m) return null;
-  const query = m[2].toLowerCase();
-  return { node, query, slashOffset: range.startOffset - query.length - 1, caretOffset: range.startOffset };
+  return {
+    node,
+    slashOffset: range.startOffset - m[2].length - 1,
+    caretOffset: range.startOffset,
+    query: m[2],
+  };
 }
 
-function shouldOfferTabMenu(ctx) {
-  const q = ctx.query;
-  if (!(q.length >= 1 && ('tab'.startsWith(q) || q.startsWith('tab')))) return false;
-  const meta = chatMetaStore[chatCurrentExe];
-  return !!(meta && meta.type === 'electron' && meta.port);
-}
-
-function shouldOfferFilePicker(ctx) {
-  return ctx.query === 'file';
-}
-
-function evaluateTabTrigger() {
-  if (chatBusy) { if (tabMenuState !== 'closed') closeTabMenu(); return; }
-  const ctx = getSlashContext();
-  if (ctx && shouldOfferTabMenu(ctx)) {
-    if (tabMenuState === 'closed') {
-      openTabMenu(ctx);
-    } else {
-      activeTrigger = ctx;
-      if (tabMenuState === 'open') positionTabMenu();
-    }
-  } else if (tabMenuState !== 'closed') {
-    closeTabMenu();
-  }
-}
-
-async function openTabMenu(ctx) {
-  const meta = chatMetaStore[chatCurrentExe];
-  if (!meta || meta.type !== 'electron' || !meta.port) return;
-  tabMenuState = 'loading';
-  activeTrigger = ctx;
-  const myToken = ++tabMenuToken;
-  let tabs = [];
-  try {
-    const res = await window.chat.listTabs(meta.port);
-    tabs = (res && Array.isArray(res.tabs)) ? res.tabs : [];
-  } catch { tabs = []; }
-  if (myToken !== tabMenuToken || !activeTrigger) return; // closed / superseded mid-fetch
-  if (!tabs.length) { closeTabMenu(); return; }
-  tabMenuItems = tabs;
-  tabMenuActiveIdx = tabs.findIndex(t => t.active);
-  if (tabMenuActiveIdx < 0) tabMenuActiveIdx = 0;
-  renderTabMenu();
-  tabMenuEl.hidden = false;
-  tabMenuState = 'open';
-  positionTabMenu();
-}
-
-function closeTabMenu() {
-  tabMenuState = 'closed';
-  tabMenuToken++;          // invalidate any in-flight fetch
-  tabMenuEl.hidden = true;
-  tabMenuItems = [];
-  activeTrigger = null;
-}
-
-function renderTabMenu() {
-  if (!tabMenuItems.length) {
-    tabMenuListEl.innerHTML = `<div class="chat-tab-menu-empty">No open tabs in this window.</div>`;
+function evaluateSlash() {
+  if (chatBusy) { if (slashState !== 'closed') closeSlash(); return; }
+  if (slashState === 'arg') {
+    if (!slashAnchor || !chatInput.contains(slashAnchor.node) ||
+        slashAnchor.node.nodeType !== Node.TEXT_NODE) { closeSlash(); return; }
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) { closeSlash(); return; }
+    const r = sel.getRangeAt(0);
+    if (r.startContainer !== slashAnchor.node) { closeSlash(); return; }
+    if (r.startOffset < slashAnchor.offset) { closeSlash(); return; }
+    slashFilter = slashAnchor.node.nodeValue.slice(slashAnchor.offset, r.startOffset);
+    refreshArgItems();
+    positionArgMenu();
     return;
   }
-  tabMenuListEl.innerHTML = tabMenuItems.map((t, i) => {
-    const host = hostFromUrl(t.url);
-    const title = t.title || host || 'Untitled tab';
-    return `
-      <button type="button" role="option" class="chat-tab-row${i === tabMenuActiveIdx ? ' active' : ''}"
-              data-i="${i}" aria-selected="${i === tabMenuActiveIdx}">
-        <span class="chat-tab-row-icon">${TAB_GLYPH_SVG}</span>
+  const ctx = detectSlashAtCaret();
+  if (ctx) openPalette(ctx);
+  else if (slashState !== 'closed') closeSlash();
+}
+
+// Detected running apps, minus ChatGPT, optionally filtered by substring.
+// Mirrors the overlay launcher's candidate list (electron + UIA).
+function appMenuCandidates(filter) {
+  const out = [];
+  for (const a of currentApps) {
+    if (isChatGptApp(a)) continue;
+    const cdp = !!(a.cdpAlive && a.DebugPort);
+    out.push({ exe: a.Exe, name: a.Name, backend: cdp ? 'cdp' : 'uia' });
+  }
+  for (const a of cachedUiaApps) {
+    if (isChatGptApp(a)) continue;
+    if (out.some(o => o.exe === a.Exe)) continue;
+    out.push({ exe: a.Exe, name: a.Name, backend: 'uia' });
+  }
+  const f = (filter || '').trim().toLowerCase();
+  const filtered = f
+    ? out.filter(o => (o.name || '').toLowerCase().includes(f) || (o.exe || '').toLowerCase().includes(f))
+    : out;
+  return filtered.slice(0, 50);
+}
+
+function filterArgTabs(q) {
+  const ql = (q || '').trim().toLowerCase();
+  if (!ql) return cachedTabs.slice(0, 50);
+  const pre = [], sub = [];
+  for (const t of cachedTabs) {
+    const title = (t.title || '').toLowerCase();
+    const url = (t.url || '').toLowerCase();
+    if (title.startsWith(ql) || url.startsWith(ql)) pre.push(t);
+    else if (title.includes(ql) || url.includes(ql)) sub.push(t);
+  }
+  return [...pre, ...sub].slice(0, 50);
+}
+
+async function loadTabsForArg(initial) {
+  const meta = scopedMetaForSlash();
+  if (!meta || meta.type !== 'electron' || !meta.port) { closeSlash(); return; }
+  const my = ++tabFetchToken;
+  if (initial) { cachedTabs = []; argItems = []; renderArgMenu(); }
+  let tabs = [];
+  let res = null;
+  try {
+    res = await window.chat.listTabs(meta.port);
+    tabs = (res && Array.isArray(res.tabs)) ? res.tabs : [];
+  } catch { tabs = []; }
+  if (my !== tabFetchToken || slashState !== 'arg' || slashCmd !== 'tab') return;
+  cachedTabs = tabs;
+  cachedWindowCount = (res && typeof res.windowCount === 'number') ? res.windowCount : 1;
+  argItems = filterArgTabs(slashFilter);
+  const activeI = argItems.findIndex(t => t.active);
+  argIdx = activeI >= 0 ? activeI : 0;
+  renderArgMenu();
+}
+
+function openPalette(ctx) {
+  const wasOpen = slashState === 'palette';
+  slashState = 'palette';
+  slashPaletteCtx = ctx;
+  slashFilter = ctx.query;
+  slashScopedExe = findScopedExeFromCtx(ctx);
+  if (!wasOpen) slashPaletteIdx = 0;
+  refreshPaletteItems();
+  appMenuEl.hidden = true;
+  tabMenuEl.hidden = true;
+  slashMenuEl.hidden = false;
+  positionMenu(slashMenuEl);
+}
+
+function refreshPaletteItems() {
+  const q = (slashFilter || '').toLowerCase();
+  const visible = SLASH_COMMANDS.filter(c => {
+    if (c.guard && !c.guard()) return false;
+    if (!q) return true;
+    return c.name.startsWith(q);
+  });
+  slashPaletteItems = visible;
+  if (slashPaletteIdx >= visible.length) slashPaletteIdx = Math.max(0, visible.length - 1);
+  if (!visible.length) {
+    slashMenuListEl.innerHTML = `<div class="chat-tab-menu-empty">No matching commands.</div>`;
+  } else {
+    renderPaletteMenu();
+  }
+}
+
+function renderPaletteMenu() {
+  slashMenuListEl.innerHTML = slashPaletteItems.map((c, i) => `
+      <button type="button" role="option" class="chat-tab-row${i === slashPaletteIdx ? ' active' : ''}"
+              data-i="${i}" aria-selected="${i === slashPaletteIdx}">
+        <span class="chat-tab-row-icon">${c.glyph}</span>
         <span class="chat-tab-row-body">
-          <span class="chat-tab-row-title">${escapeHtml(title)}</span>
-          ${host ? `<span class="chat-tab-row-url">${escapeHtml(host)}</span>` : ''}
+          <span class="chat-tab-row-title">${c.label}</span>
+          <span class="chat-tab-row-url">${escapeHtml(c.hint)}</span>
         </span>
-      </button>`;
-  }).join('');
-  const activeRow = tabMenuListEl.querySelector('.chat-tab-row.active');
-  if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
+      </button>`).join('');
+  const active = slashMenuListEl.querySelector('.chat-tab-row.active');
+  if (active) active.scrollIntoView({ block: 'nearest' });
 }
 
 // Anchor the menu just above the caret line, inside the composer wrap.
-function positionTabMenu() {
+function positionMenu(el) {
   // In overlay chat mode chatInput is reparented into .launcher-input-stack;
-  // the original .chat-input-wrap is no longer the ancestor. Fall back to
-  // whichever positioned container actually holds chatInput.
+  // the original .chat-input-wrap is no longer the ancestor.
   const wrap = chatInput.closest('.chat-input-wrap, .launcher-input-stack, .launcher-row');
   if (!wrap) return;
   const wrapRect = wrap.getBoundingClientRect();
@@ -2111,9 +2796,138 @@ function positionTabMenu() {
   }
   if (!caretRect || (!caretRect.width && !caretRect.height)) caretRect = chatInput.getBoundingClientRect();
   const left = Math.max(8, Math.min(caretRect.left - wrapRect.left, wrapRect.width - 16));
-  tabMenuEl.style.left = left + 'px';
-  tabMenuEl.style.bottom = (wrapRect.bottom - caretRect.top + 6) + 'px';
-  tabMenuEl.style.top = 'auto';
+  el.style.left = left + 'px';
+  el.style.bottom = (wrapRect.bottom - caretRect.top + 6) + 'px';
+  el.style.top = 'auto';
+}
+
+function positionArgMenu() {
+  if (slashCmd === 'app') positionMenu(appMenuEl);
+  else if (slashCmd === 'tab') positionMenu(tabMenuEl);
+}
+
+function closeSlash() {
+  slashState = 'closed';
+  slashCmd = null;
+  slashAnchor = null;
+  slashFilter = '';
+  slashPaletteCtx = null;
+  slashPaletteItems = [];
+  slashScopedExe = null;
+  argItems = [];
+  argIdx = 0;
+  tabFetchToken++;
+  cachedWindowCount = 1;
+  slashMenuEl.hidden = true;
+  appMenuEl.hidden = true;
+  tabMenuEl.hidden = true;
+}
+
+// Compat shims for the few legacy callsites that still reach for the old names.
+function closeTabMenu() { closeSlash(); }
+function closeAppMenu() { closeSlash(); }
+
+function commitSlashCmd(cmd) {
+  const ctx = slashPaletteCtx;
+  if (!ctx || !chatInput.contains(ctx.node) || ctx.node.nodeType !== Node.TEXT_NODE) {
+    closeSlash();
+    return;
+  }
+  const { node, slashOffset, caretOffset } = ctx;
+  const full = node.nodeValue;
+  node.nodeValue = full.slice(0, slashOffset) + full.slice(caretOffset);
+  const sel = window.getSelection();
+  const r = document.createRange();
+  r.setStart(node, slashOffset);
+  r.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(r);
+  slashMenuEl.hidden = true;
+  slashPaletteCtx = null;
+  slashPaletteItems = [];
+
+  if (cmd.arg === 'file') {
+    slashState = 'closed';
+    slashCmd = null;
+    slashAnchor = null;
+    slashFilter = '';
+    openFilePicker({ node, offset: slashOffset });
+    return;
+  }
+  slashState = 'arg';
+  slashCmd = cmd.arg;
+  slashAnchor = { node, offset: slashOffset };
+  slashFilter = '';
+  argItems = [];
+  argIdx = 0;
+  if (cmd.arg === 'app') {
+    refreshArgItems();
+    appMenuEl.hidden = false;
+    positionArgMenu();
+  } else if (cmd.arg === 'tab') {
+    loadTabsForArg(true);
+    tabMenuEl.hidden = false;
+    positionArgMenu();
+  }
+  chatInput.focus();
+}
+
+function refreshArgItems() {
+  if (slashCmd === 'app') {
+    argItems = appMenuCandidates(slashFilter);
+    if (argIdx >= argItems.length) argIdx = 0;
+    renderArgMenu();
+  } else if (slashCmd === 'tab') {
+    argItems = filterArgTabs(slashFilter);
+    if (argIdx >= argItems.length) argIdx = 0;
+    renderArgMenu();
+  }
+}
+
+function renderArgMenu() {
+  if (slashCmd === 'app') {
+    if (!argItems.length) {
+      const f = slashFilter.trim();
+      appMenuListEl.innerHTML = `<div class="chat-tab-menu-empty">No running apps match${f ? ` "${escapeHtml(f)}"` : ''}.</div>`;
+      return;
+    }
+    appMenuListEl.innerHTML = argItems.map((a, i) => {
+      const base = (a.exe || '').split(/[\\/]/).pop() || a.exe || '';
+      return `
+      <button type="button" role="option" class="chat-tab-row${i === argIdx ? ' active' : ''}"
+              data-i="${i}" aria-selected="${i === argIdx}">
+        <span class="chat-tab-row-icon">${APP_GLYPH_SVG}</span>
+        <span class="chat-tab-row-body">
+          <span class="chat-tab-row-title">${escapeHtml(a.name || base)}</span>
+          <span class="chat-tab-row-url">${escapeHtml(base)} - ${a.backend}</span>
+        </span>
+      </button>`;
+    }).join('');
+    const ar = appMenuListEl.querySelector('.chat-tab-row.active');
+    if (ar) ar.scrollIntoView({ block: 'nearest' });
+  } else if (slashCmd === 'tab') {
+    if (!argItems.length) {
+      tabMenuListEl.innerHTML = `<div class="chat-tab-menu-empty">No open tabs match.</div>`;
+      return;
+    }
+    const sharedHosts = tabSharedHostSet(argItems);
+    tabMenuListEl.innerHTML = argItems.map((t, i) => {
+      const primary = tabPrimaryLabel(t, sharedHosts);
+      const secondary = tabSecondaryLabel(t, cachedWindowCount, primary);
+      const tip = [(t.title || '').trim(), (t.url || '').trim()].filter(Boolean).join(' — ');
+      return `
+      <button type="button" role="option" class="chat-tab-row${i === argIdx ? ' active' : ''}"
+              data-i="${i}" aria-selected="${i === argIdx}" title="${escapeHtml(tip)}">
+        <span class="chat-tab-row-icon">${TAB_GLYPH_SVG}</span>
+        <span class="chat-tab-row-body">
+          <span class="chat-tab-row-title">${escapeHtml(primary)}</span>
+          ${secondary ? `<span class="chat-tab-row-url">${escapeHtml(secondary)}</span>` : ''}
+        </span>
+      </button>`;
+    }).join('');
+    const ar = tabMenuListEl.querySelector('.chat-tab-row.active');
+    if (ar) ar.scrollIntoView({ block: 'nearest' });
+  }
 }
 
 function buildTabPill(tab) {
@@ -2123,8 +2937,9 @@ function buildTabPill(tab) {
   span.dataset.tabId = tab.id || '';
   span.dataset.tabTitle = tab.title || '';
   span.dataset.tabUrl = tab.url || '';
-  const label = (tab.title || hostFromUrl(tab.url) || 'tab').trim();
-  span.title = label + (tab.url ? ` — ${tab.url}` : '');
+  const label = tabPrimaryLabel(tab, null);
+  const tip = [(tab.title || '').trim(), (tab.url || '').trim()].filter(Boolean).join(' — ');
+  span.title = tip || label;
   const icon = document.createElement('span');
   icon.className = 'chat-tab-pill-icon';
   icon.innerHTML = TAB_GLYPH_SVG;
@@ -2136,9 +2951,24 @@ function buildTabPill(tab) {
   return span;
 }
 
-function pickTab(i) {
-  const tab = tabMenuItems[i];
-  if (tab) replaceTriggerWithPill(tab);
+function buildAppPill(app) {
+  const span = document.createElement('span');
+  span.className = 'chat-app-pill';
+  span.contentEditable = 'false';
+  span.dataset.appExe = app.exe || '';
+  span.dataset.appName = app.name || '';
+  span.dataset.appKey = appKeyFor(app.exe || '');
+  const label = (app.name || (app.exe || '').split(/[\\/]/).pop() || 'app').trim();
+  span.title = label + (app.exe ? ` - ${app.exe}` : '');
+  const icon = document.createElement('span');
+  icon.className = 'chat-app-pill-icon';
+  icon.innerHTML = APP_GLYPH_SVG;
+  const text = document.createElement('span');
+  text.className = 'chat-app-pill-label';
+  text.textContent = label;
+  span.appendChild(icon);
+  span.appendChild(text);
+  return span;
 }
 
 function isTabPill(n) {
@@ -2150,7 +2980,7 @@ function isAnyPill(n) {
 }
 const isEmptyText = (n) => n && n.nodeType === Node.TEXT_NODE && n.nodeValue === '';
 
-// The pill immediately before the (collapsed) caret, if any — skipping empty
+// The pill immediately before the (collapsed) caret, if any -- skipping empty
 // text nodes contenteditable leaves behind around inline non-editable spans.
 function pillBeforeCaret(range) {
   const { startContainer: node, startOffset: off } = range;
@@ -2180,267 +3010,105 @@ function pillAfterCaret(range) {
   return isAnyPill(next) ? next : null;
 }
 
-// Splice the slash token (e.g. "/tab") out of its text node and drop a pill in
-// its place, leaving the caret after a trailing space.
-function replaceTriggerWithPill(tab) {
-  const ctx = activeTrigger;
-  closeTabMenu();
-  if (!ctx || !chatInput.contains(ctx.node) || ctx.node.nodeType !== Node.TEXT_NODE) return;
-  const { node, slashOffset, caretOffset } = ctx;
+// Insert the chosen pill at the splice anchor, removing any filter chars the
+// user typed in arg mode. Caret lands after the trailing space.
+function insertPillAtAnchor(buildPill, payload) {
+  if (!slashAnchor || !chatInput.contains(slashAnchor.node) ||
+      slashAnchor.node.nodeType !== Node.TEXT_NODE) { closeSlash(); return; }
+  const { node, offset } = slashAnchor;
+  let caretOff = offset + (slashFilter || '').length;
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount && sel.isCollapsed && sel.getRangeAt(0).startContainer === node) {
+    caretOff = Math.max(offset, sel.getRangeAt(0).startOffset);
+  }
   const full = node.nodeValue;
+  const before = full.slice(0, offset);
+  const after = full.slice(caretOff);
   const parent = node.parentNode;
-
-  const beforeNode = document.createTextNode(full.slice(0, slashOffset));
-  const pill = buildTabPill(tab);
-  const spaceNode = document.createTextNode(' ');
-  const afterNode = document.createTextNode(full.slice(caretOffset));
-
+  const beforeNode = document.createTextNode(before);
+  const pill = buildPill(payload);
+  const spaceNode = document.createTextNode(' ');
+  const afterNode = document.createTextNode(after);
   parent.insertBefore(beforeNode, node);
   parent.insertBefore(pill, node);
   parent.insertBefore(spaceNode, node);
   parent.insertBefore(afterNode, node);
   parent.removeChild(node);
-
-  const sel = window.getSelection();
-  const range = document.createRange();
-  range.setStart(spaceNode, spaceNode.length);
-  range.collapse(true);
-  sel.removeAllRanges();
-  sel.addRange(range);
+  const r = document.createRange();
+  r.setStart(spaceNode, 1);
+  r.collapse(true);
+  const s = window.getSelection();
+  s.removeAllRanges();
+  s.addRange(r);
+  closeSlash();
   chatInput.focus();
 }
 
-// Click a row (mousedown so the editor keeps focus/caret).
-tabMenuListEl.addEventListener('mousedown', (e) => {
+function pickArgItem(idx) {
+  if (typeof idx === 'number') argIdx = idx;
+  if (argIdx < 0 || argIdx >= argItems.length) return;
+  if (slashCmd === 'app') insertPillAtAnchor(buildAppPill, argItems[argIdx]);
+  else if (slashCmd === 'tab') insertPillAtAnchor(buildTabPill, argItems[argIdx]);
+}
+
+// Legacy aliases used by sendChatMessage's pill collection and a couple of
+// other callsites.
+function pickApp(i) { pickArgItem(i); }
+function pickTab(i) { pickArgItem(i); }
+
+// Mousedown (preserves editor focus) + mousemove highlight on every menu.
+slashMenuListEl.addEventListener('mousedown', (e) => {
   const row = e.target.closest('.chat-tab-row');
   if (!row) return;
   e.preventDefault();
-  pickTab(parseInt(row.dataset.i, 10));
+  const i = parseInt(row.dataset.i, 10);
+  if (!Number.isNaN(i) && slashPaletteItems[i]) commitSlashCmd(slashPaletteItems[i]);
 });
-tabMenuListEl.addEventListener('mousemove', (e) => {
+slashMenuListEl.addEventListener('mousemove', (e) => {
   const row = e.target.closest('.chat-tab-row');
   if (!row) return;
   const i = parseInt(row.dataset.i, 10);
-  if (i !== tabMenuActiveIdx) { tabMenuActiveIdx = i; renderTabMenu(); }
+  if (!Number.isNaN(i) && i !== slashPaletteIdx) { slashPaletteIdx = i; renderPaletteMenu(); }
 });
-
-// Caret moved away from the token (arrows, click) → re-evaluate / close.
-document.addEventListener('selectionchange', () => {
-  if (tabMenuState === 'closed' || document.activeElement !== chatInput) return;
-  const ctx = getSlashContext();
-  if (!ctx || !shouldOfferTabMenu(ctx)) { closeTabMenu(); return; }
-  activeTrigger = ctx;
-  if (tabMenuState === 'open') positionTabMenu();
-});
-
-// Click outside the menu and editor → close.
-document.addEventListener('mousedown', (e) => {
-  if (tabMenuState === 'closed') return;
-  if (tabMenuEl.contains(e.target) || chatInput.contains(e.target)) return;
-  closeTabMenu();
-});
-
-// ── `/app` mention: reference any running app inline as a pill ────────────────
-// Typing `/app` (in app-scoped OR direct chat) pops a dropdown of running apps,
-// reusing the same detected list as the overlay launcher. Picking one drops an
-// inline pill. On send each pill serialises to `[app:<key> "<name>"]` and the
-// app's live meta is collected into payload.apps so the model can select_app it.
-const appMenuEl     = document.getElementById('chat-app-menu');
-const appMenuListEl = document.getElementById('chat-app-menu-list');
-
-let appMenuState     = 'closed';   // 'closed' | 'open'
-let appMenuItems     = [];
-let appMenuActiveIdx = 0;
-let appTrigger       = null;       // { node, filter, slashOffset, caretOffset }
-
-// Detected running apps, minus ChatGPT, optionally filtered by substring.
-// Mirrors the overlay launcher's candidate list (electron + UIA).
-function appMenuCandidates(filter) {
-  const out = [];
-  for (const a of currentApps) {
-    if (isChatGptApp(a)) continue;
-    const cdp = !!(a.cdpAlive && a.DebugPort);
-    out.push({ exe: a.Exe, name: a.Name, backend: cdp ? 'cdp' : 'uia' });
-  }
-  for (const a of cachedUiaApps) {
-    if (isChatGptApp(a)) continue;
-    if (out.some(o => o.exe === a.Exe)) continue;
-    out.push({ exe: a.Exe, name: a.Name, backend: 'uia' });
-  }
-  const f = (filter || '').trim().toLowerCase();
-  const filtered = f ? out.filter(o => (o.name || '').toLowerCase().includes(f) || (o.exe || '').toLowerCase().includes(f)) : out;
-  return filtered.slice(0, 50);
-}
-
-// Caret context for /app. Two phases: typing the command word itself (/a../app)
-// with no trailing text, OR `/app <filter>` to filter the list by name.
-function getAppContext() {
-  const sel = window.getSelection();
-  if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return null;
-  const range = sel.getRangeAt(0);
-  const node = range.startContainer;
-  if (node.nodeType !== Node.TEXT_NODE || !chatInput.contains(node)) return null;
-  const before = node.nodeValue.slice(0, range.startOffset);
-  // Phase 2: "/app " or "/app <filter>" (a space already separates the filter)
-  let m = /(^|\s)\/app[ \t]+([^\n]*)$/i.exec(before);
-  if (m) {
-    const tokenLen = m[0].length - (m[1] ? m[1].length : 0);
-    return { node, filter: m[2], slashOffset: range.startOffset - tokenLen, caretOffset: range.startOffset };
-  }
-  // Phase 1: typing the command word (/a, /ap, /app) with no trailing text
-  m = /(^|\s)\/([a-zA-Z]*)$/.exec(before);
-  if (m) {
-    const q = m[2].toLowerCase();
-    if (q.length >= 1 && ('app'.startsWith(q) || q.startsWith('app'))) {
-      return { node, filter: '', slashOffset: range.startOffset - m[2].length - 1, caretOffset: range.startOffset };
-    }
-  }
-  return null;
-}
-
-function evaluateAppTrigger() {
-  if (chatBusy) { if (appMenuState !== 'closed') closeAppMenu(); return; }
-  const ctx = getAppContext();
-  if (ctx) {
-    openAppMenu(ctx);
-  } else if (appMenuState !== 'closed') {
-    closeAppMenu();
-  }
-}
-
-function openAppMenu(ctx) {
-  appTrigger = ctx;
-  const items = appMenuCandidates(ctx.filter);
-  appMenuItems = items;
-  if (appMenuActiveIdx >= items.length) appMenuActiveIdx = 0;
-  if (!items.length) {
-    appMenuListEl.innerHTML = `<div class="chat-tab-menu-empty">No running apps match${ctx.filter ? ` “${escapeHtml(ctx.filter)}”` : ''}.</div>`;
-  } else {
-    renderAppMenu();
-  }
-  appMenuEl.hidden = false;
-  appMenuState = 'open';
-  positionAppMenu();
-}
-
-function closeAppMenu() {
-  appMenuState = 'closed';
-  appMenuEl.hidden = true;
-  appMenuItems = [];
-  appMenuActiveIdx = 0;
-  appTrigger = null;
-}
-
-function renderAppMenu() {
-  appMenuListEl.innerHTML = appMenuItems.map((a, i) => {
-    const base = (a.exe || '').split(/[\\/]/).pop() || a.exe || '';
-    return `
-      <button type="button" role="option" class="chat-tab-row${i === appMenuActiveIdx ? ' active' : ''}"
-              data-i="${i}" aria-selected="${i === appMenuActiveIdx}">
-        <span class="chat-tab-row-icon">${APP_GLYPH_SVG}</span>
-        <span class="chat-tab-row-body">
-          <span class="chat-tab-row-title">${escapeHtml(a.name || base)}</span>
-          <span class="chat-tab-row-url">${escapeHtml(base)} · ${a.backend}</span>
-        </span>
-      </button>`;
-  }).join('');
-  const activeRow = appMenuListEl.querySelector('.chat-tab-row.active');
-  if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
-}
-
-function positionAppMenu() {
-  const wrap = chatInput.closest('.chat-input-wrap, .launcher-input-stack, .launcher-row');
-  if (!wrap) return;
-  const wrapRect = wrap.getBoundingClientRect();
-  let caretRect = null;
-  const sel = window.getSelection();
-  if (sel && sel.rangeCount) {
-    const rects = sel.getRangeAt(0).getClientRects();
-    if (rects.length) caretRect = rects[rects.length - 1];
-  }
-  if (!caretRect || (!caretRect.width && !caretRect.height)) caretRect = chatInput.getBoundingClientRect();
-  const left = Math.max(8, Math.min(caretRect.left - wrapRect.left, wrapRect.width - 16));
-  appMenuEl.style.left = left + 'px';
-  appMenuEl.style.bottom = (wrapRect.bottom - caretRect.top + 6) + 'px';
-  appMenuEl.style.top = 'auto';
-}
-
-function buildAppPill(app) {
-  const span = document.createElement('span');
-  span.className = 'chat-app-pill';
-  span.contentEditable = 'false';
-  span.dataset.appExe = app.exe || '';
-  span.dataset.appName = app.name || '';
-  span.dataset.appKey = appKeyFor(app.exe || '');
-  const label = (app.name || (app.exe || '').split(/[\\/]/).pop() || 'app').trim();
-  span.title = label + (app.exe ? ` — ${app.exe}` : '');
-  const icon = document.createElement('span');
-  icon.className = 'chat-app-pill-icon';
-  icon.innerHTML = APP_GLYPH_SVG;
-  const text = document.createElement('span');
-  text.className = 'chat-app-pill-label';
-  text.textContent = label;
-  span.appendChild(icon);
-  span.appendChild(text);
-  return span;
-}
-
-function pickApp(i) {
-  const app = appMenuItems[i];
-  if (app) insertAppPill(app);
-}
-
-// Splice the slash token (e.g. "/app" or "/app disc") out of its text node and
-// drop a pill in its place, leaving the caret after a trailing space.
-function insertAppPill(app) {
-  const ctx = appTrigger;
-  closeAppMenu();
-  if (!ctx || !chatInput.contains(ctx.node) || ctx.node.nodeType !== Node.TEXT_NODE) return;
-  const { node, slashOffset, caretOffset } = ctx;
-  const full = node.nodeValue;
-  const parent = node.parentNode;
-  const beforeNode = document.createTextNode(full.slice(0, slashOffset));
-  const pill = buildAppPill(app);
-  const spaceNode = document.createTextNode(' ');
-  const afterNode = document.createTextNode(full.slice(caretOffset));
-  parent.insertBefore(beforeNode, node);
-  parent.insertBefore(pill, node);
-  parent.insertBefore(spaceNode, node);
-  parent.insertBefore(afterNode, node);
-  parent.removeChild(node);
-  const sel = window.getSelection();
-  const range = document.createRange();
-  range.setStart(spaceNode, spaceNode.length);
-  range.collapse(true);
-  sel.removeAllRanges();
-  sel.addRange(range);
-  chatInput.focus();
-}
-
 appMenuListEl.addEventListener('mousedown', (e) => {
   const row = e.target.closest('.chat-tab-row');
   if (!row) return;
   e.preventDefault();
-  pickApp(parseInt(row.dataset.i, 10));
+  const i = parseInt(row.dataset.i, 10);
+  if (!Number.isNaN(i)) pickArgItem(i);
 });
 appMenuListEl.addEventListener('mousemove', (e) => {
   const row = e.target.closest('.chat-tab-row');
   if (!row) return;
   const i = parseInt(row.dataset.i, 10);
-  if (i !== appMenuActiveIdx) { appMenuActiveIdx = i; renderAppMenu(); }
+  if (!Number.isNaN(i) && i !== argIdx) { argIdx = i; renderArgMenu(); }
 });
+tabMenuListEl.addEventListener('mousedown', (e) => {
+  const row = e.target.closest('.chat-tab-row');
+  if (!row) return;
+  e.preventDefault();
+  const i = parseInt(row.dataset.i, 10);
+  if (!Number.isNaN(i)) pickArgItem(i);
+});
+tabMenuListEl.addEventListener('mousemove', (e) => {
+  const row = e.target.closest('.chat-tab-row');
+  if (!row) return;
+  const i = parseInt(row.dataset.i, 10);
+  if (!Number.isNaN(i) && i !== argIdx) { argIdx = i; renderArgMenu(); }
+});
+
 document.addEventListener('selectionchange', () => {
-  if (appMenuState === 'closed' || document.activeElement !== chatInput) return;
-  const ctx = getAppContext();
-  if (!ctx) { closeAppMenu(); return; }
-  appTrigger = ctx;
-  positionAppMenu();
+  if (slashState === 'closed' || document.activeElement !== chatInput) return;
+  evaluateSlash();
 });
 document.addEventListener('mousedown', (e) => {
-  if (appMenuState === 'closed') return;
-  if (appMenuEl.contains(e.target) || chatInput.contains(e.target)) return;
-  closeAppMenu();
+  if (slashState === 'closed') return;
+  if (slashMenuEl.contains(e.target) || appMenuEl.contains(e.target) ||
+      tabMenuEl.contains(e.target) || chatInput.contains(e.target)) return;
+  closeSlash();
 });
+chatInput.addEventListener('compositionstart', () => { isComposingChat = true; });
+chatInput.addEventListener('compositionend', () => { isComposingChat = false; evaluateSlash(); });
 
 // ── `/file` command: attach local files as inline pills ──────────────────────
 
@@ -2452,49 +3120,33 @@ function formatBytes(bytes) {
 
 let filePickerOpen = false;
 
-async function openFilePicker(ctx) {
+// `anchor` is { node, offset } pointing at the caret position where `/file`
+// just got spliced out by commitSlashCmd. The first picked file replaces that
+// caret spot; subsequent files insert at the moving caret. Caller is expected
+// to have already removed the `/file` text — this function does NOT undo on
+// cancel (there's nothing to undo).
+async function openFilePicker(anchor) {
   if (filePickerOpen) return;
   filePickerOpen = true;
-  // Save context for race-condition guard
-  const savedNode = ctx.node;
-  const savedText = ctx.node.nodeValue;
   try {
     const res = await window.chat.pickFile();
-    // Back-compat: old shape returned array directly.
     const files = Array.isArray(res) ? res : (res && res.files) || [];
     const skipped = (res && res.skipped) || [];
-    const canceled = !!(res && res.canceled);
-
-    if (canceled) {
-      if (chatInput.contains(savedNode) && savedNode.nodeValue === savedText) {
-        removeSlashToken(ctx);
-      }
-      chatInput.focus();
-      return;
-    }
 
     if (skipped.length) {
       const summary = skipped.map(s => `${s.name}: ${s.reason}`).join('; ');
       showStatus(`${skipped.length} file${skipped.length === 1 ? '' : 's'} skipped — ${summary}`, 'error');
       setTimeout(hideStatus, 6000);
     }
+    if (!files.length) { chatInput.focus(); return; }
 
-    if (!files.length) {
-      // Nothing accepted — strip /file text so user can retry.
-      if (chatInput.contains(savedNode) && savedNode.nodeValue === savedText) {
-        removeSlashToken(ctx);
-      }
-      chatInput.focus();
-      return;
-    }
-
-    // Focus the editor so caret-based inserts have a valid selection.
     chatInput.focus();
-    // Insert pills
     let isFirst = true;
     for (const file of files) {
-      if (isFirst && chatInput.contains(savedNode) && savedNode.nodeValue === savedText) {
-        replaceTriggerWithFilePill(ctx, file);
+      const anchorLive = anchor && chatInput.contains(anchor.node) &&
+                         anchor.node.nodeType === Node.TEXT_NODE;
+      if (isFirst && anchorLive) {
+        replaceAnchorWithFilePill(anchor, file);
         isFirst = false;
       } else {
         insertFilePillAtCaret(file);
@@ -2508,11 +3160,24 @@ async function openFilePicker(ctx) {
   }
 }
 
-function removeSlashToken(ctx) {
-  if (!ctx || !chatInput.contains(ctx.node)) return;
-  const { node, slashOffset, caretOffset } = ctx;
-  const full = node.nodeValue;
-  node.nodeValue = full.slice(0, slashOffset) + full.slice(caretOffset);
+function replaceAnchorWithFilePill(anchor, file) {
+  const { node, offset } = anchor;
+  const full = node.nodeValue || '';
+  const before = full.slice(0, offset);
+  const after = full.slice(offset);
+  const pill = buildFilePill(file);
+  const parent = node.parentNode;
+  if (before) parent.insertBefore(document.createTextNode(before), node);
+  parent.insertBefore(pill, node);
+  const trailing = document.createTextNode(after ? ' ' + after : ' ');
+  parent.insertBefore(trailing, node);
+  parent.removeChild(node);
+  const sel = window.getSelection();
+  const r = document.createRange();
+  r.setStart(trailing, 1);
+  r.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(r);
 }
 
 function buildFilePill(file) {
@@ -2531,30 +3196,6 @@ function buildFilePill(file) {
   span.appendChild(icon);
   span.appendChild(text);
   return span;
-}
-
-function replaceTriggerWithFilePill(ctx, file) {
-  const { node, slashOffset, caretOffset } = ctx;
-  const full = node.nodeValue || '';
-  const before = full.slice(0, slashOffset);
-  const after = full.slice(caretOffset);
-  const pill = buildFilePill(file);
-  const parent = node.parentNode;
-  if (before) {
-    const pre = document.createTextNode(before);
-    parent.insertBefore(pre, node);
-  }
-  parent.insertBefore(pill, node);
-  const trailing = document.createTextNode(after ? ' ' + after : ' ');
-  parent.insertBefore(trailing, node);
-  parent.removeChild(node);
-  // Place caret after trailing space
-  const sel = window.getSelection();
-  const range = document.createRange();
-  range.setStart(trailing, 1);
-  range.collapse(true);
-  sel.removeAllRanges();
-  sel.addRange(range);
 }
 
 function insertFilePillAtCaret(file) {
@@ -3628,6 +4269,186 @@ refreshApps();
   const lCloseBtn       = document.getElementById('launcher-close-btn');
   const lFoot           = document.getElementById('launcher-foot');
 
+  // ── lInput shim ──
+  // lInput is a contenteditable <div> so it can host inline pill spans for
+  // /app and /tab references. The rest of the launcher code was written
+  // against the prior <input> API, so we install getters/setters that present
+  // the same surface (value, selectionStart, selectionEnd, setSelectionRange,
+  // placeholder) but operate over serialized text that includes pill tokens.
+  function lTokenForPill(el) {
+    if (el.classList.contains('chat-app-pill')) {
+      const key = el.dataset.appKey || '';
+      const name = (el.dataset.appName || '').replace(/"/g, "'");
+      return `[app:${key} "${name}"]`;
+    }
+    if (el.classList.contains('chat-tab-pill')) {
+      const id = el.dataset.tabId || '';
+      const title = (el.dataset.tabTitle || '').replace(/"/g, "'");
+      return `[tab:${id} "${title}"]`;
+    }
+    return el.textContent || '';
+  }
+  function lSerialize(root) {
+    let out = '';
+    const walk = (parent) => {
+      parent.childNodes.forEach((n) => {
+        if (n.nodeType === Node.TEXT_NODE) {
+          out += n.nodeValue;
+        } else if (n.nodeType === Node.ELEMENT_NODE) {
+          if (n.classList && (n.classList.contains('chat-app-pill') || n.classList.contains('chat-tab-pill'))) {
+            out += lTokenForPill(n);
+          } else if (n.tagName === 'BR') {
+            out += '\n';
+          } else if (n.tagName === 'DIV' || n.tagName === 'P') {
+            if (out && !out.endsWith('\n')) out += '\n';
+            walk(n);
+          } else {
+            walk(n);
+          }
+        }
+      });
+    };
+    walk(root);
+    return out;
+  }
+  function lOffsetToRange(target) {
+    let remaining = target;
+    const result = { node: lInput, offset: 0 };
+    const visit = (n) => {
+      if (n.nodeType === Node.TEXT_NODE) {
+        if (remaining <= n.nodeValue.length) {
+          result.node = n; result.offset = remaining;
+          return true;
+        }
+        remaining -= n.nodeValue.length;
+        return false;
+      }
+      if (n.nodeType === Node.ELEMENT_NODE) {
+        if (n.classList && (n.classList.contains('chat-app-pill') || n.classList.contains('chat-tab-pill'))) {
+          const len = lTokenForPill(n).length;
+          if (remaining < len) {
+            const parent = n.parentNode;
+            const idx = Array.prototype.indexOf.call(parent.childNodes, n);
+            result.node = parent;
+            result.offset = remaining === 0 ? idx : idx + 1;
+            return true;
+          }
+          remaining -= len;
+          return false;
+        }
+        for (const c of n.childNodes) {
+          if (visit(c)) return true;
+        }
+      }
+      return false;
+    };
+    if (!visit(lInput)) {
+      result.node = lInput;
+      result.offset = lInput.childNodes.length;
+    }
+    return result;
+  }
+  function lRangeToOffset(node, offset) {
+    if (!lInput.contains(node) && node !== lInput) return 0;
+    const r = document.createRange();
+    r.setStart(lInput, 0);
+    r.setEnd(node, offset);
+    const tmp = document.createElement('div');
+    tmp.appendChild(r.cloneContents());
+    return lSerialize(tmp).length;
+  }
+  function lCaretOffset(which) {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return 0;
+    const range = sel.getRangeAt(0);
+    if (!lInput.contains(range.startContainer)) return 0;
+    const node = which === 'end' ? range.endContainer : range.startContainer;
+    const off  = which === 'end' ? range.endOffset    : range.startOffset;
+    return lRangeToOffset(node, off);
+  }
+  function lApplyCaret(start, end) {
+    if (end == null) end = start;
+    const s = lOffsetToRange(start);
+    const e = lOffsetToRange(end);
+    const r = document.createRange();
+    r.setStart(s.node, s.offset);
+    r.setEnd(e.node, e.offset);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+  Object.defineProperty(lInput, 'value', {
+    configurable: true,
+    get() { return lSerialize(lInput); },
+    set(v) {
+      lInput.innerHTML = '';
+      if (v) lInput.appendChild(document.createTextNode(String(v)));
+    },
+  });
+  Object.defineProperty(lInput, 'selectionStart', {
+    configurable: true,
+    get() { return lCaretOffset('start'); },
+  });
+  Object.defineProperty(lInput, 'selectionEnd', {
+    configurable: true,
+    get() { return lCaretOffset('end'); },
+  });
+  Object.defineProperty(lInput, 'placeholder', {
+    configurable: true,
+    get() { return lInput.dataset.placeholder || ''; },
+    set(v) { lInput.dataset.placeholder = String(v == null ? '' : v); },
+  });
+  lInput.setSelectionRange = function (s, e) {
+    try { lApplyCaret(s, e); } catch {}
+  };
+  function lPillBeforeCaret(range) {
+    const { startContainer: node, startOffset: off } = range;
+    let prev;
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (off > 0) return null;
+      prev = node.previousSibling;
+    } else {
+      if (off === 0) return null;
+      prev = node.childNodes[off - 1];
+    }
+    while (prev && prev.nodeType === Node.TEXT_NODE && prev.nodeValue === '') prev = prev.previousSibling;
+    return (prev && prev.nodeType === Node.ELEMENT_NODE && prev.classList &&
+      (prev.classList.contains('chat-app-pill') || prev.classList.contains('chat-tab-pill'))) ? prev : null;
+  }
+  function lPillAfterCaret(range) {
+    const { startContainer: node, startOffset: off } = range;
+    let next;
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (off < node.nodeValue.length) return null;
+      next = node.nextSibling;
+    } else {
+      next = node.childNodes[off];
+    }
+    while (next && next.nodeType === Node.TEXT_NODE && next.nodeValue === '') next = next.nextSibling;
+    return (next && next.nodeType === Node.ELEMENT_NODE && next.classList &&
+      (next.classList.contains('chat-app-pill') || next.classList.contains('chat-tab-pill'))) ? next : null;
+  }
+  // Splice the active /app or /tab arg span and insert a pill DOM node in
+  // place of the literal `[app:...]` / `[tab:...]` token. start/end are
+  // text-space offsets (the same ones the rest of the launcher reasons in).
+  function lInsertPill(start, end, pill) {
+    const sPos = lOffsetToRange(start);
+    const ePos = lOffsetToRange(end);
+    const r = document.createRange();
+    r.setStart(sPos.node, sPos.offset);
+    r.setEnd(ePos.node, ePos.offset);
+    r.deleteContents();
+    r.insertNode(pill);
+    const space = document.createTextNode(' ');
+    pill.parentNode.insertBefore(space, pill.nextSibling);
+    const newR = document.createRange();
+    newR.setStart(space, 1);
+    newR.collapse(true);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(newR);
+  }
+
   // State
   let mode      = 'chat';        // 'chat' | 'automation'
   let stage     = 'app';         // 'app' | 'task'
@@ -3637,12 +4458,61 @@ refreshApps();
   let activeIdx = -1;            // highlighted dropdown row
   let autos     = [];            // automation entries for selApp (automation mode)
   let allowOverlayClose = true;  // mirrors top-level config.allowOverlayClose
-  // `/app` reference mode inside the launcher task input: when the user types
-  // `/app` mid-prompt, the dropdown lists running apps (same as initial app
-  // selection) and picking one inserts an [app:key "name"] token into lInput.
-  let lAppMode  = false;         // dropdown currently showing /app candidates
-  let lAppCtx   = null;          // { filter, start, end } caret span of the /app token
+  // Slash-command palette + arg picker for the launcher task input. Two phases:
+  //  palette → user typed `/` and the dropdown lists matching commands.
+  //  arg     → cmd committed; `/cmd` text already spliced out, lInput chars
+  //            between lSlashAnchor and the caret are the filter.
+  // lAppMode / lTabMode below stay around as derived booleans because the
+  // dropdown row renderer (rowHtmlFor) already keys off them.
+  let lSlashState  = 'closed';   // 'closed' | 'palette' | 'arg'
+  let lSlashCmd    = null;       // 'app' | 'tab'
+  let lSlashAnchor = -1;         // position in lInput.value where the splice was
+  let lSlashPalCtx = null;       // { slashOffset, caretOffset, query }
+  let lAppMode  = false;         // derived: arg-phase /app picker is up
+  let lAppCtx   = null;          // derived: { filter, start, end } for current arg span
   const launcherAppRefs = new Map(); // exe → resolved meta, for submit-time apps[]
+  let lTabMode    = false;       // derived: arg-phase /tab picker is up
+  let lTabCtx     = null;        // derived: { filter, start, end } for current arg span
+  let lTabAllTabs = [];          // cached tab list for the active /tab session
+  let lTabWindowCount = 1;       // last seen window count from listTabs
+  let lTabToken   = 0;           // bumped to invalidate in-flight fetches
+  // When the caret sits right of a `/app` pill in lInput, subsequent `/`-cmds
+  // (e.g. `/tab`) scope to THAT app instead of the launcher's selApp primary.
+  let lSlashScopedExe = null;
+  const L_SLASH_COMMANDS = [
+    { name: 'app', label: '/app', hint: 'Reference a running app', arg: 'app' },
+    { name: 'tab', label: '/tab', hint: 'Reference a Chrome tab',  arg: 'tab',
+      guard: () => {
+        const meta = lScopedAppMeta();
+        return !!(meta && meta.type === 'electron' && meta.port);
+      } },
+  ];
+
+  // Walk lInput pills, return the last `/app` pill whose serialised text offset
+  // ends before `offset` (i.e. is positioned before the slash caret).
+  function lFindScopedExeAtSlash(offset) {
+    const pills = lInput.querySelectorAll('.chat-app-pill');
+    if (!pills.length) return null;
+    let last = null;
+    for (const p of pills) {
+      const parent = p.parentNode;
+      const idx = Array.prototype.indexOf.call(parent.childNodes, p);
+      const pillEnd = lRangeToOffset(parent, idx + 1);
+      if (pillEnd <= offset) last = p;
+    }
+    return last ? (last.dataset.appExe || null) : null;
+  }
+
+  function lScopedAppMeta() {
+    if (lSlashScopedExe) {
+      const ref = launcherAppRefs.get(lSlashScopedExe);
+      if (ref) return ref;
+      const r = resolveAppMeta(lSlashScopedExe);
+      if (r) return r;
+    }
+    return selApp || null;
+  }
+  let lComposing = false;
 
   function applyCloseBtnVisibility() {
     if (lCloseBtn) lCloseBtn.hidden = allowOverlayClose;
@@ -3671,8 +4541,8 @@ refreshApps();
         icon: a.Icon || '',
         // Capture live CDP port + pid at selection time so a later refreshApps()
         // race can't strip them before openChat() resolves meta. Without these,
-        // resolveAppMeta(exe) may read a stale row → meta.port=null → /tab gate
-        // refuses to open the picker (shouldOfferTabMenu requires meta.port).
+        // resolveAppMeta(exe) may read a stale row → meta.port=null → the /tab
+        // palette entry's guard hides itself and the picker never opens.
         port: a.DebugPort || null,
         pid: a.MainPid || null,
       });
@@ -3789,6 +4659,7 @@ refreshApps();
     // target directly from content: chat-messages.scrollHeight + composer +
     // foot + picker (if any) + overlay padding, capped at 72% of screen height.
     let target;
+    let scrollH = null;
     if (empty) {
       // Clear any inline cap from a previous non-empty pass so the empty card
       // hugs lRow + foot only.
@@ -3813,12 +4684,23 @@ refreshApps();
       const maxWinH = Math.min(screenCap, availCap);
       const maxScrollH = Math.max(120, maxWinH - chromeH);
       const msgsH = Math.ceil(chatMessagesEl.scrollHeight);
-      const scrollH = Math.min(msgsH + 4, maxScrollH);
+      const naturalScrollH = Math.min(msgsH + 4, maxScrollH);
+      const naturalTarget = naturalScrollH + chromeH;
+      // While streaming, content grows token-by-token. Each setBounds on the
+      // transparent frameless overlay = one DWM repaint = visible flicker, so
+      // resizing per-chunk produces a buggy growing window even with the
+      // 200ms throttle. Instead: the first time stream content would grow the
+      // window, snap straight to maxWinH and hold there. Subsequent ticks
+      // compute the same target → minDelta gate returns early → zero further
+      // resizes. Stream content scrolls inside chat-scroll. After chat:done,
+      // streaming flips off and the next tick shrinks back to natural size.
+      const streaming = !!chatStreamExe;
+      const snapToMax = streaming && naturalTarget > lastSent.h;
+      scrollH = snapToMax ? maxScrollH : naturalScrollH;
       // Drive chat-scroll height from JS so the old CSS 72vh trap (vh derived
       // from the window we are about to resize) can't fight us. Card sums to
       // its children; window matches card + overlay padding. No dead space.
-      chatScrollEl.style.maxHeight = scrollH + 'px';
-      target = scrollH + chromeH;
+      target = snapToMax ? maxWinH : naturalTarget;
     }
     const flipped = empty !== lastSent.empty;
     // During GPT streaming, scrollHeight grows by a few px per token. Each
@@ -3828,7 +4710,17 @@ refreshApps();
     // edits feel responsive.
     const streaming = !!chatStreamExe;
     const minDelta = streaming ? 120 : 6;
+    // Mid-stream no-shrink guard. After snapToMax pins the window to maxWinH,
+    // naturalTarget stays below maxWinH for the rest of the response (content
+    // fills <100% of max). Without this guard, each ~200ms tick computes
+    // target=naturalTarget < lastSent.h=maxWinH, the minDelta gate fails on
+    // the large delta, and setBounds shrinks the window — then the next tick
+    // re-snaps to max. The oscillation is the visible flicker. Hold the
+    // current height until streaming ends; the post-stream tick (streaming
+    // flips off in onChatDone) shrinks to natural size in one step.
+    if (streaming && target < lastSent.h && !immediate && !flipped) return;
     if (!immediate && !flipped && Math.abs(target - lastSent.h) < minDelta && w === lastSent.w) return;
+    if (scrollH !== null) chatScrollEl.style.maxHeight = scrollH + 'px';
     lastSent = { w, h: target, empty };
     const atBottom = chatScrollEl.scrollTop + chatScrollEl.clientHeight >= chatScrollEl.scrollHeight - 24;
     // Every resize is instant. The tween used to run 16 setBounds × 14ms on
@@ -3997,11 +4889,33 @@ refreshApps();
   // row, which re-fires the .ld-row entrance keyframe and reads as a list-
   // wide flicker on each keystroke / arrow-nav.
   function rowKeyFor(it) {
+    if (it && it.slashCmd) return `slash|${it.slashCmd.name}`;
+    if (lTabMode) return `tab|${it.id || it.url || it.title || ''}`;
     if (mode === 'automation' && stage === 'task') return `auto|${it.slug || it.name || ''}`;
     return `app|${it.type || ''}|${it.exe || it.path || it.name || ''}`;
   }
   function rowHtmlFor(it, i) {
     const active = i === activeIdx ? ' active' : '';
+    if (it && it.slashCmd) {
+      const slashIcon = '<span class="ld-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg></span>';
+      return `<div class="ld-row${active}" role="option" data-i="${i}">
+        ${slashIcon}
+        <span class="ld-text"><span class="ld-name">${escapeHtml(it.name)}</span><span class="ld-sub">${escapeHtml(it.hint || '')}</span></span>
+        <span class="ld-enter">hit <kbd>tab</kbd></span>
+      </div>`;
+    }
+    if (lTabMode) {
+      const sharedHosts = tabSharedHostSet(items);
+      const primary = tabPrimaryLabel(it, sharedHosts);
+      const secondary = tabSecondaryLabel(it, lTabWindowCount, primary);
+      const tip = [(it.title || '').trim(), (it.url || '').trim()].filter(Boolean).join(' — ');
+      const tabIcon = '<span class="ld-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"></rect><path d="M2 9h20"></path><path d="M6 6.5h.01M9 6.5h.01"></path></svg></span>';
+      return `<div class="ld-row${active}" role="option" data-i="${i}" title="${escapeHtml(tip)}">
+        ${tabIcon}
+        <span class="ld-text"><span class="ld-name">${escapeHtml(primary)}</span>${secondary ? `<span class="ld-sub">${escapeHtml(secondary)}</span>` : ''}</span>
+        <span class="ld-enter">hit <kbd>tab</kbd></span>
+      </div>`;
+    }
     if (mode === 'automation' && stage === 'task') {
       const sub = it.userMsg ? escapeHtml(String(it.userMsg).slice(0, 60)) : `${(it.steps || []).length} steps`;
       return `<div class="ld-row${active}" role="option" data-i="${i}">
@@ -4047,9 +4961,9 @@ refreshApps();
 
   function setGhost() {
     const v = lInput.value;
-    // No inline ghost while picking a /app reference — the input holds the whole
-    // prompt, not just an app name, so ghosting the app name would corrupt it.
-    if (lAppMode) { lGhost.textContent = ''; return; }
+    // No inline ghost while picking a /app or /tab reference — the input holds
+    // the whole prompt, not just a name, so ghosting it would corrupt it.
+    if (lSlashState !== 'closed' || lAppMode || lTabMode) { lGhost.textContent = ''; return; }
     if (!v || activeIdx > 0) { lGhost.textContent = ''; return; }
     const top = items[0];
     if (top && top.gptDirect) { lGhost.textContent = ''; return; }
@@ -4061,31 +4975,149 @@ refreshApps();
     }
   }
 
-  // Caret context for a `/app` token in the launcher TASK input. Two phases like
-  // the chat composer: typing the command word (/a../app) or `/app <filter>`.
-  function lAppContext() {
-    if (stage !== 'task' || mode === 'automation') return null;
+  // Detect a `/[cmd]` token at the caret. Returns the splice span + the
+  // characters typed after the slash so the palette can filter against them.
+  function lDetectSlash() {
+    if (stage !== 'task' || mode === 'automation' || lComposing) return null;
+    if (lInput.selectionStart !== lInput.selectionEnd) return null; // bail on range selection
     const caret = (lInput.selectionStart == null) ? lInput.value.length : lInput.selectionStart;
     const before = lInput.value.slice(0, caret);
-    let m = /(^|\s)\/app[ \t]+([^\n]*)$/i.exec(before);
-    if (m) { const tokLen = m[0].length - (m[1] ? m[1].length : 0); return { filter: m[2], start: caret - tokLen, end: caret }; }
-    m = /(^|\s)\/([a-zA-Z]*)$/.exec(before);
-    if (m) { const word = m[2].toLowerCase(); if (word.length >= 1 && ('app'.startsWith(word) || word.startsWith('app'))) return { filter: '', start: caret - m[2].length - 1, end: caret }; }
-    return null;
+    // Slash sits at start-of-input OR right after whitespace -- filters URLs
+    // and accidental mid-word slashes the same way the chat composer does.
+    const m = /(^|\s)\/([a-zA-Z]*)$/.exec(before);
+    if (!m) return null;
+    return {
+      slashOffset: caret - m[2].length - 1,
+      caretOffset: caret,
+      query: m[2],
+    };
+  }
+
+  function lFilterPalette(query) {
+    const q = (query || '').toLowerCase();
+    return L_SLASH_COMMANDS.filter(c => {
+      if (c.guard && !c.guard()) return false;
+      if (!q) return true;
+      return c.name.startsWith(q);
+    });
+  }
+
+  // Commit a palette command: splice `/cmd` text out of lInput, anchor the
+  // caret at that position, enter arg phase.
+  function lCommitSlashCmd(cmd) {
+    const ctx = lSlashPalCtx;
+    if (!ctx || !cmd) return;
+    // Splice the literal "/cmd" text out in DOM space so any pre-existing
+    // pills survive (the value setter would otherwise flatten them to text).
+    const s = lOffsetToRange(ctx.slashOffset);
+    const e = lOffsetToRange(ctx.caretOffset);
+    const r = document.createRange();
+    r.setStart(s.node, s.offset);
+    r.setEnd(e.node, e.offset);
+    r.deleteContents();
+    r.collapse(true);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+    lSlashAnchor = ctx.slashOffset;
+    lSlashState  = 'arg';
+    lSlashCmd    = cmd.arg;
+    lSlashPalCtx = null;
+    if (cmd.arg === 'tab' && (!lTabAllTabs || !lTabAllTabs.length)) loadLauncherTabs();
+    refreshSuggestions();
+  }
+
+  function lCloseSlash() {
+    lSlashState  = 'closed';
+    lSlashCmd    = null;
+    lSlashAnchor = -1;
+    lSlashPalCtx = null;
+    lSlashScopedExe = null;
+    lAppMode = false; lAppCtx = null;
+    lTabMode = false; lTabCtx = null;
+  }
+
+  function filterTabs(q) {
+    if (!q) return lTabAllTabs.slice(0, 8);
+    const ql = q.toLowerCase();
+    const pre = [], sub = [];
+    for (const t of lTabAllTabs) {
+      const title = (t.title || '').toLowerCase();
+      const url = (t.url || '').toLowerCase();
+      if (title.startsWith(ql) || url.startsWith(ql)) pre.push(t);
+      else if (title.includes(ql) || url.includes(ql)) sub.push(t);
+    }
+    return [...pre, ...sub].slice(0, 8);
+  }
+
+  async function loadLauncherTabs() {
+    const meta = lScopedAppMeta();
+    if (!meta || !meta.port) { lTabAllTabs = []; lTabWindowCount = 1; return; }
+    const myToken = ++lTabToken;
+    let tabs = [];
+    let res = null;
+    try {
+      res = await window.chat.listTabs(meta.port);
+      tabs = (res && Array.isArray(res.tabs)) ? res.tabs : [];
+    } catch { tabs = []; }
+    if (myToken !== lTabToken) return; // superseded
+    lTabAllTabs = tabs;
+    lTabWindowCount = (res && typeof res.windowCount === 'number') ? res.windowCount : 1;
+    if (lSlashState === 'arg' && lSlashCmd === 'tab') {
+      refreshSuggestions();
+    }
   }
 
   function refreshSuggestions() {
     const q = lInput.value.trim();
     if (stage === 'app') {
       items = filterApps(q);
-      lAppMode = false; lAppCtx = null;
+      lCloseSlash();
     }
-    else if (mode === 'automation') { items = filterAutos(q); lAppMode = false; lAppCtx = null; }
+    else if (mode === 'automation') {
+      items = filterAutos(q);
+      lCloseSlash();
+    }
     else {
-      // chat task stage: free text, EXCEPT a `/app` token opens the app list.
-      const actx = lAppContext();
-      if (actx) { lAppMode = true; lAppCtx = actx; items = filterApps(actx.filter.trim()); }
-      else { lAppMode = false; lAppCtx = null; items = []; }
+      // chat task stage: drive the slash machine.
+      if (lSlashState === 'arg') {
+        const caret = (lInput.selectionStart == null) ? lInput.value.length : lInput.selectionStart;
+        if (lSlashAnchor < 0 || caret < lSlashAnchor) {
+          lCloseSlash();
+          items = [];
+        } else {
+          const filter = lInput.value.slice(lSlashAnchor, caret);
+          if (lSlashCmd === 'app') {
+            items = filterApps(filter.trim());
+            lAppMode = true;  lAppCtx = { filter, start: lSlashAnchor, end: caret };
+            lTabMode = false; lTabCtx = null;
+          } else if (lSlashCmd === 'tab') {
+            items = filterTabs(filter.trim());
+            lTabMode = true;  lTabCtx = { filter, start: lSlashAnchor, end: caret };
+            lAppMode = false; lAppCtx = null;
+          } else {
+            items = [];
+          }
+        }
+      } else {
+        const ctx = lDetectSlash();
+        if (ctx) {
+          lSlashState  = 'palette';
+          lSlashPalCtx = ctx;
+          const prevScope = lSlashScopedExe;
+          lSlashScopedExe = lFindScopedExeAtSlash(ctx.slashOffset);
+          // Bust the /tab cache when the active scope changes — otherwise
+          // the previous scope's tabs would re-show for the new app pill.
+          if (prevScope !== lSlashScopedExe) { lTabAllTabs = []; lTabWindowCount = 1; lTabToken++; }
+          const cmds = lFilterPalette(ctx.query);
+          items = cmds.map(c => ({ slashCmd: c, name: c.label, hint: c.hint }));
+          lAppMode = false; lAppCtx = null;
+          lTabMode = false; lTabCtx = null;
+        } else {
+          lCloseSlash();
+          items = [];
+        }
+      }
     }
     activeIdx = items.length ? 0 : -1;
     renderDropdown();
@@ -4161,6 +5193,7 @@ refreshApps();
 
   async function selectApp(app) {
     selApp = app;
+    lTabAllTabs = []; lTabWindowCount = 1; lTabToken++;        // drop any prior app's tab cache
     lAppPill.hidden = false;
     lAppPillName.textContent = app.name;
     if (app.icon) { lAppPillIcon.src = app.icon; lAppPillIcon.style.display = ''; }
@@ -4187,6 +5220,8 @@ refreshApps();
     stage = 'app';
     selApp = null;
     autos = [];
+    lTabAllTabs = []; lTabWindowCount = 1; lTabToken++;
+    lCloseSlash();
     lAppPill.hidden = true;
     lInput.value = '';
     lInput.placeholder = 'Search an app or type a prompt…';
@@ -4201,21 +5236,39 @@ refreshApps();
     enterInlineChat();
   }
 
-  // Replace the active `/app` token in lInput with `[app:key "name"]` and record
-  // the app's resolved meta so submit can hand it to the backend as apps[].
+  // Replace the active /app arg span in lInput with `[app:key "name"]` and
+  // record the app's resolved meta so submit can hand it to the backend as
+  // apps[]. The span runs from lSlashAnchor (the spliced /cmd position) to the
+  // current caret.
   function pickLauncherApp(app) {
-    const ctx = lAppCtx;
-    if (!ctx || !app) return;
-    const key = appKeyFor(app.exe);
-    const token = `[app:${key} "${String(app.name || '').replace(/"/g, "'")}"] `;
-    const v = lInput.value;
-    lInput.value = v.slice(0, ctx.start) + token + v.slice(ctx.end);
-    launcherAppRefs.set(app.exe, { key, exe: app.exe, name: app.name, type: app.type, pid: app.pid || null, port: app.port || null });
-    const pos = ctx.start + token.length;
-    lAppMode = false; lAppCtx = null; items = []; activeIdx = -1;
+    if (!app) return;
+    const start = (lSlashAnchor >= 0) ? lSlashAnchor : (lAppCtx ? lAppCtx.start : -1);
+    const end = (lInput.selectionStart != null) ? lInput.selectionStart : lInput.value.length;
+    if (start < 0) return;
+    const pill = buildAppPill(app);
+    lInsertPill(start, end, pill);
+    launcherAppRefs.set(app.exe, { key: pill.dataset.appKey, exe: app.exe, name: app.name, type: app.type, pid: app.pid || null, port: app.port || null });
+    lCloseSlash();
+    items = []; activeIdx = -1;
     lDropdown.hidden = true; lGhost.textContent = '';
     lInput.focus();
-    try { lInput.setSelectionRange(pos, pos); } catch {}
+    refreshSuggestions();
+  }
+
+  // Same idea for /tab: splice the arg span with `[tab:<id> "<title>"]`. The
+  // backend forwards this token; the model interprets it via
+  // cdp_select_window({ id }) before issuing tab-scoped tools.
+  function pickLauncherTab(tab) {
+    if (!tab) return;
+    const start = (lSlashAnchor >= 0) ? lSlashAnchor : (lTabCtx ? lTabCtx.start : -1);
+    const end = (lInput.selectionStart != null) ? lInput.selectionStart : lInput.value.length;
+    if (start < 0) return;
+    const pill = buildTabPill(tab);
+    lInsertPill(start, end, pill);
+    lCloseSlash();
+    items = []; activeIdx = -1;
+    lDropdown.hidden = true; lGhost.textContent = '';
+    lInput.focus();
     refreshSuggestions();
   }
 
@@ -4275,15 +5328,103 @@ refreshApps();
     activeIdx = items.length ? 0 : -1;
     refreshSuggestions();
   });
+  lInput.addEventListener('compositionstart', () => { lComposing = true; });
+  lInput.addEventListener('compositionend', () => { lComposing = false; refreshSuggestions(); });
+
+  // Paste in a contenteditable copies rich HTML by default — sanitize to plain
+  // text so pasted tokens behave like typed ones (the slash machine reasons in
+  // text-space; stray <span>s or images would break that).
+  lInput.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const text = (e.clipboardData || window.clipboardData).getData('text');
+    if (!text) return;
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount) {
+      sel.getRangeAt(0).deleteContents();
+      sel.getRangeAt(0).insertNode(document.createTextNode(text));
+      sel.collapseToEnd();
+    }
+    lInput.dispatchEvent(new Event('input', { bubbles: true }));
+  });
 
   lInput.addEventListener('keydown', (e) => {
     const hasList = !lDropdown.hidden && items.length;
-    // `/app` reference picking: Enter/Tab insert the highlighted app token,
-    // Escape dismisses the app list without leaving the task stage. Arrow keys
-    // fall through to the normal list navigation below.
-    if (lAppMode && items.length) {
-      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickLauncherApp(items[activeIdx] || items[0]); return; }
-      if (e.key === 'Escape') { e.preventDefault(); lAppMode = false; lAppCtx = null; items = []; activeIdx = -1; lDropdown.hidden = true; lGhost.textContent = ''; setHint(); syncLauncherSize(); return; }
+    // Pills are contentEditable=false; Chromium often won't delete them on
+    // Backspace/Delete. Remove the adjacent pill ourselves so the key works.
+    if ((e.key === 'Backspace' || e.key === 'Delete')) {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount && sel.isCollapsed && lInput.contains(sel.getRangeAt(0).startContainer)) {
+        const range = sel.getRangeAt(0);
+        const pill = e.key === 'Backspace' ? lPillBeforeCaret(range) : lPillAfterCaret(range);
+        if (pill) {
+          e.preventDefault();
+          // Drop the tracking entry so collectLauncherApps doesn't resurrect it.
+          if (pill.classList.contains('chat-app-pill')) {
+            const key = pill.dataset.appKey || '';
+            for (const [exe, meta] of launcherAppRefs) {
+              if (meta.key === key) { launcherAppRefs.delete(exe); break; }
+            }
+          }
+          const newRange = document.createRange();
+          newRange.setStartBefore(pill);
+          newRange.collapse(true);
+          pill.remove();
+          if (lInput.textContent.trim() === '' && !lInput.querySelector('.chat-app-pill, .chat-tab-pill')) {
+            lInput.innerHTML = '';
+          } else {
+            sel.removeAllRanges();
+            sel.addRange(newRange);
+          }
+          refreshSuggestions();
+          return;
+        }
+      }
+    }
+    // Slash palette: Tab/Enter commits highlighted cmd, Esc closes. Arrow keys
+    // fall through to the generic list nav below.
+    if (lSlashState === 'palette' && items.length) {
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        const it = items[activeIdx] || items[0];
+        if (it && it.slashCmd) lCommitSlashCmd(it.slashCmd);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        lCloseSlash(); items = []; activeIdx = -1;
+        lDropdown.hidden = true; lGhost.textContent = '';
+        setHint(); syncLauncherSize();
+        return;
+      }
+    }
+    // Arg picker: Tab/Enter picks; Esc closes; Backspace at the splice anchor
+    // (no filter chars left) exits arg mode -- one more backspace dismisses the
+    // picker cleanly. The /cmd text is already spliced, so nothing to restore.
+    if (lSlashState === 'arg') {
+      if ((e.key === 'Enter' || e.key === 'Tab') && items.length) {
+        e.preventDefault();
+        if (lSlashCmd === 'app') pickLauncherApp(items[activeIdx] || items[0]);
+        else if (lSlashCmd === 'tab') pickLauncherTab(items[activeIdx] || items[0]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        lCloseSlash(); items = []; activeIdx = -1;
+        lDropdown.hidden = true; lGhost.textContent = '';
+        setHint(); syncLauncherSize();
+        return;
+      }
+      if (e.key === 'Backspace') {
+        const caret = (lInput.selectionStart == null) ? lInput.value.length : lInput.selectionStart;
+        const selEnd = (lInput.selectionEnd == null) ? caret : lInput.selectionEnd;
+        if (caret === lSlashAnchor && selEnd === caret) {
+          e.preventDefault();
+          lCloseSlash(); items = []; activeIdx = -1;
+          lDropdown.hidden = true; lGhost.textContent = '';
+          setHint(); syncLauncherSize();
+          return;
+        }
+      }
     }
     if (e.key === 'ArrowDown' && hasList) {
       e.preventDefault(); activeIdx = (activeIdx + 1) % items.length; renderDropdown(); setGhost(); return;
@@ -4331,7 +5472,9 @@ refreshApps();
     if (!row) return;
     const i = Number(row.dataset.i);
     if (Number.isNaN(i) || !items[i]) return;
+    if (lSlashState === 'palette' && items[i].slashCmd) { lCommitSlashCmd(items[i].slashCmd); return; }
     if (lAppMode) { pickLauncherApp(items[i]); return; }
+    if (lTabMode) { pickLauncherTab(items[i]); return; }
     if (stage === 'app') {
       if (items[i].gptDirect) chatWithGptDirect(lInput.value.trim());
       else selectApp(items[i]);
@@ -4483,6 +5626,7 @@ refreshApps();
   }
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
+    if (e.isComposing || e.keyCode === 229) return; // IME composition cancel — not ours
     // Swallow every Esc keydown (chat or launcher view) until the user
     // releases the key after a hold-to-reset. Prevents the held key from
     // immediately exiting the overlay once the reset drops us into launcher.
@@ -4516,6 +5660,7 @@ refreshApps();
   }, true);
   document.addEventListener('keyup', (e) => {
     if (e.key !== 'Escape') return;
+    if (e.isComposing || e.keyCode === 229) return; // IME composition cancel — not ours
     const wasHolding = escHoldStart > 0 || escResetFired;
     const didReset = escResetFired;
     cancelEscHold();
@@ -4523,6 +5668,10 @@ refreshApps();
     escSuppressUntilKeyup = false;
     if (!wasHolding) return;
     if (didReset) return; // suppress dismiss after a successful reset
+    // Tap-Esc during an in-flight stream stops the model (keeps transcript).
+    // Backend: chat:stop sets the abort flag + req.destroy(); the round loop
+    // breaks at the next check and emits chat:done so the renderer clears state.
+    if (view === 'chat' && chatBusy) { stopChatMessage(); return; }
     if (view === 'chat' && !chatBusy && allowOverlayClose) window.overlay.dismiss();
   }, true);
   // Window losing focus aborts the hold (the user can't see the progress and
@@ -4539,7 +5688,10 @@ refreshApps();
   });
 
   // ── Show / hide from the hotkey ──
+  // Strip the closing class on every show so a re-summon during the close
+  // fade snaps back to fully opaque without any half-state flash.
   window.overlay.onShow((data) => {
+    document.body.classList.remove('overlay-closing');
     window.overlay.getConfig().then((c) => {
       if (c) {
         allowOverlayClose = c.allowOverlayClose !== false;
@@ -4560,6 +5712,7 @@ refreshApps();
       const persistedView = sessionStorage.getItem('autobot.overlay.view');
       const persistedExe  = sessionStorage.getItem('autobot.overlay.exe');
       if (reqMode === 'chat' && persistedView === 'chat' && persistedExe && chatStore[persistedExe] && chatStore[persistedExe].length) {
+        if (typeof destroyLiveActivity === 'function' && persistedExe !== chatCurrentExe) destroyLiveActivity();
         chatCurrentExe = persistedExe;
         const meta = chatMetaStore[persistedExe];
         if (persistedExe === DIRECT_CHAT_ID) chatAppNameEl.textContent = DIRECT_CHAT_NAME;
@@ -4583,10 +5736,36 @@ refreshApps();
   window.overlay.onHide(() => {
     // Keep chat state for restore; just clear the launcher input.
     if (view === 'launcher') { lInput.value = ''; lGhost.textContent = ''; }
+    // Play the close animation, then tell main to actually hide() the window.
+    // requestAnimationFrame gives the browser a frame to commit the starting
+    // styles before the transition class is applied — without it the class
+    // change can collapse into the same frame and skip the transition.
+    const ackFinished = () => {
+      try { window.overlay.finishHide(); } catch {}
+    };
+    let done = false;
+    const onEnd = (e) => {
+      if (e && e.target !== document.body) return; // ignore bubbled child transitions
+      if (done) return;
+      done = true;
+      document.body.removeEventListener('transitionend', onEnd);
+      ackFinished();
+    };
+    document.body.addEventListener('transitionend', onEnd);
+    // Belt-and-suspenders fallback: if transitionend never fires (DevTools
+    // paused, prefers-reduced-motion stubs the transition out) ack anyway so
+    // main's own 240ms fallback never has to fire (which would look laggy).
+    setTimeout(() => { if (!done) { done = true; document.body.removeEventListener('transitionend', onEnd); ackFinished(); } }, 200);
+    requestAnimationFrame(() => {
+      document.body.classList.add('overlay-closing');
+    });
   });
 
-  // Refresh the running-apps list shortly after load so suggestions are warm.
-  setTimeout(() => { refreshApps().then(() => { if (view === 'launcher' && stage === 'app') refreshSuggestions(); }); }, 50);
+  // Refresh the running-apps list at load so suggestions are warm by first
+  // hotkey press. Runs immediately (not behind a 50 ms setTimeout) — even with
+  // backgroundThrottling disabled on the hidden overlay window, deferring
+  // the kickoff burns time the user's first-summon clock is already counting.
+  refreshApps().then(() => { if (view === 'launcher' && stage === 'app') refreshSuggestions(); }).catch(() => {});
 
   // Initial paint.
   enterLauncher('chat');
