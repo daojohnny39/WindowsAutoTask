@@ -3316,7 +3316,7 @@ async function cdpAction(port, action, args) {
   }
 }
 
-function checkCdpAlive(port) {
+function checkCdpAliveOnce(port, timeoutMs = 2000) {
   return new Promise((resolve) => {
     if (!port) return resolve(false);
     const req = http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
@@ -3324,8 +3324,16 @@ function checkCdpAlive(port) {
       res.resume();
     });
     req.on('error', () => resolve(false));
-    req.setTimeout(2000, () => { req.destroy(); resolve(false); });
+    req.setTimeout(timeoutMs, () => { req.destroy(); resolve(false); });
   });
+}
+
+async function checkCdpAlive(port, { retries = 3, delayMs = 600 } = {}) {
+  for (let i = 0; i <= retries; i++) {
+    if (await checkCdpAliveOnce(port)) return true;
+    if (i < retries) await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
+  }
+  return false;
 }
 
 // In-flight cache so renderer's first detect-apps call after launch reuses the

@@ -218,6 +218,16 @@ async function refreshApps(fromDrawer = false) {
 
       renderDrawer();
       renderWorkspace();
+
+      // Self-heal: a transient CDP startup race (e.g. Notion's slow HTTP-listener bind)
+      // can flag an app "error" on a single probe. Re-probe error'd apps once, shortly after.
+      if (!window.__cdpSelfHealPending && currentApps.some((a) => a.error && a.DebugEnabled && a.DebugPort)) {
+        window.__cdpSelfHealPending = true;
+        setTimeout(() => {
+          window.__cdpSelfHealPending = false;
+          refreshApps();
+        }, 4000);
+      }
     } catch (err) {
       setDrawerStatus(`Detection failed: ${err.message}`, 'error');
     }
@@ -4809,7 +4819,10 @@ refreshApps();
     if (syncRAF) cancelAnimationFrame(syncRAF);
     syncRAF = requestAnimationFrame(() => {
       syncRAF = 0;
-      const h = Math.ceil(launcherCard.getBoundingClientRect().height);
+      // offsetHeight ignores the in-flight `launcherIn` scale() transform;
+      // getBoundingClientRect would return the shrunk box mid-animation and
+      // cache a too-small height, clipping the card top on the next reopen.
+      const h = Math.ceil(launcherCard.offsetHeight);
       // Dedupe: every keystroke calls renderDropdown -> syncLauncherSize, but the
       // dropdown height only changes when row-count changes. Skipping no-op
       // resizes prevents the frameless transparent window from repainting on
@@ -5427,6 +5440,11 @@ refreshApps();
     if (wasInline) {
       setTimeout(() => { try { lInput.focus(); } catch {} }, 160);
     }
+    // Force a fresh resize on every launcher entry (incl. each overlay show):
+    // the dedup in syncLauncherSize would otherwise skip the corrective resize
+    // when the collapsed card measures the same as the prior session, leaving
+    // the window stuck at showOverlay's collapsedHeight and clipping the top.
+    lastSyncedH = 0;
     syncLauncherSize();
   }
 
