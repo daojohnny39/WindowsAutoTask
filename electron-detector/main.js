@@ -80,6 +80,8 @@ const AUTOMATION_TOOLS_CDP = new Set([
   'cdp_get_search_results', 'cdp_set_search_sort', 'cdp_jump_to_search_result',
   'cdp_get_pins', 'cdp_jump_to_pin', 'cdp_jump_to_reply_source',
   'cdp_open_image',
+  'cdp_open_notion_page', 'cdp_open_in_new_tab', 'cdp_open_notion_page_in_new_tab',
+  'notion_tasklist_read', 'notion_task_toggle',
 ]);
 const AUTOMATION_TOOLS_UIA = new Set([
   'uia_invoke', 'uia_set_value', 'uia_get_tree',
@@ -375,8 +377,9 @@ let appConfig = appConfigModule.load();
 let settingsWindow = null;   // decorated management window (app mgmt, auth, hotkey, logs)
 let overlayWindow = null;    // frameless transparent quick-entry overlay (primary surface)
 let overlayDragging = false; // true while the user drags the overlay by its footer (suppress blur-dismiss)
-let overlayClosing = false;  // true while the close animation is playing; suppress duplicate hides + blur loops
-let overlayCloseTimer = null; // fallback timer in case the renderer never acks the animation end
+let overlayClosing = false;  // true while a hide is in flight; suppress duplicate hides + blur loops
+let overlayCloseTimer = null; // fallback timer in case the renderer never acks the hide request
+let overlayFadeTween = null;  // setInterval handle for the BrowserWindow opacity fade tween
 let tray = null;
 let isQuitting = false;
 
@@ -517,6 +520,114 @@ function createSettingsWindow({ show = true } = {}) {
   return settingsWindow;
 }
 
+const koffi = (process.platform === 'win32') ? (() => { try { return require('koffi'); } catch { return null; } })() : null;
+
+// Hypothesis #5 from white-bar-overlay-investigation.md:
+// Win11 24H2 DWM paints an NC caption strip on transparent+frameless windows.
+// Stripping the chrome at the native Win32 level removes the area entirely so
+// DWM has nowhere to paint during overlay dismiss/show transitions.
+function stripWindowChrome(win) {
+  try {
+    if (!koffi || !win || win.isDestroyed() || process.platform !== 'win32') {
+      return;
+    }
+
+    const user32 = koffi.load('user32.dll');
+    const GetWindowLongPtrW = user32.func('intptr_t __stdcall GetWindowLongPtrW(intptr_t hWnd, int nIndex)');
+    const SetWindowLongPtrW = user32.func('intptr_t __stdcall SetWindowLongPtrW(intptr_t hWnd, int nIndex, intptr_t dwNewLong)');
+    const SetWindowPos = user32.func('bool __stdcall SetWindowPos(intptr_t hWnd, intptr_t hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags)');
+
+    const GWL_STYLE = -16;
+    const WS_CAPTION    = 0x00C00000;
+    const WS_DLGFRAME   = 0x00400000;
+    const WS_BORDER     = 0x00800000;
+    const WS_THICKFRAME = 0x00040000;
+    const WS_SYSMENU    = 0x00080000;
+    const SWP_NOMOVE      = 0x0002;
+    const SWP_NOSIZE      = 0x0001;
+    const SWP_NOZORDER    = 0x0004;
+    const SWP_NOACTIVATE  = 0x0010;
+    const SWP_FRAMECHANGED = 0x0020;
+
+    const is64Bit = process.arch === 'x64' || process.arch === 'arm64';
+    const hwndBuffer = win.getNativeWindowHandle();
+    const hwnd = is64Bit ? hwndBuffer.readBigInt64LE(0) : hwndBuffer.readInt32LE(0);
+    const style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    const styleMask = WS_CAPTION | WS_DLGFRAME | WS_BORDER | WS_THICKFRAME | WS_SYSMENU;
+    const newStyle = is64Bit
+      ? BigInt(style) & ~BigInt(styleMask)
+      : style & ~styleMask;
+
+    SetWindowLongPtrW(hwnd, GWL_STYLE, newStyle);
+    SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    console.log('[stripWindowChrome] NC chrome stripped from overlay HWND');
+  } catch (error) {
+    console.log('[stripWindowChrome] failed:', error);
+  }
+}
+
+// Diagnostic helper — dumps Win32 STYLE/EXSTYLE and child window list to stdout.
+// Zero behavior change. Wrap in try/catch so failures are always silent.
+function dumpWindowStyle(win, tag) {
+  try {
+    if (!koffi || !win || win.isDestroyed() || process.platform !== 'win32') return;
+    const user32 = koffi.load('user32.dll');
+    const GetWindowLongPtrW = user32.func('intptr_t __stdcall GetWindowLongPtrW(intptr_t hWnd, int nIndex)');
+    const GetWindowRect      = user32.func('bool __stdcall GetWindowRect(intptr_t hWnd, void* lpRect)');
+    const GetClassNameW      = user32.func('int __stdcall GetClassNameW(intptr_t hWnd, str16 lpClassName, int nMaxCount)');
+    const EnumChildWindows   = user32.func('bool __stdcall EnumChildWindows(intptr_t hWndParent, intptr_t lpEnumFunc, intptr_t lParam)');
+
+    const GWL_STYLE    = -16;
+    const GWL_EXSTYLE  = -20;
+    const WS_CAPTION       = 0x00C00000;
+    const WS_EX_LAYERED    = 0x00080000;
+
+    const is64Bit  = process.arch === 'x64' || process.arch === 'arm64';
+    const hwndBuf  = win.getNativeWindowHandle();
+    const hwnd     = is64Bit ? hwndBuf.readBigInt64LE(0) : hwndBuf.readInt32LE(0);
+
+    const style    = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    const exstyle  = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+
+    // Convert BigInt → Number for bitwise ops (safe for flag checks up to 2^31)
+    const styleN   = typeof style   === 'bigint' ? Number(style)   : style;
+    const exstyleN = typeof exstyle === 'bigint' ? Number(exstyle) : exstyle;
+
+    const layeredYN = (exstyleN & WS_EX_LAYERED) ? 'YES' : 'NO';
+    const captionYN = (styleN   & WS_CAPTION)    ? 'YES' : 'NO';
+
+    const hwndHex = typeof hwnd === 'bigint' ? hwnd.toString(16) : hwnd.toString(16);
+    console.log(`[wb-diag ${tag}] hwnd=0x${hwndHex} STYLE=0x${styleN.toString(16)} EXSTYLE=0x${exstyleN.toString(16)} LAYERED=${layeredYN} CAPTION=${captionYN}`);
+
+    // Enumerate child windows
+    const children = [];
+    const enumProto = koffi.proto('bool __stdcall EnumProc(intptr_t hWnd, intptr_t lParam)');
+    const enumCb = koffi.register((childHwnd, _lParam) => {
+      children.push(is64Bit ? childHwnd : Number(childHwnd));
+      return true;
+    }, enumProto);
+    try {
+      EnumChildWindows(hwnd, enumCb, 0);
+    } finally {
+      koffi.unregister(enumCb);
+    }
+
+    for (const ch of children) {
+      try {
+        const className = GetClassNameW(ch, null, 256);
+        const rectBuf   = Buffer.alloc(16);
+        GetWindowRect(ch, rectBuf);
+        const l = rectBuf.readInt32LE(0), t = rectBuf.readInt32LE(4);
+        const r = rectBuf.readInt32LE(8), b = rectBuf.readInt32LE(12);
+        const chHex = typeof ch === 'bigint' ? ch.toString(16) : Number(ch).toString(16);
+        console.log(`[wb-diag ${tag} child] hwnd=0x${chHex} class="${className}" rect={${l},${t},${r},${b}}`);
+      } catch {}
+    }
+  } catch (e) {
+    // Diagnostic — never throw
+  }
+}
+
 function createOverlayWindow() {
   if (overlayWindow && !overlayWindow.isDestroyed()) return overlayWindow;
   const ov = appConfig.overlay;
@@ -534,6 +645,7 @@ function createOverlayWindow() {
     frame: false,
     transparent: true,
     backgroundColor: '#00000000',
+    title: '',
     skipTaskbar: true,
     resizable: false,
     minimizable: false,
@@ -541,6 +653,13 @@ function createOverlayWindow() {
     fullscreenable: false,
     show: false,
     hasShadow: false,            // shadow drawn in CSS (Windows ignores hasShadow for transparent)
+    // Win11 DWM keeps a non-client caption strip on transparent+frameless windows
+    // unless thickFrame is explicitly disabled. The strip composites in as a
+    // ~30px light-gray bar at the top during the close fade (and historically
+    // showed the page title) even with frame:false + setTitle(''). thickFrame:
+    // false + roundedCorners:false drop the strip entirely.
+    thickFrame: false,
+    roundedCorners: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -553,6 +672,22 @@ function createOverlayWindow() {
       backgroundThrottling: false,
     },
   });
+  // Block index.html's <title>Windows Autobot</title> from being synced onto
+  // the overlay's BrowserWindow title (Electron does this via the
+  // page-title-updated event after loadFile resolves). If the title syncs,
+  // any momentary native-chrome reflow during hide() leaks that text as a
+  // white title bar flash. settingsWindow shares index.html and DOES want
+  // the real title, so we suppress only on the overlay.
+  overlayWindow.on('page-title-updated', (e) => { e.preventDefault(); });
+  overlayWindow.once('ready-to-show', () => {
+    try { overlayWindow.setTitle(''); } catch {}
+    // The overlay body fades out on dismiss; keep the compositor clear color
+    // transparent from first paint so the fade cannot reveal a white surface.
+    try { overlayWindow.webContents.setBackgroundColor('#00000000'); } catch {}
+    stripWindowChrome(overlayWindow);
+    dumpWindowStyle(overlayWindow, 'ready-to-show');
+  });
+  overlayWindow.on('show', () => { stripWindowChrome(overlayWindow); dumpWindowStyle(overlayWindow, 'show'); });
   overlayWindow.loadFile('index.html', { query: { mode: 'overlay' } });
   overlayWindow.on('blur', () => {
     // Auto-dismiss on blur, unless DevTools is what stole focus or a footer
@@ -707,10 +842,12 @@ function animateOverlayTo(width, height, { center = false, anchor = 'bottom', in
 
 // ── Overlay show / hide / toggle ──
 function showOverlay(mode /* 'chat' | 'automation' */) {
+  if (resizeTween) { clearInterval(resizeTween); resizeTween = null; }
   const ov = createOverlayWindow();
-  // Cancel any pending close: if the user resummons during the fade we abort
-  // the hide and let the renderer reset its opacity/transform back to 1.
+  // Cancel any pending close: if the user resummons before the fallback timer
+  // fires, abort the hide and let the renderer reset any closing state.
   if (overlayCloseTimer) { clearTimeout(overlayCloseTimer); overlayCloseTimer = null; }
+  cancelOverlayFade();
   overlayClosing = false;
   const width = appConfig.overlay.width;
   const height = appConfig.overlay.collapsedHeight;
@@ -718,6 +855,7 @@ function showOverlay(mode /* 'chat' | 'automation' */) {
   const bounds = { x: pos.x, y: pos.y, width, height };
   ov.setBounds(bounds);
   ov.setAlwaysOnTop(true, 'pop-up-menu');
+  try { ov.setOpacity(1); } catch {}
   ov.show();
   ov.focus();
   // Re-apply bounds AFTER show(). On Windows, a setBounds() issued while the
@@ -728,30 +866,48 @@ function showOverlay(mode /* 'chat' | 'automation' */) {
   ov.webContents.send('overlay:show', { mode: mode || 'chat' });
 }
 function hideOverlay() {
+  if (resizeTween) { clearInterval(resizeTween); resizeTween = null; }
   if (!overlayWindow || overlayWindow.isDestroyed()) return;
   if (overlayClosing) return;                  // already animating
   if (!overlayWindow.isVisible()) return;      // nothing to do
+  dumpWindowStyle(overlayWindow, 'pre-hide');
   overlayClosing = true;
   saveOverlayPos();
-  overlayWindow.setAlwaysOnTop(false);
   try { overlayWindow.webContents.send('overlay:hide'); } catch {}
-  // Fallback: if the renderer never acks (DevTools paused, transition cancelled,
-  // etc.) force the window down a hair after the CSS transition would have ended.
-  overlayCloseTimer = setTimeout(() => { finalizeHideOverlay(); }, 240);
+  // Normal path: renderer immediately acks overlay:hide-finished so the native
+  // transparent window is collapsed and hidden without a visible close wait.
+  // Fallback only covers a wedged renderer/preload IPC path.
+  overlayCloseTimer = setTimeout(() => { finalizeHideOverlay(); }, 180);
+}
+function cancelOverlayFade() {
+  // Retained as a no-op for showOverlay's defensive call; opacity tween removed.
 }
 function finalizeHideOverlay() {
+  if (resizeTween) { clearInterval(resizeTween); resizeTween = null; }
+  try { overlayWindow.webContents.setBackgroundColor('#00000000'); } catch {}
   if (overlayCloseTimer) { clearTimeout(overlayCloseTimer); overlayCloseTimer = null; }
   overlayClosing = false;
   if (!overlayWindow || overlayWindow.isDestroyed()) return;
-  if (overlayWindow.isVisible()) overlayWindow.hide();
+  // Collapse before hide as a native-window backstop. The renderer no longer
+  // waits through a close fade; this denies the native compositor any visible
+  // top-gutter interval to paint into.
+  let preHideBounds = null;
+  try { preHideBounds = overlayWindow.getBounds(); } catch {}
+  if (overlayWindow.isVisible()) {
+    try { overlayWindow.setBounds({ x: -32000, y: -32000, width: 1, height: 1 }); } catch {}
+    try { overlayWindow.hide(); } catch {}
+  }
+  dumpWindowStyle(overlayWindow, 'post-hide');
+  // Restore the pre-hide bounds so the next showOverlay() opens at the
+  // user-expected size/position even before its own setBounds re-application.
+  if (preHideBounds) { try { overlayWindow.setBounds(preHideBounds); } catch {} }
+  try { overlayWindow.setAlwaysOnTop(false); } catch {}
 }
 
-// ── Hotkey + double-tap detection ──
-// Single tap → show overlay (chat mode) immediately, no latency. A second tap
-// within the window, while the just-opened overlay is visible, switches it to
-// Automation Mode. Outside that window a tap toggles (hide if visible).
+// ── Hotkey ──
+// First tap → show overlay (chat mode). Second tap while visible → switch to
+// Automation Mode (no time window). Overlay never closes via the hotkey.
 let lastHotkeyAt = 0;
-const DOUBLE_TAP_MS = 420;
 const HOTKEY_DEBOUNCE_MS = 70; // ignore key-repeat (globalShortcut gives no key-up)
 function onHotkey() {
   const now = Date.now();
@@ -762,13 +918,8 @@ function onHotkey() {
   // Calling showOverlay() also clears overlayClosing + the fallback timer.
   const visible = overlayWindow && !overlayWindow.isDestroyed() && overlayWindow.isVisible() && !overlayClosing;
   if (visible) {
-    if (dt < DOUBLE_TAP_MS) {
-      // Second tap → Automation Mode (morph the already-open overlay).
-      overlayWindow.webContents.send('overlay:show', { mode: 'automation' });
-      overlayWindow.focus();
-    } else {
-      hideOverlay();
-    }
+    overlayWindow.webContents.send('overlay:toggle-mode');
+    overlayWindow.focus();
   } else {
     showOverlay('chat');
   }
@@ -1970,6 +2121,7 @@ const chatLogSessions = new Map(); // exe -> { file, id, startedAt, turnCount }
 const directChatStore = require('./direct-chat-store');
 const DIRECT_CHAT_ID = '__direct__';
 const DIRECT_HOSTED_TOOLS = [{ type: 'web_search' }];
+let directResetEpoch = 0;
 
 // Settle window between scrolling an off-screen click target into view and
 // reading its FINAL coordinates. Discord's virtual scrollers (server rail,
@@ -5931,7 +6083,7 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
         return;
       }
       if (meaningfulIdle >= HEARTBEAT_MS) {
-        try { sender.send('chat:thinking', { exe: meta.exe, heartbeatMs: Date.now() - startedAt, kind: 'reasoning' }); } catch {}
+        try { sender.send('chat:thinking', { exe: meta.exe, turnId: meta.turnId, heartbeatMs: Date.now() - startedAt, kind: 'reasoning' }); } catch {}
       }
     }, Math.min(HEARTBEAT_MS, HARD_TOTAL_MS ? Math.max(1000, Math.floor(HARD_TOTAL_MS / 4)) : HEARTBEAT_MS));
     if (heartbeatTimer.unref) heartbeatTimer.unref();
@@ -5951,7 +6103,7 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
         if (delta) {
           textContent += delta;
           if (partial) partial.text = textContent;
-          sender.send('chat:chunk', { delta, exe: meta.exe });
+          sender.send('chat:chunk', { delta, exe: meta.exe, turnId: meta.turnId });
         }
       } else if (t === 'response.output_item.added' && parsed.item && parsed.item.type === 'function_call') {
         const it = parsed.item;
@@ -5970,7 +6122,7 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
         // the search happening; final sources land in output_item.done below.
         const it = parsed.item;
         const query = (it.action && (it.action.query || it.action.search_query)) || '';
-        try { sender.send('chat:tool', { exe: meta.exe, callId: it.id || null, name: 'web_search', args: { query }, label: null }); } catch {}
+        try { sender.send('chat:tool', { exe: meta.exe, turnId: meta.turnId, callId: it.id || null, name: 'web_search', args: { query }, label: null }); } catch {}
       } else if (t === 'response.output_item.done' && parsed.item && parsed.item.type === 'web_search_call') {
         const it = parsed.item;
         const query = (it.action && (it.action.query || it.action.search_query)) || '';
@@ -5982,6 +6134,7 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
         try {
           sender.send('chat:tool-result', {
             exe: meta.exe,
+            turnId: meta.turnId,
             callId: it.id || null,
             name: 'web_search',
             args: { query },
@@ -5996,6 +6149,7 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
           try {
             sender.send('chat:citation', {
               exe: meta.exe,
+              turnId: meta.turnId,
               url: a.url,
               title: a.title || '',
               startIndex: typeof a.start_index === 'number' ? a.start_index : null,
@@ -6028,19 +6182,19 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
         const delta = parsed.delta;
         if (delta) {
           if (reasoningSink) reasoningSink.text += delta;
-          sender.send('chat:thinking', { exe: meta.exe, delta, kind: 'reasoning' });
+          sender.send('chat:thinking', { exe: meta.exe, turnId: meta.turnId, delta, kind: 'reasoning' });
         }
       } else if (
         t === 'response.reasoning_summary_part.added' ||
         t === 'response.reasoning_summary_text.added'
       ) {
-        sender.send('chat:thinking', { exe: meta.exe, reset: true, kind: 'reasoning' });
+        sender.send('chat:thinking', { exe: meta.exe, turnId: meta.turnId, reset: true, kind: 'reasoning' });
       } else if (
         t === 'response.reasoning_summary_part.done' ||
         t === 'response.reasoning_summary_text.done' ||
         t === 'response.reasoning_text.done'
       ) {
-        sender.send('chat:thinking', { exe: meta.exe, sectionDone: true, kind: 'reasoning' });
+        sender.send('chat:thinking', { exe: meta.exe, turnId: meta.turnId, sectionDone: true, kind: 'reasoning' });
       } else if (t === 'response.failed' || t === 'error') {
         if (settled) return;
         settled = true;
@@ -6145,6 +6299,10 @@ async function runChatSend(event, payload) {
     throw new Error('chat:send requires payload.meta with { exe, name, type, pid, port }');
   }
   const exe = meta.exe;
+  // turnId stamps every chat:* event so the renderer can drop late events from
+  // a Stop+Reset'd stream that would otherwise contaminate the next turn's bubble.
+  const turnId = (payload && typeof payload.turnId === 'number') ? payload.turnId : null;
+  meta.turnId = turnId;
   chatAbortFlags.delete(exe);
 
   // Transcript logging (toggled in config.json). Start a new per-session file
@@ -6309,6 +6467,7 @@ async function runChatSend(event, payload) {
         try {
           event.sender.send('chat:thinking', {
             exe: meta.exe,
+            turnId,
             delta: `\n[retry ${attempt}/${total} after HTTP ${status || 'network error'} — waiting ${Math.round(delayMs / 1000)}s]`,
             kind: 'reasoning',
           });
@@ -6354,7 +6513,7 @@ async function runChatSend(event, payload) {
           }
         }
         const startLabel = humanLabelFromRefInfo(refInfo);
-        event.sender.send('chat:tool', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, label: startLabel });
+        event.sender.send('chat:tool', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, label: startLabel });
 
         // Clarification: suspend the loop, render a question card in the renderer,
         // and resume this same turn once the user clicks a choice or types an answer.
@@ -6363,7 +6522,7 @@ async function runChatSend(event, payload) {
             ? parsedArgs.options.slice(0, 4).map(o => String(o).replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 120)).filter(Boolean)
             : [];
           const question = String(parsedArgs.question || '').replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 1000);
-          event.sender.send('chat:ask', { exe, callId: tc.call_id, question, options: opts });
+          event.sender.send('chat:ask', { exe, turnId, callId: tc.call_id, question, options: opts });
           const ans = await Promise.race([
             waitForUserAnswer(exe),
             new Promise((r) => setTimeout(() => r({ timedOut: true }), 10 * 60_000)), // zombie guard
@@ -6373,7 +6532,7 @@ async function runChatSend(event, payload) {
           if (ans.aborted || chatAbortFlags.get(exe)) askResult = { aborted: true };
           else if (ans.timedOut) askResult = { error: 'no_answer', hint: 'User did not answer in time. Proceed with a safe default or stop and explain what you need.' };
           else askResult = { answer: ans.answer };
-          event.sender.send('chat:tool-result', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, result: askResult, label: null, errorRaw: askResult.error || null });
+          event.sender.send('chat:tool-result', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, result: askResult, label: null, errorRaw: askResult.error || null });
           turnTrail.push({ name: tc.name, args: parsedArgs, result: askResult, refInfo: null, callId: tc.call_id, label: null });
           input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
           input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(askResult) });
@@ -6397,7 +6556,7 @@ async function runChatSend(event, payload) {
           result = { error: String(err.message || err) };
         }
         const errorRaw = (result && result.error) ? String(result.error) : null;
-        event.sender.send('chat:tool-result', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, result, label: startLabel, errorRaw });
+        event.sender.send('chat:tool-result', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, result, label: startLabel, errorRaw });
         turnTrail.push({ name: tc.name, args: parsedArgs, result, refInfo, callId: tc.call_id, label: startLabel });
         input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
         input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(result) });
@@ -6441,7 +6600,7 @@ async function runChatSend(event, payload) {
         if (!fullContent.trim()) {
           const synth = synthesiseDoneReply(turnTrail);
           fullContent = synth;
-          try { event.sender.send('chat:chunk', { delta: synth, exe }); } catch {}
+          try { event.sender.send('chat:chunk', { delta: synth, exe, turnId }); } catch {}
         }
       }
     }
@@ -6478,7 +6637,7 @@ async function runChatSend(event, payload) {
         backend: snap.backend,
       }, debugLog);
     }
-    event.sender.send('chat:done', { exe, error: errorReason, trail: turnTrail, content: fullContent });
+    event.sender.send('chat:done', { exe, turnId, error: errorReason, trail: turnTrail, content: fullContent });
   }
   return { content: fullContent, error: errorReason, trail: turnTrail, roundsUsed };
 }
@@ -6495,12 +6654,18 @@ async function runChatSend(event, payload) {
 const DIRECT_INSTRUCTIONS_BASE = `You are the Autobot direct chat assistant. No app is currently selected — the user is talking to you directly inside the Autobot overlay. Answer their questions, help them think, write, reason, search the web when useful, and reference attached files. You do not have access to any running application here; if the user asks you to act on a specific Windows app (click, type, scroll, read its UI), explain that they should open the Autobot overlay, pick that app from the launcher, and ask again — direct chat cannot drive other apps.`;
 
 async function runDirectChat(event, payload) {
+  const directTurnEpoch = directResetEpoch;
   const { token, accountId, apiKey } = getCodexAuth();
   if (!token) throw new Error('Not logged in. Click "Login with ChatGPT" first.');
   const useDirectApi = !!apiKey;
 
   const messages = (payload && payload.messages) || [];
   const attachments = Array.isArray(payload && payload.attachments) ? payload.attachments : [];
+  // turnId is renderer-assigned per send and stamped on every chat:* event we
+  // emit. Lets the renderer drop late chunks/dones from a Stop+Reset'd stream
+  // so they cannot contaminate the next turn (exe filter alone fails because
+  // direct chat reuses DIRECT_CHAT_ID across turns).
+  const turnId = (payload && typeof payload.turnId === 'number') ? payload.turnId : null;
 
   const exe = DIRECT_CHAT_ID;
   chatAbortFlags.delete(exe);
@@ -6573,7 +6738,7 @@ async function runDirectChat(event, payload) {
   let roundsUsed = 0;
   const turnTrail = [];
   const mainPartial = { text: '' };
-  const meta = { exe, name: 'Direct chat', pid: null, type: 'direct', port: null };
+  const meta = { exe, name: 'Direct chat', pid: null, type: 'direct', port: null, turnId };
 
   try {
     for (let round = 0; round < MAX_ROUNDS; round++) {
@@ -6592,7 +6757,7 @@ async function runDirectChat(event, payload) {
 
       const notifyRetry = ({ status, attempt, total, delayMs }) => {
         try {
-          event.sender.send('chat:thinking', { exe, delta: `\n[retry ${attempt}/${total} after HTTP ${status || 'network error'} — waiting ${Math.round(delayMs / 1000)}s]`, kind: 'reasoning' });
+          event.sender.send('chat:thinking', { exe, turnId, delta: `\n[retry ${attempt}/${total} after HTTP ${status || 'network error'} — waiting ${Math.round(delayMs / 1000)}s]`, kind: 'reasoning' });
         } catch {}
       };
       const { req, res } = await sendResponsesRequestWithRetry(
@@ -6636,14 +6801,14 @@ async function runDirectChat(event, payload) {
           }
         }
         const startLabel = humanLabelFromRefInfo(refInfo);
-        event.sender.send('chat:tool', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, label: startLabel });
+        event.sender.send('chat:tool', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, label: startLabel });
 
         if (tc.name === 'ask_user') {
           const opts = Array.isArray(parsedArgs.options)
             ? parsedArgs.options.slice(0, 4).map(o => String(o).replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 120)).filter(Boolean)
             : [];
           const question = String(parsedArgs.question || '').replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 1000);
-          event.sender.send('chat:ask', { exe, callId: tc.call_id, question, options: opts });
+          event.sender.send('chat:ask', { exe, turnId, callId: tc.call_id, question, options: opts });
           const ans = await Promise.race([
             waitForUserAnswer(exe),
             new Promise((r) => setTimeout(() => r({ timedOut: true }), 10 * 60_000)),
@@ -6653,7 +6818,7 @@ async function runDirectChat(event, payload) {
           if (ans.aborted || chatAbortFlags.get(exe)) askResult = { aborted: true };
           else if (ans.timedOut) askResult = { error: 'no_answer', hint: 'User did not answer in time. Proceed with a safe default or stop and explain what you need.' };
           else askResult = { answer: ans.answer };
-          event.sender.send('chat:tool-result', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, result: askResult, label: null, errorRaw: askResult.error || null });
+          event.sender.send('chat:tool-result', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, result: askResult, label: null, errorRaw: askResult.error || null });
           turnTrail.push({ name: tc.name, args: parsedArgs, result: askResult, refInfo: null, callId: tc.call_id, label: null });
           input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
           input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(askResult) });
@@ -6686,7 +6851,7 @@ async function runDirectChat(event, payload) {
           result = { error: String(err.message || err) };
         }
         const errorRaw = (result && result.error) ? String(result.error) : null;
-        event.sender.send('chat:tool-result', { exe, callId: tc.call_id, name: tc.name, args: parsedArgs, result, label: startLabel, errorRaw });
+        event.sender.send('chat:tool-result', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, result, label: startLabel, errorRaw });
         turnTrail.push({ name: tc.name, args: parsedArgs, result, refInfo, callId: tc.call_id, label: startLabel });
         input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
         input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(result) });
@@ -6705,20 +6870,21 @@ async function runDirectChat(event, payload) {
       debugLog(`[chat:send-direct] error: ${errorReason}`);
     }
   } finally {
-    const aborted = chatAbortFlags.get(exe);
-    chatAbortFlags.delete(exe);
+    const resetDuringTurn = directTurnEpoch !== directResetEpoch;
+    const aborted = chatAbortFlags.get(exe) || resetDuringTurn;
+    if (!resetDuringTurn) chatAbortFlags.delete(exe);
     activeChats.delete(exe);
     if (aborted) errorReason = 'Stopped by user';
     // Persist the turn to disk (skip if aborted before any reply or on hard error
     // with no content). Append-only, atomic write inside the store.
-    if (lastUserMsg && (fullContent || !errorReason)) {
+    if (!resetDuringTurn && lastUserMsg && (fullContent || !errorReason)) {
       try {
         directChatStore.appendTurn({ userContent: lastUserMsg, assistantContent: fullContent }, debugLog);
       } catch (err) {
         debugLog(`[chat:send-direct] persist failed: ${err.message}`);
       }
     }
-    event.sender.send('chat:done', { exe, error: errorReason, trail: turnTrail, content: fullContent });
+    event.sender.send('chat:done', { exe, turnId, error: errorReason, trail: turnTrail, content: fullContent });
   }
   return { content: fullContent, error: errorReason, trail: turnTrail, roundsUsed };
 }
@@ -6740,9 +6906,10 @@ ipcMain.handle('shell:open-external', (_event, url) => {
 ipcMain.handle('chat:reset-direct', () => {
   // Mirror chat:reset behavior for the direct sentinel: kill any in-flight
   // request, unblock a pending ask_user, then wipe the persisted history.
+  directResetEpoch += 1;
+  chatAbortFlags.set(DIRECT_CHAT_ID, true);
   const req = activeChats.get(DIRECT_CHAT_ID);
   if (req) { try { req.destroy(); } catch {} activeChats.delete(DIRECT_CHAT_ID); }
-  chatAbortFlags.delete(DIRECT_CHAT_ID);
   resolvePendingAsk(DIRECT_CHAT_ID, { aborted: true });
   return directChatStore.reset(debugLog);
 });
@@ -6936,6 +7103,10 @@ function filterCaptureItems(cap, where) {
     items = items.filter((it) => me && it.authorId === me);
   } else if (w === 'reply' || w === 'replies') {
     items = items.filter((it) => it && it.hasReply);
+  } else if (w === 'unchecked') {
+    items = items.filter((it) => it && it.checked === false);
+  } else if (w === 'checked') {
+    items = items.filter((it) => it && it.checked === true);
   }
   return items;
 }
@@ -7093,6 +7264,17 @@ function resolveItemRef(cap, path, capName) {
   let pos = null;
   for (const p of parts) {
     if (p === 'images' || p === 'pictures' || p === 'mine' || p === 'all' || p === 'reply' || p === 'replies') where = p;
+    else if (p === 'unchecked' || p === 'checked') where = p;
+    // Strip trailing field accessors that just name the capture's id field —
+    // resolveItemRef ALWAYS returns the id, so `$tasks.first.rowId` is the same
+    // as `$tasks.first`. Same for `.id` / `.messageid`.
+    else if (p === (cap.idField || '').toLowerCase() || p === 'id' || p === 'messageid' || p === 'rowid') { /* skip */ }
+    // Compound tokens like firstUnchecked / lastChecked / firstChecked / lastUnchecked
+    // — split into pos + where so the rest of the resolver picks them up.
+    else if (p === 'firstunchecked') { pos = 'first'; where = 'unchecked'; }
+    else if (p === 'lastunchecked')  { pos = 'last';  where = 'unchecked'; }
+    else if (p === 'firstchecked')   { pos = 'first'; where = 'checked'; }
+    else if (p === 'lastchecked')    { pos = 'last';  where = 'checked'; }
     else pos = p; // first | last | <index>
   }
   const items = filterCaptureItems(cap, where);
@@ -7196,7 +7378,7 @@ const APOS_SRC = "['’]";
 const SERVER_FAILURE_REGEX = new RegExp(
   '\\b(' +
     'failed|error|aborted|stuck|gave up|timed out|timeout|expired|' +
-    '(?:could|would|should|did|do|does|was|were|is|are|has|have|had|wo|ca)n' + APOS_SRC + '?t(?:\\s+(?:click|find|reach|open|complete|finish|submit|locate|navigate|scroll|paste|type|move|jump|load|fetch|read|work))?|' +
+    '(?:could|would|should|did|do|does|was|were|is|are|has|have|had|wo|ca)n' + APOS_SRC + '?t\\s+(?:click|find|reach|open|complete|finish|submit|locate|navigate|scroll|paste|type|move|jump|load|fetch|read|work)|' +
     'cannot|unable to|not able to|' +
     'stopped (?:without|before|early|short)|had to stop|ran out of|out of (?:rounds|time|budget)|' +
     '(?:before|until|when)\\s+(?:the\\s+)?(?:tool\\s+)?session\\s+(?:ended|expired|ran out|stopped|finished)|session\\s+(?:ended|expired)\\s+(?:before|without)|' +
@@ -7234,10 +7416,10 @@ const MESSAGE_REF_RULES = `DYNAMIC MESSAGE & SEARCH TARGETS — NEVER bake a mes
 function buildCodexPrompt({ meta, backend, userMsg, finalReply, trail }) {
   const toolList = backend === 'uia'
     ? '`uia_invoke`, `uia_set_value`, `uia_get_tree`'
-    : '`cdp_find`, `cdp_click`, `cdp_type`, `cdp_paste`, `cdp_press_key`, `cdp_get_text`, `cdp_get_tree`, `cdp_get_messages`, `cdp_react`, `cdp_scroll_to_message`, `cdp_scroll_messages`, `cdp_scroll`, `cdp_get_search_results`, `cdp_set_search_sort`, `cdp_jump_to_search_result`, `cdp_get_pins`, `cdp_jump_to_pin`, `cdp_jump_to_reply_source`, `cdp_open_image`';
+    : '`cdp_find`, `cdp_click`, `cdp_type`, `cdp_paste`, `cdp_press_key`, `cdp_get_text`, `cdp_get_tree`, `cdp_get_messages`, `cdp_react`, `cdp_scroll_to_message`, `cdp_scroll_messages`, `cdp_scroll`, `cdp_get_search_results`, `cdp_set_search_sort`, `cdp_jump_to_search_result`, `cdp_get_pins`, `cdp_jump_to_pin`, `cdp_jump_to_reply_source`, `cdp_open_image`, `cdp_open_notion_page`, `cdp_open_in_new_tab`, `notion_tasklist_read`, `notion_task_toggle`';
   const refRule = backend === 'uia'
     ? 'Refs (u1, u47, ...) expire between UIA snapshots. Insert a `uia_get_tree` step before each `uia_invoke` / `uia_set_value` that needs a fresh ref, and reference the element by `automationId` or `name` in the args.'
-    : 'Refs (e12, f3, ...) expire between snapshots. Replace ref-based clicks with a `cdp_find` step that captures the lookup, then reference `$<capture-name>.fN` in later steps. Prefer `cdp_find` over `cdp_get_tree` for targeted lookups.';
+    : 'Refs (e12, f3, ...) expire between snapshots. Replace ref-based clicks with a `cdp_find` step that captures the lookup, then reference `$<capture-name>.fN` in later steps. Prefer `cdp_find` over `cdp_get_tree` for targeted lookups.\n- NOTION-AWARE PRIMITIVES (use in preference to cdp_find/cdp_click + tree-walking for Notion):\n  * `cdp_open_notion_page({"pageId":"<32 hex>"})` — direct nav to any Notion page by stable page id; works even when sidebar collapsed. SINGLE-STEP recipes for "go to page X" are valid and expected — emit just this one step. ALSO use this for ANY recipe that must open TEST TASKLIST or TEST CALENDAR before doing further work — NEVER cdp_find the sidebar entry and cdp_click it; that pattern hits child spans/icons, fails to navigate, and breaks downstream cdp_find lookups for elements that only mount once the target page renders. Page ids are stable workspace constants, OK to bake literally.\n  * `notion_tasklist_read({})` — read current page\'s task rows as { rowId, content, checked, displayIndex }. Prefer over cdp_get_tree when the goal needs row identity. CAPTURE its output under a name (e.g. `"capture":"tasks"`) so later steps can reference `$tasks.<filter>.rowId` at run time — NEVER bake row ids from the trail.\n  * `notion_task_toggle({"rowId":"<32 hex>", "checked":<bool>?})` — flip a specific row\'s checkbox by stable row id. Reference the row id via `$<capture>.first.rowId` etc. — row ids are TRANSIENT per workspace state; never literal.';
   const example = backend === 'uia' ? '' : `
 EXAMPLE — user asked "go to example-community then #example-channel". Successful trail had cdp_get_tree → cdp_find("example-community ...") result_summary.matches { f1: svg(Unread, example-community ...), f2: svg(Unread, example-community ...), f3: div(treeitem, example-community ...) } → cdp_click(f3, targetElement.role=treeitem) → cdp_find("example-channel") result_summary.matches { f1: ul(channel list wrapper), f2: a(link, "Text (Active Threads)example-channel") } → cdp_click(f2, targetElement.tag=A, role=link) → cdp_get_messages.
 HOW TO PICK \`.fN\` (load-bearing — wrong fN clicks the wrong row at replay):
@@ -7914,6 +8096,14 @@ async function executeAutomationStep(step, ctx) {
       captures[step.capture] = {
         kind: 'pins', idField: 'messageId',
         items: (result && Array.isArray(result.pins)) ? result.pins : [],
+        query: capQuery,
+      };
+    } else if (step.tool === 'notion_tasklist_read') {
+      // Notion task rows — $tasks.first / $tasks.unchecked.first / $tasks.firstUnchecked
+      // resolve to a live rowId at replay so the recipe never bakes a transient id.
+      captures[step.capture] = {
+        kind: 'tasklist', idField: 'rowId',
+        items: (result && Array.isArray(result.rows)) ? result.rows : [],
         query: capQuery,
       };
     } else {

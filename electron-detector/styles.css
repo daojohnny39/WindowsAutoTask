@@ -148,6 +148,16 @@ body {
   background: var(--bg-elev-1);
 }
 
+.nav-close-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: transparent; border: 1px solid var(--border); color: var(--text-muted); cursor: pointer;
+  font-size: 14px; line-height: 1;
+  transition: background var(--dur-1), color var(--dur-1), border-color var(--dur-1);
+  -webkit-app-region: no-drag;
+  margin-left: 8px;
+}
+.nav-close-btn:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
 .codex-login-btn {
   padding: 6px 12px;
   font-size: 13px;
@@ -395,6 +405,12 @@ body {
   border-radius: 4px;
   border: 2px solid transparent;
   background-clip: padding-box;
+}
+/* Hide chat scrollbar thumb while assistant is streaming — the bar twitching
+   on every token shifts text under the cursor. Keep the 8px gutter so the
+   message area doesn't reflow when streaming ends. */
+.chat-scroll:has(.chat-msg.streaming)::-webkit-scrollbar-thumb {
+  background: transparent;
 }
 
 .app-card {
@@ -1310,73 +1326,59 @@ body {
   color: var(--text-soft);
   font-weight: 500;
 }
-.chat-clarify-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.chat-clarify-chip {
+/* Chosen answer stamped onto the card after the user submits. */
+.chat-clarify-answer {
+  align-self: flex-start;
+  max-width: 100%;
   padding: 6px 12px;
   font-size: 12.5px;
-  font-family: inherit;
-  color: var(--text-soft);
-  background: var(--bg-elev-2);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-1);
-  cursor: pointer;
-  transition: background var(--dur-1) var(--ease-out),
-              color var(--dur-1) var(--ease-out),
-              border-color var(--dur-1) var(--ease-out);
-}
-.chat-clarify-chip:hover:not(:disabled) {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-  color: var(--text-soft);
-}
-.chat-clarify-chip:disabled { cursor: default; opacity: 0.55; }
-.chat-clarify-chip.chosen {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-on);
-  opacity: 1;
-}
-.chat-clarify-custom {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-}
-.chat-clarify-input {
-  flex: 1;
-  min-width: 0;
-  padding: 7px 10px;
-  font-size: 13px;
-  font-family: inherit;
-  color: var(--text-soft);
-  background: var(--bg-elev-2);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-1);
-  outline: none;
-  transition: border-color var(--dur-1) var(--ease-out);
-}
-.chat-clarify-input:focus { border-color: var(--accent); }
-.chat-clarify-input:disabled { opacity: 0.55; }
-.chat-clarify-send {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  flex: none;
   color: var(--accent-on);
   background: var(--accent);
-  border: none;
   border-radius: var(--r-1);
-  cursor: pointer;
-  transition: background var(--dur-1) var(--ease-out), opacity var(--dur-1) var(--ease-out);
+  word-break: break-word;
 }
-.chat-clarify-send:hover:not(:disabled) { background: var(--accent-strong); }
-.chat-clarify-send:disabled { opacity: 0.4; cursor: default; }
 .chat-clarify-card.answered { border-left-color: var(--border-strong); opacity: 0.85; }
+
+/* Clarify choices render as a full-width app-selector panel (icon tile + bold
+   label + "hit tab" badge on the active row) — same look as the overlay
+   launcher app picker. Two host slots:
+     • Settings chat: parent is .chat-input-wrap → absolute, pinned just above
+       the rounded composer pill (bottom 100% + gap).
+     • Overlay chat: parent is .launcher-card directly above .launcher-row →
+       static flex child, full card width, like #launcher-dropdown.
+   Reuses .chat-tab-menu shell for the dark panel + shadow + entrance anim;
+   the clarify path skips positionMenu so these rules aren't fighting inline
+   left/bottom from the caret-anchored slash/app/tab popovers. */
+.chat-input-wrap > .chat-clarify-menu {
+  left: 0 !important;
+  right: 0 !important;
+  bottom: calc(100% + 8px) !important;
+  top: auto !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  transform-origin: bottom center;
+}
+.launcher-card > .chat-clarify-menu {
+  position: static !important;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  width: 100% !important;
+  max-width: 100% !important;
+  border: none;
+  border-bottom: 1px solid var(--border-soft);
+  border-radius: 0;
+  box-shadow: none;
+  transform-origin: bottom center;
+}
+.chat-clarify-menu .chat-tab-menu-head { display: none; }
+.chat-clarify-menu .chat-tab-menu-list {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 320px;
+}
+.chat-clarify-menu .ld-name { white-space: normal; line-height: 1.35; }
 
 /* Action row under assistant turn */
 .chat-actions {
@@ -2039,6 +2041,105 @@ body {
 .chat-welcome-title { font-size: 16px; color: var(--text-soft); font-weight: 500; }
 .chat-welcome-sub { font-size: 13px; color: var(--text-faint); }
 
+/* ─── Inline automation panel (create flow) ───
+   Takes over the chat-scroll slot inside #page-chat while the user creates an
+   automation. Composer stays mounted below. Three states (confirm/progress/
+   review) live in one panel; the review state hosts the moveable #auto-review-
+   form that also fits inside #auto-review-modal for the workspace-view path. */
+.auto-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elev-1);
+  border-top: 1px solid var(--border-soft);
+  overflow: hidden;
+  animation: chatFadeIn var(--dur-3) var(--ease-out);
+}
+.auto-panel[hidden] { display: none; }
+/* Hide chat-scroll wherever it lives (main-window keeps it inside #page-chat;
+   overlay mode reparents it into .launcher-card) while the panel is up. */
+body[data-auto-panel="open"] #chat-scroll { display: none !important; }
+/* Overlay slot: panel sits where chat-scroll did. openAutoPanel() mirrors
+   chat-scroll's inline height + maxHeight so the surface fills the same slot. */
+/* Overlay slot: panel takes chat-scroll's place above lRow. Match chat-scroll's
+   border-radius + opaque chat background so the surface reads as one card. */
+.launcher-card > .auto-panel {
+  -webkit-app-region: no-drag;
+  width: 100%;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  background: oklch(0.16 0.006 250 / 0.96);
+  border: 0;
+  border-radius: 18px 18px 0 0;
+}
+
+.auto-panel-state {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: none;
+  flex-direction: column;
+}
+.auto-panel[data-state="confirm"]  > .auto-panel-state[data-state="confirm"],
+.auto-panel[data-state="progress"] > .auto-panel-state[data-state="progress"],
+.auto-panel[data-state="review"]   > .auto-panel-state[data-state="review"] { display: flex; }
+
+.auto-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  flex-shrink: 0;
+}
+.auto-panel-title { font-size: 15px; font-weight: 600; color: var(--text); }
+
+.auto-panel-body {
+  padding: 14px 20px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  position: relative;
+}
+.auto-panel-body::-webkit-scrollbar { width: 8px; }
+.auto-panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+.auto-panel-body-center { align-items: center; justify-content: center; gap: 16px; }
+
+.auto-panel-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-soft);
+  flex-shrink: 0;
+}
+.auto-panel-foot-center { justify-content: center; }
+
+.auto-panel-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Moveable review form — reparents between #auto-review-panel-host (create
+   flow) and #auto-review-modal-host (workspace "view saved" path). */
+.auto-review-form {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.auto-modal-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 /* ─── Automation modals + entries ─── */
 .auto-modal {
   display: none;
@@ -2046,8 +2147,12 @@ body {
   inset: 0;
   background: var(--scrim);
   z-index: 1100;
+  /* Dock to the bottom-center where the launcher card lives, so automation
+     reads as the same floating surface instead of a center-screen web modal. */
+  flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-end;
+  padding: 16px;
   animation: scrimFade var(--dur-2) var(--ease-out);
 }
 .auto-modal.show { display: flex; }
@@ -2055,14 +2160,24 @@ body {
 .auto-modal-box {
   position: relative;
   background: var(--bg-elev-1);
-  border: 1px solid var(--border);
-  border-radius: var(--r-3);
-  width: min(620px, 92vw);
-  max-height: 84vh;
+  /* Match launcher-card chrome: same hairline, radius, soft floating shadow. */
+  border: 1px solid oklch(1 0 0 / 0.08);
+  border-radius: 18px;
+  width: 100%;
+  max-width: 568px;          /* overlay window is 600px wide minus 16px gutters */
+  max-height: calc(100vh - 32px);
   display: flex;
   flex-direction: column;
-  animation: popIn var(--dur-3) var(--ease-out);
+  box-shadow: 0 6px 16px -8px oklch(0.05 0.01 250 / 0.35),
+              0 2px 6px -3px oklch(0.05 0.01 250 / 0.25),
+              inset 0 1px 0 oklch(1 0 0 / 0.04);
+  transform-origin: bottom center;
+  animation: sheetUp var(--dur-3) var(--ease-out-2);
   overflow: hidden;
+}
+@keyframes sheetUp {
+  from { opacity: 0; transform: translateY(12px) scale(0.99); }
+  to   { opacity: 1; transform: none; }
 }
 .auto-modal-box-narrow { width: min(380px, 88vw); padding: 24px 28px 20px; }
 
@@ -2120,13 +2235,13 @@ body {
   font-size: 13px;
   color: var(--text);
   background: var(--bg-elev-2);
-  border-left: 2px solid var(--accent);
+  border: 1px solid var(--border-soft);
   padding: 10px 12px;
-  border-radius: 0 var(--r-1) var(--r-1) 0;
+  border-radius: var(--r-1);
   word-wrap: break-word;
   user-select: text;
 }
-.auto-modal-quote-faint { color: var(--text-soft); border-left-color: var(--border); }
+.auto-modal-quote-faint { color: var(--text-soft); }
 
 .auto-modal-trail {
   display: flex;
@@ -2155,7 +2270,7 @@ body {
   font-size: 12px;
   color: var(--text-faint);
   padding: 6px 10px;
-  background: oklch(0.72 0.13 245 / 0.08);
+  background: oklch(0.78 0.16 145 / 0.08);
   border-radius: var(--r-1);
 }
 
@@ -2233,9 +2348,9 @@ body {
   height: 0;
   border: 1.5px solid var(--accent);
   border-radius: var(--r-1);
-  background: oklch(0.72 0.13 245 / 0.06);
-  box-shadow: 0 0 0 1px oklch(0.72 0.13 245 / 0.12),
-              0 0 14px oklch(0.72 0.13 245 / 0.22);
+  background: oklch(0.78 0.16 145 / 0.06);
+  box-shadow: 0 0 0 1px oklch(0.78 0.16 145 / 0.12),
+              0 0 14px oklch(0.78 0.16 145 / 0.22);
   opacity: 0;
   pointer-events: none;
   z-index: 1;
@@ -2262,8 +2377,8 @@ body {
   animation: none;
 }
 @keyframes runCursorPulse {
-  0%, 100% { box-shadow: 0 0 0 1px oklch(0.72 0.13 245 / 0.12), 0 0 10px oklch(0.72 0.13 245 / 0.16); }
-  50%      { box-shadow: 0 0 0 1px oklch(0.72 0.13 245 / 0.22), 0 0 18px oklch(0.72 0.13 245 / 0.34); }
+  0%, 100% { box-shadow: 0 0 0 1px oklch(0.78 0.16 145 / 0.12), 0 0 10px oklch(0.78 0.16 145 / 0.16); }
+  50%      { box-shadow: 0 0 0 1px oklch(0.78 0.16 145 / 0.22), 0 0 18px oklch(0.78 0.16 145 / 0.34); }
 }
 @media (prefers-reduced-motion: reduce) {
   .auto-modal-runlog-cursor { transition: opacity var(--dur-2) var(--ease-out); animation: none; }
@@ -2298,14 +2413,15 @@ body {
 .auto-modal-runlog-row.is-done { opacity: 0.78; }
 
 /* ── Run completion overlay ── */
+/* The completion state takes over the run modal's own box (opaque, same
+   surface) instead of popping a second card over it. No modal-on-modal. */
 .run-complete {
   position: absolute;
   inset: 0;
   display: none;
   align-items: center;
   justify-content: center;
-  background: oklch(0.18 0.02 250 / 0.55);
-  backdrop-filter: blur(3px);
+  background: var(--bg-elev-1);
   z-index: 5;
 }
 .run-complete.show {
@@ -2318,10 +2434,7 @@ body {
   align-items: center;
   gap: 10px;
   padding: 28px 36px 26px;
-  background: var(--bg-elev-1);
-  border: 1px solid var(--border);
-  border-radius: var(--r-3);
-  box-shadow: 0 18px 50px oklch(0 0 0 / 0.45);
+  background: transparent;
   animation: runCompletePop var(--dur-3) var(--ease-out-2) both;
 }
 .run-complete-badge {
@@ -2629,17 +2742,23 @@ body[data-mode="overlay"] {
   height: 100vh;
   overflow: hidden;
 }
-/* Smooth dismiss animation. Transition is only present while .overlay-closing
-   is set, so the first paint on summon stays instant (no fade-in flicker).
-   will-change keeps the compositor layer warm so the fade does not jank.
-   Pointer events off during the close so a stray click cannot retrigger
-   anything on the disappearing surface. */
+/* Smooth dismiss animation. Keep the body itself as a stable transparent host:
+   animating opacity/transform on the whole WebContents can expose a full-width
+   compositor clear strip in the transparent gutter above the card. */
 body[data-mode="overlay"].overlay-closing {
+  pointer-events: none;
+}
+body[data-mode="overlay"].overlay-closing .launcher-card,
+body[data-mode="overlay"].overlay-closing .auto-modal.show .auto-modal-box {
   opacity: 0;
   transform: scale(0.985) translateY(6px);
   transition: opacity 140ms ease-out, transform 140ms ease-out;
   pointer-events: none;
   will-change: opacity, transform;
+}
+/* v7 fix — html transparent in overlay so body fade reveals desktop-transparent compositor surface, not opaque html bg */
+html:has(body[data-mode="overlay"]) {
+  background: transparent !important;
 }
 /* Everything that belongs to the full settings window is hidden in overlay. */
 body[data-mode="overlay"] .navbar,
@@ -2658,7 +2777,7 @@ body[data-mode="overlay"] .status-bar { display: none !important; }
   flex-direction: column;
   justify-content: flex-end;   /* bar pinned to the bottom; grows upward */
   align-items: center;
-  padding: 16px;
+  padding: 0;
   z-index: 50;
 }
 .launcher[hidden] { display: none; }
@@ -2823,9 +2942,9 @@ body[data-mode="overlay"] .status-bar { display: none !important; }
   transition: background var(--dur-1), color var(--dur-1);
 }
 .launcher-mode-chip[data-mode="automation"] {
-  background: oklch(0.72 0.13 245 / 0.16);
-  color: var(--info);
-  border-color: oklch(0.72 0.13 245 / 0.4);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  border-color: oklch(0.78 0.16 145 / 0.4);
 }
 
 .launcher-foot {
@@ -2962,15 +3081,6 @@ body[data-mode="overlay"][data-overlay-view="chat"] .launcher-foot {
 .chat-msg.bubble-enter {
   animation: bubbleEnter 220ms cubic-bezier(.2,.7,.2,1) both;
   transform-origin: bottom center;
-}
-
-@keyframes streamingPulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(120, 160, 255, 0.0); }
-  50%      { box-shadow: 0 0 0 6px rgba(120, 160, 255, 0.10); }
-}
-.chat-msg.chat-msg-assistant.streaming {
-  animation: streamingPulse 1400ms ease-in-out infinite;
-  border-radius: inherit;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -3122,6 +3232,10 @@ body[data-mode="overlay"] .auto-modal {
   background: transparent;
   animation: none;
 }
+body[data-mode="overlay"].auto-modal-open .launcher {
+  visibility: hidden;
+  pointer-events: none;
+}
 
 /* ── Static-composer mode ──
    Plan: keep .launcher-row visible across both launcher and chat.
@@ -3187,9 +3301,14 @@ body[data-mode="overlay"][data-overlay-view="chat"] .launcher-app-pill-x {
    visible above the overlay. */
 .launcher-card > #chat-scroll {
   -webkit-app-region: no-drag;
-  /* Height is driven by JS (sizeForChat sets max-height inline) so card +
-     window resize together with no dead gap. flex:0 0 auto keeps the scroll
-     sized to its content (capped by the inline max-height). */
+  /* Height is driven by JS (sizeForChat sets `height` inline each ~60ms
+     pulse). flex:0 0 auto + explicit px height = card sums to scroll +
+     composer with no dead gap. CSS transition interpolates between
+     pulse values so token-by-token scrollHeight growth animates smoothly
+     instead of stepping in discrete ~120px hops. During streaming the
+     window itself stays pinned at maxWinH (one setBounds per turn) so
+     this CSS-driven height growth happens entirely inside a fixed
+     window — zero DWM repaint flicker. */
   flex: 0 0 auto;
   min-height: 0;
   overflow-y: auto;
@@ -3197,6 +3316,7 @@ body[data-mode="overlay"][data-overlay-view="chat"] .launcher-app-pill-x {
   border: 0;
   border-radius: 18px 18px 0 0;
   margin: 0;
+  transition: height 220ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 .launcher-card > #chat-scroll .chat-messages {
   max-width: 100%;
@@ -3237,6 +3357,9 @@ body[data-mode="overlay"][data-overlay-view="chat"] .launcher-app-pill-x {
   .launcher-card > #chat-scroll.chat-leave {
     animation-duration: 1ms !important;
     animation-iteration-count: 1 !important;
+  }
+  .launcher-card > #chat-scroll {
+    transition: none;
   }
 }
 

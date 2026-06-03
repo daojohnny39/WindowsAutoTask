@@ -104,6 +104,11 @@ contextBridge.exposeInMainWorld('overlay', {
     ipcRenderer.on('overlay:hide', handler);
     return () => ipcRenderer.removeListener('overlay:hide', handler);
   },
+  onToggleMode: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on('overlay:toggle-mode', handler);
+    return () => ipcRenderer.removeListener('overlay:toggle-mode', handler);
+  },
   onSettingsFocusSection: (cb) => {
     const handler = (_e, data) => cb(data);
     ipcRenderer.on('settings:focus-section', handler);

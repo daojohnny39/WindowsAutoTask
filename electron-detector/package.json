@@ -12,6 +12,7 @@
     "electron-packager": "^17.1.2"
   },
   "dependencies": {
-    "katex": "^0.17.0"
+    "katex": "^0.17.0",
+    "koffi": "^3.0.2"
   }
 }

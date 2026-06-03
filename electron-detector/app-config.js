@@ -24,7 +24,7 @@ const DEFAULTS = {
   allowOverlayClose: true,
   overlay: {
     width: 600,
-    collapsedHeight: 72,   // launcher bar only
+    collapsedHeight: 90,   // launcher card only; BrowserWindow hugs the card
     dropdownMaxHeight: 280,
     chatHeight: 540,       // legacy: initial chat panel height (still consulted as fallback)
     chatWidth: 760,        // overlay width while chat panel is active (auto-clamped to display)

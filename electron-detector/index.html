@@ -71,6 +71,7 @@
       <button class="nav-link-btn" id="nav-inspector" title="Open Inspector">Inspector</button>
       <button class="codex-login-btn" id="codex-login-btn" disabled>Checkingâ€¦</button>
       <div class="codex-install-error" id="codex-install-error"></div>
+      <button class="nav-close-btn" id="nav-close-btn" type="button" title="Close window">&times;</button>
     </div>
   </nav>
 
@@ -184,6 +185,64 @@
         </div>
       </div>
     </div>
+
+    <!-- Inline automation panel: takes over the chat-scroll slot while the user
+         creates an automation. Composer stays interactive below. Escape closes
+         and restores the chat (handled in renderer.js). -->
+    <section class="auto-panel" id="auto-panel" hidden>
+      <!-- 1. Confirm trail before sending to Codex -->
+      <div class="auto-panel-state" data-state="confirm">
+        <div class="auto-panel-head">
+          <div class="auto-panel-title">Turn this into an automation?</div>
+          <button class="auto-modal-x" id="auto-confirm-close" title="Close (Esc)">×</button>
+        </div>
+        <div class="auto-panel-body">
+          <div class="auto-modal-section">
+            <div class="auto-modal-section-label">You asked</div>
+            <div class="auto-modal-quote" id="auto-confirm-user"></div>
+          </div>
+          <div class="auto-modal-section">
+            <div class="auto-modal-section-label">ChatGPT completed it with <span id="auto-confirm-count">0</span> tool call<span id="auto-confirm-plural">s</span></div>
+            <div class="auto-modal-trail" id="auto-confirm-trail"></div>
+          </div>
+          <div class="auto-modal-section">
+            <div class="auto-modal-section-label">Reply</div>
+            <div class="auto-modal-quote auto-modal-quote-faint" id="auto-confirm-reply"></div>
+          </div>
+          <div class="auto-modal-note">
+            ChatGPT will distill this into a deterministic JSON recipe. You'll review it before saving.
+          </div>
+        </div>
+        <div class="auto-panel-foot">
+          <button class="ghost-btn" id="auto-confirm-cancel">Cancel</button>
+          <button class="ghost-btn primary" id="auto-confirm-go">Generate recipe</button>
+        </div>
+      </div>
+
+      <!-- 2. Codex generating spinner -->
+      <div class="auto-panel-state" data-state="progress">
+        <div class="auto-panel-head">
+          <div class="auto-panel-title">ChatGPT is writing the recipe…</div>
+        </div>
+        <div class="auto-panel-body auto-panel-body-center">
+          <div class="spinner"></div>
+          <div class="auto-modal-progress" id="auto-progress-text">Connecting…</div>
+        </div>
+        <div class="auto-panel-foot auto-panel-foot-center">
+          <button class="ghost-btn" id="auto-progress-cancel">Cancel</button>
+        </div>
+      </div>
+
+      <!-- 3. Recipe review — the moveable #auto-review-form attaches here via JS -->
+      <div class="auto-panel-state" data-state="review">
+        <div class="auto-panel-head">
+          <div class="auto-panel-title">Review automation</div>
+          <button class="auto-modal-x" id="auto-review-close" title="Close (Esc)">×</button>
+        </div>
+        <div class="auto-panel-host" id="auto-review-panel-host"></div>
+      </div>
+    </section>
+
     <div class="chat-composer">
       <div class="chat-window-picker" id="chat-window-picker" hidden>
         <button class="cwp-trigger" id="cwp-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
@@ -225,6 +284,12 @@
           </div>
           <div class="chat-tab-menu-list" id="chat-app-menu-list"></div>
         </div>
+        <div class="chat-tab-menu chat-clarify-menu" id="chat-clarify-menu" hidden role="listbox" aria-label="Choose an answer">
+          <div class="chat-tab-menu-head">
+            <span class="chat-tab-menu-title" id="chat-clarify-menu-title">Choose an answer</span>
+          </div>
+          <div class="chat-tab-menu-list" id="chat-clarify-menu-list"></div>
+        </div>
         <div class="chat-input" id="chat-input" contenteditable="true" role="textbox"
              aria-multiline="true" data-placeholder="Send a message…"></div>
         <button class="chat-send-btn" id="chat-send-btn" title="Send (Enter)">
@@ -237,79 +302,47 @@
     </div>
   </div>
 
-  <!-- Automation: confirm trail before sending to Codex -->
-  <div class="auto-modal" id="auto-confirm-modal" role="dialog" aria-modal="true">
-    <div class="auto-modal-box">
-      <div class="auto-modal-head">
-        <div class="auto-modal-title">Turn this into an automation?</div>
-        <button class="auto-modal-x" id="auto-confirm-close" title="Close">×</button>
-      </div>
-      <div class="auto-modal-body">
-        <div class="auto-modal-section">
-          <div class="auto-modal-section-label">You asked</div>
-          <div class="auto-modal-quote" id="auto-confirm-user"></div>
-        </div>
-        <div class="auto-modal-section">
-          <div class="auto-modal-section-label">ChatGPT completed it with <span id="auto-confirm-count">0</span> tool call<span id="auto-confirm-plural">s</span></div>
-          <div class="auto-modal-trail" id="auto-confirm-trail"></div>
-        </div>
-        <div class="auto-modal-section">
-          <div class="auto-modal-section-label">Reply</div>
-          <div class="auto-modal-quote auto-modal-quote-faint" id="auto-confirm-reply"></div>
-        </div>
-        <div class="auto-modal-note">
-          ChatGPT will distill this into a deterministic JSON recipe. You'll review it before saving.
-        </div>
-      </div>
-      <div class="auto-modal-foot">
-        <button class="ghost-btn" id="auto-confirm-cancel">Cancel</button>
-        <button class="ghost-btn primary" id="auto-confirm-go">Generate recipe</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Automation: codex generating spinner -->
-  <div class="auto-modal" id="auto-progress-modal" role="dialog" aria-modal="true">
-    <div class="auto-modal-box auto-modal-box-narrow">
-      <div class="auto-modal-title">ChatGPT is writing the recipeâ€¦</div>
-      <div class="spinner" style="margin: 18px auto;"></div>
-      <div class="auto-modal-progress" id="auto-progress-text">Connectingâ€¦</div>
-      <div class="auto-modal-foot auto-modal-foot-center">
-        <button class="ghost-btn" id="auto-progress-cancel">Cancel</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Automation: recipe review (save / discard) -->
+  <!-- Automation: recipe review modal shell.
+       Used by the workspace "view saved automation" path. The review form
+       (#auto-review-form) is a moveable block — it lives inside the inline
+       #auto-panel during the create flow and slides into this modal host when
+       the user opens a saved automation from the Automations workspace. -->
   <div class="auto-modal" id="auto-review-modal" role="dialog" aria-modal="true">
     <div class="auto-modal-box">
       <div class="auto-modal-head">
         <div class="auto-modal-title">Review automation</div>
-        <button class="auto-modal-x" id="auto-review-close" title="Close">×</button>
+        <button class="auto-modal-x" id="auto-review-modal-close" title="Close">×</button>
       </div>
-      <div class="auto-modal-body">
-        <div class="auto-modal-section">
-          <div class="auto-modal-section-label">Name</div>
-          <input type="text" class="auto-modal-input" id="auto-review-name" placeholder="Automation name">
-        </div>
-        <div class="auto-modal-section">
-          <div class="auto-modal-section-label">Steps (<span id="auto-review-count">0</span>) · click a step to change it, ✕ to remove, or add one below</div>
-          <div class="auto-modal-steps" id="auto-review-steps"></div>
-        </div>
-        <div class="auto-modal-error" id="auto-review-error"></div>
+      <div class="auto-modal-host" id="auto-review-modal-host">
+        <!-- Moveable review form (body + foot). Reparented at runtime between
+             this modal host (workspace "view saved" path) and the inline
+             #auto-panel review state (create flow). -->
+        <div id="auto-review-form" class="auto-review-form">
+          <div class="auto-modal-body">
+            <div class="auto-modal-section">
+              <div class="auto-modal-section-label">Name</div>
+              <input type="text" class="auto-modal-input" id="auto-review-name" placeholder="Automation name">
+            </div>
+            <div class="auto-modal-section">
+              <div class="auto-modal-section-label">Steps (<span id="auto-review-count">0</span>) · click a step to change it, ✕ to remove, or add one below</div>
+              <div class="auto-modal-steps" id="auto-review-steps"></div>
+            </div>
+            <div class="auto-modal-error" id="auto-review-error"></div>
 
-        <button class="auto-modal-link" id="auto-review-toggle-json" type="button">&#9656; Show technical view (JSON)</button>
-        <div class="auto-modal-json-wrap" id="auto-review-json-wrap" hidden>
-          <textarea class="auto-modal-recipe auto-modal-json" id="auto-review-json" spellcheck="false"></textarea>
-          <div class="auto-modal-error" id="auto-review-json-error"></div>
-          <div class="auto-modal-json-foot">
-            <button class="ghost-btn" id="auto-review-json-save">Apply JSON changes</button>
+            <button class="auto-modal-link" id="auto-review-toggle-json" type="button">&#9656; Show technical view (JSON)</button>
+            <div class="auto-modal-json-wrap" id="auto-review-json-wrap" hidden>
+              <textarea class="auto-modal-recipe auto-modal-json" id="auto-review-json" spellcheck="false"></textarea>
+              <div class="auto-modal-error" id="auto-review-json-error"></div>
+              <div class="auto-modal-json-foot">
+                <button class="ghost-btn" id="auto-review-json-save">Apply JSON changes</button>
+              </div>
+            </div>
+          </div>
+          <div class="auto-modal-foot">
+            <button class="ghost-btn" id="auto-review-discard">Discard</button>
+            <button class="ghost-btn primary" id="auto-review-save">Save automation</button>
           </div>
         </div>
-      </div>
-      <div class="auto-modal-foot">
-        <button class="ghost-btn" id="auto-review-discard">Discard</button>
-        <button class="ghost-btn primary" id="auto-review-save">Save automation</button>
       </div>
     </div>
   </div>

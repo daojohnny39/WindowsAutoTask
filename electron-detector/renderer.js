@@ -725,6 +725,10 @@ function renderUiaElements(container, elements) {
 
 inspectorRefresh.addEventListener('click', refreshElements);
 
+// ── Nav close (settings window) ──
+const navCloseBtn = document.getElementById('nav-close-btn');
+if (navCloseBtn) navCloseBtn.addEventListener('click', () => window.close());
+
 // ── Codex login ──
 const codexBtn         = document.getElementById('codex-login-btn');
 const codexInstallErr  = document.getElementById('codex-install-error');
@@ -846,6 +850,15 @@ let chatStreamExe      = null;
 let chatBusy           = false;
 let chatStreamSources  = [];        // collected URL citations for the streaming assistant msg
 
+// Per-turn token used to drop stale chat:* IPC events after a Stop / Reset.
+// Backend stamps every chat:* send with the turnId it received from sendChatMessage;
+// renderer keeps `currentTurnId` and discards events whose id no longer matches.
+// Plain `data.exe` filtering is not enough — direct chat reuses DIRECT_CHAT_ID
+// across turns, so a late chat:chunk from an aborted stream would contaminate the
+// next turn's bubble without this guard.
+let currentTurnId = 0;
+let nextTurnId    = 1;
+
 let thinkingBuffer     = '';
 let thinkingFallback   = '';
 let reasoningStartMs   = 0;
@@ -897,6 +910,7 @@ function resolveAppMeta(exe, name) {
 
 async function openChat(appName, exe, metaOverride) {
   if (typeof destroyLiveActivity === 'function') destroyLiveActivity();
+  closeClarify(); // switching chats drops any pending choice menu
   chatCurrentExe = exe;
   chatAppNameEl.textContent = appName;
   if (!chatStore[exe]) chatStore[exe] = [];
@@ -936,6 +950,7 @@ async function openChat(appName, exe, metaOverride) {
 // hidden and agent.ensure is skipped — direct mode has no app context.
 async function openDirectChat() {
   if (typeof destroyLiveActivity === 'function') destroyLiveActivity();
+  closeClarify(); // switching chats drops any pending choice menu
   chatCurrentExe = DIRECT_CHAT_ID;
   chatAppNameEl.textContent = DIRECT_CHAT_NAME;
   const meta = { exe: DIRECT_CHAT_ID, name: 'GPT-5.5', type: 'direct', pid: null, port: null };
@@ -957,7 +972,7 @@ async function openDirectChat() {
   try { sessionStorage.setItem('autobot.overlay.exe', DIRECT_CHAT_ID); } catch {}
 }
 
-chatBackBtn.addEventListener('click', () => switchPage('workspace'));
+chatBackBtn.addEventListener('click', () => { closeAutoPanel(); switchPage('workspace'); });
 
 // ── Window picker (multi-window apps, e.g. several Chrome windows) ──
 // Surfaces above the composer ONLY when the open chat is scoped to an Electron
@@ -1165,6 +1180,12 @@ document.addEventListener('keydown', (e) => {
 
 async function resetCurrentChat() {
   if (!chatCurrentExe) return;
+  closeAutoPanel(); // drop any in-flight automation surface before clearing the chat it was scoped to
+  // Invalidate any in-flight turn BEFORE telling main to abort. Stale chat:chunk /
+  // chat:done events from the cancelled stream arrive a few ticks later, but
+  // currentTurnId=0 makes the renderer drop them so they cannot contaminate the
+  // next turn's bubble or push partial content into chatStore.
+  currentTurnId = 0;
   if (chatCurrentExe === DIRECT_CHAT_ID) {
     try { await window.chat.resetDirect(); } catch (err) { console.warn('resetDirect failed', err); }
   } else {
@@ -1486,6 +1507,7 @@ function flushStreamMarkdown() {
 }
 window.chat.onChunk((data) => {
   if (data.exe !== chatCurrentExe) return;
+  if (data.turnId != null && data.turnId !== currentTurnId) return; // stale stream after Stop/Reset
   const wasEmpty = !chatStreamContent;
   chatStreamContent += data.delta;
   hideThinking();
@@ -1507,6 +1529,7 @@ window.chat.onChunk((data) => {
 
 window.chat.onThinking((data) => {
   if (data.exe !== chatCurrentExe) return;
+  if (data.turnId != null && data.turnId !== currentTurnId) return;
   if (data.reset) thinkingBuffer = '';
   if (data.delta) thinkingBuffer += data.delta;
   if (data.heartbeatMs !== undefined) {
@@ -1522,6 +1545,7 @@ window.chat.onThinking((data) => {
 
 window.chat.onTool((data) => {
   if (data.exe !== chatCurrentExe) return;
+  if (data.turnId != null && data.turnId !== currentTurnId) return;
   if (data.name === 'ask_user') return; // rendered as a clarify card, not a tool line
   hideThinking();
   // Cancel any pending error-flash revert; the new start phrase takes over the top line.
@@ -1575,6 +1599,7 @@ window.chat.onTool((data) => {
 // Sources footer when chat:done lands. Ignore events for stale streams.
 window.chat.onCitation((data) => {
   if (data.exe !== chatStreamExe) return;
+  if (data.turnId != null && data.turnId !== currentTurnId) return;
   if (!data.url) return;
   if (chatStreamSources.some(s => s.url === data.url)) return;
   chatStreamSources.push({ url: data.url, title: data.title || '' });
@@ -1587,6 +1612,7 @@ window.chat.onToolResult((data) => {
   const pending = data.callId ? pendingToolPills.get(data.callId) : null;
   if (data.callId) pendingToolPills.delete(data.callId);
   if (data.exe !== chatCurrentExe) return;
+  if (data.turnId != null && data.turnId !== currentTurnId) return;
   if (data.name === 'ask_user') return; // card already reflects the answer
   const args = data.args || (pending && pending.args) || {};
   const label = data.label || (pending && pending.label) || null;
@@ -1651,84 +1677,123 @@ window.chat.onToolResult((data) => {
   repinAboveThinking();
 });
 
-// Clarifying-question card (mid-turn). Appended directly to the message list like
-// tool lines — transient until chat:done re-renders, after which the Q&A persists
-// via the turn trail (ask_user shows there). Answering does NOT call renderChat.
+// Clarifying-question handling (mid-turn `ask_user`). The question text is shown
+// as a transient `#chat-clarify-card` in the message list (scrollback context +
+// where the chosen answer is stamped). The CHOICES render in a floating
+// `#chat-clarify-menu` above the composer — same look + keyboard model as the
+// app-selector dropdown: Up/Down highlight, Tab submits the highlight. The user
+// can also type a custom answer in the main composer and hit Enter; an empty
+// composer + Enter submits the highlighted choice. Choices stay mouse-clickable.
+const CLARIFY_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M9 12l2 2 4-4"></path></svg>';
+
+// { exe, callId, options:[], idx } while an ask_user clarify awaits an answer.
+let clarifyState = null;
+
 window.chat.onAsk((data) => {
   if (data.exe !== chatCurrentExe) return;
+  if (data.turnId != null && data.turnId !== currentTurnId) return;
   hideThinking();
-
+  // Clear any competing UI: a stale slash/app/tab dropdown or a previous
+  // unanswered clarify (rapid re-ask) must not overlap or get mis-stamped.
+  closeSlash();
+  closeClarify();
   const old = document.getElementById('chat-clarify-card');
   if (old) old.remove();
 
   const exe = data.exe;
+  const options = (Array.isArray(data.options) ? data.options : [])
+    .map((o) => String(o == null ? '' : o).trim()).filter(Boolean);
+
+  // Transient transcript card — question only; answer is stamped on submit.
   const card = document.createElement('div');
   card.className = 'chat-clarify-card';
   card.id = 'chat-clarify-card';
-
   const q = document.createElement('div');
   q.className = 'chat-clarify-question';
   q.textContent = data.question || 'Which option do you want?';
   card.appendChild(q);
-
-  const opts = Array.isArray(data.options) ? data.options : [];
-  if (opts.length) {
-    const optsRow = document.createElement('div');
-    optsRow.className = 'chat-clarify-options';
-    opts.forEach((opt) => {
-      const chip = document.createElement('button');
-      chip.type = 'button';
-      chip.className = 'chat-clarify-chip';
-      chip.textContent = opt;
-      chip.addEventListener('click', () => answerClarify(card, opt));
-      optsRow.appendChild(chip);
-    });
-    card.appendChild(optsRow);
-  }
-
-  const customRow = document.createElement('div');
-  customRow.className = 'chat-clarify-custom';
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.className = 'chat-clarify-input';
-  input.placeholder = opts.length ? 'Or type a custom answer…' : 'Type your answer…';
-  const sendBtn = document.createElement('button');
-  sendBtn.type = 'button';
-  sendBtn.className = 'chat-clarify-send';
-  sendBtn.innerHTML = CHAT_SEND_ICON;
-  sendBtn.disabled = true;
-  const sync = () => { sendBtn.disabled = !input.value.trim(); };
-  input.addEventListener('input', sync);
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); if (input.value.trim()) answerClarify(card, input.value); }
-  });
-  sendBtn.addEventListener('click', () => { if (input.value.trim()) answerClarify(card, input.value); });
-  customRow.appendChild(input);
-  customRow.appendChild(sendBtn);
-  card.appendChild(customRow);
-
   chatMessagesEl.appendChild(card);
   scrollChatToBottom();
-  // Let the user answer via the card; main composer stays disabled (busy).
-  setTimeout(() => { try { input.focus(); } catch {} }, 0);
 
-  card._exe = exe;
+  clarifyState = { exe, callId: data.callId || null, options, idx: 0 };
+
+  if (options.length) {
+    renderClarifyMenu();
+    clarifyMenuEl.hidden = false;
+    // No positionMenu — clarify menu pins full-width above .chat-input-wrap via CSS
+    // (app-selector look), unlike the caret-anchored slash/app/tab popovers.
+    if (typeof window.__overlaySizeForChat === 'function') {
+      requestAnimationFrame(() => window.__overlaySizeForChat({ immediate: true }));
+    }
+  }
+  // Focus the main composer so typing a custom answer works immediately.
+  setTimeout(() => { try { chatInput.focus(); } catch {} }, 0);
 });
 
-function answerClarify(card, answer) {
-  const text = (answer || '').trim();
-  if (!text || card.classList.contains('answered')) return;
-  const exe = card._exe || chatCurrentExe;
-  window.chat.answer({ exe, answer: text });
-  card.classList.add('answered');
-  card.querySelectorAll('.chat-clarify-chip').forEach((c) => {
-    c.disabled = true;
-    if (c.textContent === text) c.classList.add('chosen');
-  });
-  const input = card.querySelector('.chat-clarify-input');
-  const sendBtn = card.querySelector('.chat-clarify-send');
-  if (input) { input.disabled = true; if (!card.querySelector('.chat-clarify-chip.chosen')) input.value = text; }
-  if (sendBtn) sendBtn.disabled = true;
+function renderClarifyMenu() {
+  if (!clarifyState || !clarifyState.options.length) return;
+  // Render rows in the launcher app-selector look (.ld-row): icon tile, bold
+  // label, and a "hit tab" badge that appears on the active row. Identical
+  // visual + keyboard model to the overlay app picker.
+  const rows = clarifyMenuListEl.children;
+  if (rows.length === clarifyState.options.length) {
+    // Patch in place: only flip .active so the ldRowIn entrance keyframe does
+    // not re-fire on every arrow press (would read as a list-wide flicker).
+    for (let i = 0; i < rows.length; i++) {
+      const on = i === clarifyState.idx;
+      rows[i].classList.toggle('active', on);
+      rows[i].setAttribute('aria-selected', on);
+    }
+  } else {
+    clarifyMenuListEl.innerHTML = clarifyState.options.map((opt, i) => `
+      <div class="ld-row${i === clarifyState.idx ? ' active' : ''}" role="option"
+           data-i="${i}" aria-selected="${i === clarifyState.idx}">
+        <span class="ld-icon">${CLARIFY_GLYPH_SVG}</span>
+        <span class="ld-text"><span class="ld-name">${escapeHtml(opt)}</span></span>
+        <span class="ld-enter">hit <kbd>tab</kbd></span>
+      </div>`).join('');
+  }
+  const ar = clarifyMenuListEl.querySelector('.ld-row.active');
+  if (ar) ar.scrollIntoView({ block: 'nearest' });
+}
+
+// Hide the floating choice menu and drop pending state. Idempotent — safe to
+// call from turn-end / context-switch sites even when no clarify is pending.
+function closeClarify() {
+  clarifyState = null;
+  if (clarifyMenuEl) {
+    clarifyMenuEl.hidden = true;
+    clarifyMenuListEl.innerHTML = '';
+  }
+  if (typeof window.__overlaySizeForChat === 'function') {
+    requestAnimationFrame(() => window.__overlaySizeForChat({ immediate: true }));
+  }
+}
+
+function answerClarify(answer) {
+  // Capture-then-null so a key-repeat Enter or a fast mouse click can't double-submit.
+  const state = clarifyState;
+  if (!state) return;
+  const text = String(answer == null ? '' : answer).trim();
+  if (!text) return; // empty highlight w/ no options → ignore
+  clarifyState = null;
+  window.chat.answer({ exe: state.exe, answer: text });
+
+  // Stamp the chosen answer onto the transcript card.
+  const card = document.getElementById('chat-clarify-card');
+  if (card && !card.classList.contains('answered')) {
+    card.classList.add('answered');
+    const ans = document.createElement('div');
+    ans.className = 'chat-clarify-answer';
+    ans.textContent = text;
+    card.appendChild(ans);
+  }
+
+  // Consume any typed custom text and tear down the floating menu.
+  clearChatInput();
+  closeClarify();
+  try { chatInput.focus(); } catch {}
+
   // Model resumes the turn.
   thinkingFallback = 'thinking…';
   thinkingBuffer = '';
@@ -2268,6 +2333,7 @@ function renderTrailPills(trail) {
 
 window.chat.onDone((data) => {
   if (data.exe !== chatStreamExe) return;
+  if (data.turnId != null && data.turnId !== currentTurnId) return; // stale stream finalized after Stop/Reset
   hideThinking();
   // Drain any pending coalesced markdown render so the final bubble paints
   // the complete content before chat:done's renderChat() replaces it.
@@ -2316,6 +2382,7 @@ window.chat.onDone((data) => {
   thinkingFallback = '';
   reasoningStartMs = 0;
   setChatBusy(false);
+  closeClarify(); // turn ended (done/abort) — drop any stale choice menu
   // Destroy live activity strip BEFORE renderChat — the canonical "Show N
   // actions" trail block on the assistant turn takes over.
   destroyLiveActivity();
@@ -2372,6 +2439,9 @@ async function sendChatMessage(forcedText, forcedApps) {
   chatStreamExe = chatCurrentExe;
   chatStreamSources = [];
 
+  const turnId = nextTurnId++;
+  currentTurnId = turnId;
+
   const isDirect = chatCurrentExe === DIRECT_CHAT_ID;
   const meta = isDirect
     ? (chatMetaStore[DIRECT_CHAT_ID] || { exe: DIRECT_CHAT_ID, name: 'GPT-5.5', type: 'direct', pid: null, port: null })
@@ -2384,9 +2454,9 @@ async function sendChatMessage(forcedText, forcedApps) {
 
   try {
     if (isDirect) {
-      await window.chat.sendDirect({ messages: apiMessages, attachments: fileAttachments, apps: appRefs });
+      await window.chat.sendDirect({ turnId, messages: apiMessages, attachments: fileAttachments, apps: appRefs });
     } else {
-      await window.chat.send({ meta, messages: apiMessages, attachments: fileAttachments, apps: appRefs });
+      await window.chat.send({ turnId, meta, messages: apiMessages, attachments: fileAttachments, apps: appRefs });
     }
   } catch (err) {
     hideThinking();
@@ -2434,6 +2504,39 @@ chatInput.addEventListener('keydown', (e) => {
         return;
       }
     }
+  }
+  // Clarify pending (mid-turn ask_user): own Up/Down/Tab/Enter like a modal.
+  // Up/Down highlight a choice, Tab submits the highlight, Enter submits a typed
+  // custom answer (or the highlight when the composer is empty). Letters/Shift+
+  // Enter fall through so the user can type a multiline custom answer.
+  if (clarifyState) {
+    const opts = clarifyState.options;
+    if (e.key === 'ArrowDown' && opts.length) {
+      e.preventDefault();
+      clarifyState.idx = Math.min(opts.length - 1, clarifyState.idx + 1);
+      renderClarifyMenu();
+      return;
+    }
+    if (e.key === 'ArrowUp' && opts.length) {
+      e.preventDefault();
+      clarifyState.idx = Math.max(0, clarifyState.idx - 1);
+      renderClarifyMenu();
+      return;
+    }
+    if (e.key === 'Tab' && opts.length) {
+      e.preventDefault();
+      answerClarify(opts[clarifyState.idx]);
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      const custom = serializeChatInput().trim();
+      if (custom) answerClarify(custom);
+      else if (opts.length) answerClarify(opts[clarifyState.idx]);
+      return; // never falls through to sendChatMessage
+    }
+    // Esc: no special handling — global hold-Esc still aborts the turn, which
+    // fires onDone → closeClarify() cleanup.
   }
   // Slash palette open: arrow keys navigate, Tab/Enter commits highlighted cmd,
   // Esc closes. Letters fall through to contenteditable so the filter shrinks
@@ -2541,6 +2644,9 @@ const slashMenuEl     = document.getElementById('chat-slash-menu');
 const slashMenuListEl = document.getElementById('chat-slash-menu-list');
 const tabMenuEl       = document.getElementById('chat-tab-menu');
 const tabMenuListEl   = document.getElementById('chat-tab-menu-list');
+const clarifyMenuEl      = document.getElementById('chat-clarify-menu');
+const clarifyMenuListEl  = document.getElementById('chat-clarify-menu-list');
+const clarifyMenuTitleEl = document.getElementById('chat-clarify-menu-title');
 
 const TAB_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"></rect><path d="M2 9h20"></path><path d="M6 6.5h.01M9 6.5h.01"></path></svg>';
 
@@ -3096,6 +3202,19 @@ tabMenuListEl.addEventListener('mousemove', (e) => {
   const i = parseInt(row.dataset.i, 10);
   if (!Number.isNaN(i) && i !== argIdx) { argIdx = i; renderArgMenu(); }
 });
+clarifyMenuListEl.addEventListener('mousedown', (e) => {
+  const row = e.target.closest('.ld-row');
+  if (!row || !clarifyState) return;
+  e.preventDefault(); // keep composer focus
+  const i = parseInt(row.dataset.i, 10);
+  if (!Number.isNaN(i) && clarifyState.options[i]) answerClarify(clarifyState.options[i]);
+});
+clarifyMenuListEl.addEventListener('mousemove', (e) => {
+  const row = e.target.closest('.ld-row');
+  if (!row || !clarifyState) return;
+  const i = parseInt(row.dataset.i, 10);
+  if (!Number.isNaN(i) && i !== clarifyState.idx) { clarifyState.idx = i; renderClarifyMenu(); }
+});
 
 document.addEventListener('selectionchange', () => {
   if (slashState === 'closed' || document.activeElement !== chatInput) return;
@@ -3342,7 +3461,16 @@ function canAutomate(m) {
   return true;
 }
 
-const autoConfirmModal   = document.getElementById('auto-confirm-modal');
+// Inline automation panel (replaces the create-flow confirm/progress/review
+// modals). The workspace "view saved" path still uses #auto-review-modal as a
+// thin shell — the review form (#auto-review-form) is reparented between the
+// two on demand so we don't duplicate DOM.
+const pageChatEl         = document.getElementById('page-chat');
+const autoPanel          = document.getElementById('auto-panel');
+const autoReviewForm     = document.getElementById('auto-review-form');
+const autoReviewPanelHost = document.getElementById('auto-review-panel-host');
+const autoReviewModalHost = document.getElementById('auto-review-modal-host');
+
 const autoConfirmClose   = document.getElementById('auto-confirm-close');
 const autoConfirmCancel  = document.getElementById('auto-confirm-cancel');
 const autoConfirmGo      = document.getElementById('auto-confirm-go');
@@ -3352,11 +3480,11 @@ const autoConfirmPlural  = document.getElementById('auto-confirm-plural');
 const autoConfirmTrail   = document.getElementById('auto-confirm-trail');
 const autoConfirmReply   = document.getElementById('auto-confirm-reply');
 
-const autoProgressModal  = document.getElementById('auto-progress-modal');
 const autoProgressText   = document.getElementById('auto-progress-text');
 const autoProgressCancel = document.getElementById('auto-progress-cancel');
 
-const autoReviewModal    = document.getElementById('auto-review-modal');
+const autoReviewModal      = document.getElementById('auto-review-modal');
+const autoReviewModalClose = document.getElementById('auto-review-modal-close');
 const autoReviewClose    = document.getElementById('auto-review-close');
 const autoReviewName     = document.getElementById('auto-review-name');
 const autoReviewCount    = document.getElementById('auto-review-count');
@@ -3387,8 +3515,91 @@ let activeCodexJob    = null;     // jobId for cancel
 let reviewState       = null;     // { meta, steps, userMsg, finalReply }
 let activeRunId       = null;
 
-function showAutoModal(el) { el.classList.add('show'); }
-function hideAutoModal(el) { el.classList.remove('show'); }
+function syncAutoModalChrome() {
+  const anyOpen = !!document.querySelector('.auto-modal.show');
+  document.body.classList.toggle('auto-modal-open', anyOpen);
+}
+function showAutoModal(el) {
+  el.classList.add('show');
+  syncAutoModalChrome();
+}
+function hideAutoModal(el) {
+  el.classList.remove('show');
+  syncAutoModalChrome();
+}
+
+// Inline automation panel — confirm → progress → review live in one surface
+// that takes over the chat-scroll slot inside #page-chat. Escape closes the
+// panel and restores the chat (handler at the global keydown listener).
+function ensureReviewFormIn(host) {
+  if (autoReviewForm.parentElement !== host) host.appendChild(autoReviewForm);
+}
+function openAutoPanel(state) {
+  if (state === 'review') ensureReviewFormIn(autoReviewPanelHost);
+  autoPanel.dataset.state = state;
+  autoPanel.hidden = false;
+  pageChatEl.classList.add('auto-panel-open');
+  // Overlay mode hides #page-chat and reparents #chat-scroll into the launcher
+  // card. To stay visible in that mode we slot the panel into the same parent.
+  // Body-level data attr drives the chat-scroll hide rule so it works in both
+  // overlay (chat-scroll lives in .launcher-card) and main-window modes.
+  const slot = chatScrollEl.parentElement;
+  if (slot && slot !== pageChatEl && autoPanel.parentElement !== slot) {
+    slot.insertBefore(autoPanel, chatScrollEl);
+  }
+  document.body.dataset.autoPanel = 'open';
+  // Snap the overlay window to max-chat height immediately. sizeForChat reads
+  // maxScrollH (not panel.scrollHeight) when the panel is up, so this is one
+  // setBounds — no per-rAF growth pass as the body lays out.
+  if (typeof window.__overlaySizeForChat === 'function') {
+    window.__overlaySizeForChat({ immediate: true });
+  }
+}
+function closeAutoPanel() {
+  if (autoPanel.hidden) return false;
+  const wasState = autoPanel.dataset.state;
+  // Progress state with an in-flight codex job: cancel before tearing down.
+  if (wasState === 'progress' && activeCodexJob) {
+    try { window.automation.cancelCreate(activeCodexJob); } catch {}
+    activeCodexJob = null;
+  }
+  autoPanel.hidden = true;
+  delete autoPanel.dataset.state;
+  pageChatEl.classList.remove('auto-panel-open');
+  delete document.body.dataset.autoPanel;
+  autoPanel.style.height = '';
+  autoPanel.style.maxHeight = '';
+  // Return the panel to its home parent (#page-chat above .chat-composer) so
+  // it doesn't follow chat-scroll if the user back-navigates the overlay.
+  if (autoPanel.parentElement !== pageChatEl) {
+    const composer = pageChatEl.querySelector('.chat-composer');
+    if (composer) pageChatEl.insertBefore(autoPanel, composer);
+    else pageChatEl.appendChild(autoPanel);
+  }
+  // Resize overlay back to chat content now that the panel is gone.
+  if (typeof window.__overlaySizeForChat === 'function') {
+    requestAnimationFrame(() => window.__overlaySizeForChat({ immediate: true }));
+  }
+  pendingAutomation = null;
+  // Only clear reviewState if we were in/leaving the review state — the modal
+  // (workspace-view) path owns reviewState independently.
+  if (wasState === 'review') reviewState = null;
+  resetReviewJsonView();
+  return true;
+}
+function isAutoPanelOpen() { return !autoPanel.hidden; }
+
+// Workspace "view saved" path — drops the review form into the modal host.
+function openReviewModal() {
+  ensureReviewFormIn(autoReviewModalHost);
+  showAutoModal(autoReviewModal);
+}
+function closeReviewModal() {
+  hideAutoModal(autoReviewModal);
+  reviewState = null;
+  resetReviewJsonView();
+}
+function isReviewModalOpen() { return autoReviewModal.classList.contains('show'); }
 
 function summariseArgs(args) {
   if (!args || typeof args !== 'object') return '';
@@ -3732,26 +3943,20 @@ function openAutomateConfirm(msg) {
       <span class="auto-modal-trail-args">${escapeHtml(summariseArgs(t.args))} → ${escapeHtml(summariseResult(t.result))}</span>
     </div>`;
   }).join('');
-  showAutoModal(autoConfirmModal);
+  openAutoPanel('confirm');
 }
 
-function closeAutomateConfirm() {
-  hideAutoModal(autoConfirmModal);
-  pendingAutomation = null;
-}
-
-autoConfirmClose.addEventListener('click', closeAutomateConfirm);
-autoConfirmCancel.addEventListener('click', closeAutomateConfirm);
+autoConfirmClose.addEventListener('click', closeAutoPanel);
+autoConfirmCancel.addEventListener('click', closeAutoPanel);
 
 autoConfirmGo.addEventListener('click', async () => {
   if (!pendingAutomation) return;
   const payload = pendingAutomation;
-  closeAutomateConfirm();
+  // Transition confirm → progress without leaving the panel.
   autoProgressText.textContent = 'Connecting…';
-  showAutoModal(autoProgressModal);
+  openAutoPanel('progress');
   try {
     const result = await window.automation.create(payload);
-    hideAutoModal(autoProgressModal);
     activeCodexJob = null;
     openRecipeReview({
       meta: payload.meta,
@@ -3761,19 +3966,12 @@ autoConfirmGo.addEventListener('click', async () => {
       backend: result.backend,
     });
   } catch (err) {
-    hideAutoModal(autoProgressModal);
     activeCodexJob = null;
     showCreateError(err.message || String(err), payload);
   }
 });
 
-autoProgressCancel.addEventListener('click', async () => {
-  if (activeCodexJob) {
-    try { await window.automation.cancelCreate(activeCodexJob); } catch {}
-  }
-  hideAutoModal(autoProgressModal);
-  activeCodexJob = null;
-});
+autoProgressCancel.addEventListener('click', () => { closeAutoPanel(); });
 
 window.automation.onCodexProgress((data) => {
   if (data && data.jobId && !activeCodexJob) activeCodexJob = data.jobId;
@@ -3793,7 +3991,7 @@ function resetReviewJsonView() {
 }
 
 function showCreateError(msg, payload) {
-  // Reuse review modal layout for error display
+  // Reuse review form layout for error display
   reviewState = { meta: payload.meta, steps: [], userMsg: payload.userMsg, finalReply: payload.finalReply, isError: true };
   autoReviewName.value = '';
   autoReviewName.disabled = false;
@@ -3804,7 +4002,7 @@ function showCreateError(msg, payload) {
   autoReviewDiscard.textContent = 'Close';
   autoReviewToggleJson.style.display = 'none';
   resetReviewJsonView();
-  showAutoModal(autoReviewModal);
+  openAutoPanel('review');
 }
 
 function openRecipeReview({ meta, userMsg, finalReply, steps, backend }) {
@@ -3818,7 +4016,7 @@ function openRecipeReview({ meta, userMsg, finalReply, steps, backend }) {
   autoReviewDiscard.textContent = 'Discard';
   autoReviewToggleJson.style.display = '';
   resetReviewJsonView();
-  showAutoModal(autoReviewModal);
+  openAutoPanel('review');
   setTimeout(() => autoReviewName.focus(), 100);
 }
 
@@ -3828,8 +4026,15 @@ function suggestName(userMsg) {
   return cleaned.length > 60 ? cleaned.slice(0, 57) + '…' : cleaned;
 }
 
-autoReviewClose.addEventListener('click', () => { hideAutoModal(autoReviewModal); reviewState = null; });
-autoReviewDiscard.addEventListener('click', () => { hideAutoModal(autoReviewModal); reviewState = null; });
+// Discard/close/save handlers branch on where the moveable form currently
+// lives — panel (create flow) vs modal (workspace view saved).
+function closeActiveReviewSurface() {
+  if (autoReviewForm.parentElement === autoReviewModalHost) closeReviewModal();
+  else closeAutoPanel();
+}
+autoReviewClose.addEventListener('click', closeAutoPanel);              // panel head X
+autoReviewModalClose.addEventListener('click', closeReviewModal);        // modal head X
+autoReviewDiscard.addEventListener('click', closeActiveReviewSurface);   // form foot Discard
 
 autoReviewSave.addEventListener('click', async () => {
   if (!reviewState || reviewState.isError) return;
@@ -3841,8 +4046,7 @@ autoReviewSave.addEventListener('click', async () => {
       userMsg: reviewState.userMsg,
       finalReply: reviewState.finalReply,
     });
-    hideAutoModal(autoReviewModal);
-    reviewState = null;
+    closeActiveReviewSurface();
     // Surface a short status in chat
     addChatMessage('system', 'Automation saved. Find it in the Automations tab.');
     refreshAutomationsForApp(chatCurrentExe);
@@ -4022,7 +4226,7 @@ async function handleAutomationAction(act, id) {
     autoReviewDiscard.textContent = 'Close';
     autoReviewToggleJson.style.display = '';
     resetReviewJsonView();
-    showAutoModal(autoReviewModal);
+    openReviewModal();
     return;
   }
   if (act === 'run') {
@@ -4200,8 +4404,8 @@ autoRunStop.addEventListener('click', () => {
   if (activeRunId) window.automation.stop(activeRunId);
   autoRunStop.style.display = 'none';
 });
-autoRunClose.addEventListener('click', () => { hideAutoModal(autoRunModal); });
-autoRunDone.addEventListener('click', () => { hideAutoModal(autoRunModal); });
+autoRunClose.addEventListener('click', () => { hideAutoModal(autoRunModal); window.__overlayResetAfterRun?.(); });
+autoRunDone.addEventListener('click', () => { hideAutoModal(autoRunModal); window.__overlayResetAfterRun?.(); });
 autoRunCompleteBtn.addEventListener('click', () => {
   // Only dismiss the overlay — leave the run log (and any error) visible
   // underneath. The foot Close button is what exits the modal.
@@ -4248,8 +4452,7 @@ refreshApps();
   document.body.dataset.mode = APP_MODE;
   if (APP_MODE !== 'overlay') return;
 
-  const OVERLAY_PAD = 16;                 // matches .launcher padding in CSS
-  let cfg = { width: 600, collapsedHeight: 72, dropdownMaxHeight: 280, chatHeight: 540, runHeight: 560 };
+  let cfg = { width: 600, collapsedHeight: 90, dropdownMaxHeight: 280, chatHeight: 540, runHeight: 560 };
   let WIN_W = cfg.width;
 
   const launcher        = document.getElementById('launcher');
@@ -4606,7 +4809,7 @@ refreshApps();
     if (syncRAF) cancelAnimationFrame(syncRAF);
     syncRAF = requestAnimationFrame(() => {
       syncRAF = 0;
-      const h = Math.ceil(launcherCard.getBoundingClientRect().height) + OVERLAY_PAD * 2;
+      const h = Math.ceil(launcherCard.getBoundingClientRect().height);
       // Dedupe: every keystroke calls renderDropdown -> syncLauncherSize, but the
       // dropdown height only changes when row-count changes. Skipping no-op
       // resizes prevents the frameless transparent window from repainting on
@@ -4649,104 +4852,114 @@ refreshApps();
   }
   function sizeForChat(opts) {
     const immediate = !!(opts && opts.immediate);
-    const empty = chatIsEmpty();
+    // When the inline automation panel is up, it occupies the chat-scroll slot
+    // and drives window height instead. chat-scroll is hidden via the
+    // body[data-auto-panel] CSS rule, but the panel still needs the same
+    // chromeH + natural-content + maxHeight clamp logic to fit on-screen.
+    const panelOpen = !autoPanel.hidden;
+    const empty = panelOpen ? false : chatIsEmpty();
     const w = chatWinW();
-    // Static-composer layout: launcher-card is `display:flex` inside `.launcher`
-    // (position:fixed, inset:0) so its height is upper-bounded by the window.
-    // Measuring cardH and then sizing the window to it is circular — when the
-    // window is small, chat-scroll's flex slot collapses (to ~52px) even though
-    // chat-messages.scrollHeight is much larger. Instead, compute the window
-    // target directly from content: chat-messages.scrollHeight + composer +
-    // foot + picker (if any) + overlay padding, capped at 72% of screen height.
-    let target;
-    let scrollH = null;
+    const streaming = !panelOpen && !!chatStreamExe;
+    const flipped = empty !== lastSent.empty;
+
     if (empty) {
-      // Clear any inline cap from a previous non-empty pass so the empty card
-      // hugs lRow + foot only.
+      // Empty card hugs lRow + foot only. Clear any inline height/cap from a
+      // previous non-empty pass so the next sizeForChat from a small content
+      // size starts fresh.
+      chatScrollEl.style.height = '';
       chatScrollEl.style.maxHeight = '';
       const cardH = Math.ceil(launcherCard.getBoundingClientRect().height);
-      target = cardH + OVERLAY_PAD * 2;
-    } else {
-      const lRowH = Math.ceil(lRow.getBoundingClientRect().height) || 52;
-      const footEl = document.querySelector('.launcher-foot');
-      const footH = footEl ? Math.ceil(footEl.getBoundingClientRect().height) : 30;
-      const cwpVisible = chatWindowPickerEl && !chatWindowPickerEl.hidden
-        && chatWindowPickerEl.parentNode === launcherCard;
-      const cwpH = cwpVisible ? Math.ceil(chatWindowPickerEl.getBoundingClientRect().height) + 6 : 0;
-      const screenH = (window.screen && window.screen.availHeight) || 900;
-      const chromeH = lRowH + footH + cwpH + 6 + OVERLAY_PAD * 2;
-      const screenCap = Math.floor(screenH * 0.85);
-      // Use the lower of (screen-fraction cap) and (what main can actually
-      // grant from current window position). Without the main cap we'd ask
-      // for a window taller than the desktop and the card would overflow
-      // off-screen above the viewport.
-      const availCap = cachedAvailH > 0 ? cachedAvailH : screenCap;
-      const maxWinH = Math.min(screenCap, availCap);
-      const maxScrollH = Math.max(120, maxWinH - chromeH);
-      const msgsH = Math.ceil(chatMessagesEl.scrollHeight);
-      const naturalScrollH = Math.min(msgsH + 4, maxScrollH);
-      const naturalTarget = naturalScrollH + chromeH;
-      // While streaming, content grows token-by-token. Each setBounds on the
-      // transparent frameless overlay = one DWM repaint = visible flicker, so
-      // resizing per-chunk produces a buggy growing window even with the
-      // 200ms throttle. Instead: the first time stream content would grow the
-      // window, snap straight to maxWinH and hold there. Subsequent ticks
-      // compute the same target → minDelta gate returns early → zero further
-      // resizes. Stream content scrolls inside chat-scroll. After chat:done,
-      // streaming flips off and the next tick shrinks back to natural size.
-      const streaming = !!chatStreamExe;
-      const snapToMax = streaming && naturalTarget > lastSent.h;
-      scrollH = snapToMax ? maxScrollH : naturalScrollH;
-      // Drive chat-scroll height from JS so the old CSS 72vh trap (vh derived
-      // from the window we are about to resize) can't fight us. Card sums to
-      // its children; window matches card + overlay padding. No dead space.
-      target = snapToMax ? maxWinH : naturalTarget;
+      const target = cardH;
+      if (!immediate && !flipped && Math.abs(target - lastSent.h) < 6 && w === lastSent.w) return;
+      lastSent = { w, h: target, empty };
+      window.overlay.resize(w, target, { anchor: 'bottom', instant: true });
+      setTimeout(() => { refreshAvailH(); }, 32);
+      return;
     }
-    const flipped = empty !== lastSent.empty;
-    // During GPT streaming, scrollHeight grows by a few px per token. Each
-    // setBounds on the transparent frameless overlay = one DWM repaint = one
-    // visible flicker, so coalesce growth into multi-line hops (~120px ≈ 5
-    // lines). Non-streaming UI keeps the tight 6px gate so launcher / msg-list
-    // edits feel responsive.
-    const streaming = !!chatStreamExe;
-    const minDelta = streaming ? 120 : 6;
-    // Mid-stream no-shrink guard. After snapToMax pins the window to maxWinH,
-    // naturalTarget stays below maxWinH for the rest of the response (content
-    // fills <100% of max). Without this guard, each ~200ms tick computes
-    // target=naturalTarget < lastSent.h=maxWinH, the minDelta gate fails on
-    // the large delta, and setBounds shrinks the window — then the next tick
-    // re-snaps to max. The oscillation is the visible flicker. Hold the
-    // current height until streaming ends; the post-stream tick (streaming
-    // flips off in onChatDone) shrinks to natural size in one step.
-    if (streaming && target < lastSent.h && !immediate && !flipped) return;
-    if (!immediate && !flipped && Math.abs(target - lastSent.h) < minDelta && w === lastSent.w) return;
-    if (scrollH !== null) chatScrollEl.style.maxHeight = scrollH + 'px';
-    lastSent = { w, h: target, empty };
+
+    const lRowH = Math.ceil(lRow.getBoundingClientRect().height) || 52;
+    const footEl = document.querySelector('.launcher-foot');
+    const footH = footEl ? Math.ceil(footEl.getBoundingClientRect().height) : 30;
+    const cwpVisible = chatWindowPickerEl && !chatWindowPickerEl.hidden
+      && chatWindowPickerEl.parentNode === launcherCard;
+    const cwpH = cwpVisible ? Math.ceil(chatWindowPickerEl.getBoundingClientRect().height) + 6 : 0;
+    // Clarify menu, when present, slots into launcherCard between chat-scroll
+    // and lRow as a static flex child (see CSS `.launcher-card > .chat-clarify-menu`).
+    // Its height is real overlay chrome — if we don't subtract it from the
+    // scroll cap, the window comes back too short on the next reopen and the
+    // top of chat-scroll gets clipped off-viewport above the card.
+    const clarifyVisible = chatClarifyMenuEl && !chatClarifyMenuEl.hidden
+      && chatClarifyMenuEl.parentNode === launcherCard;
+    const clarifyH = clarifyVisible ? Math.ceil(chatClarifyMenuEl.getBoundingClientRect().height) + 6 : 0;
+    const screenH = (window.screen && window.screen.availHeight) || 900;
+    const chromeH = lRowH + footH + cwpH + clarifyH + 6;
+    const screenCap = Math.floor(screenH * 0.85);
+    // Use the lower of (screen-fraction cap) and (what main can actually
+    // grant from current window position). Without the main cap we'd ask
+    // for a window taller than the desktop and the card would overflow
+    // off-screen above the viewport.
+    const availCap = cachedAvailH > 0 ? cachedAvailH : screenCap;
+    const maxWinH = Math.min(screenCap, availCap);
+    const maxScrollH = Math.max(120, maxWinH - chromeH);
+    // Panel surface drives sizing when open; otherwise use chat-messages.
+    // Panel always takes the full available slot (maxScrollH) — sizing it to
+    // content would animate through several growth steps as the body lays out
+    // (head/foot first, then trail, then quote), which reads as a slow expand.
+    // One snap to max gets the user there in a single overlay resize.
+    const targetEl  = panelOpen ? autoPanel : chatScrollEl;
+    const msgsH = panelOpen ? maxScrollH : Math.ceil(chatMessagesEl.scrollHeight);
+    const naturalScrollH = Math.min(msgsH + (panelOpen ? 0 : 4), maxScrollH);
+    const naturalTarget = naturalScrollH + chromeH;
+
+    // Drive chat-scroll inner height from JS so CSS `transition: height 220ms`
+    // can interpolate between pulse values. With explicit px height the
+    // browser tweens token-by-token growth instead of snapping per render.
+    // maxHeight cap keeps long replies from overshooting the window.
+    targetEl.style.height = naturalScrollH + 'px';
+    targetEl.style.maxHeight = maxScrollH + 'px';
+
     const atBottom = chatScrollEl.scrollTop + chatScrollEl.clientHeight >= chatScrollEl.scrollHeight - 24;
-    // Every resize is instant. The tween used to run 16 setBounds × 14ms on
-    // the empty↔non-empty flip and the first chat-mode size to look smooth,
-    // but each tween step DWM-repaints the transparent frameless window — the
-    // animation IS the flicker. One setBounds = one flicker; tweening turns a
-    // single state change into ~16 visible flashes. Static target only.
-    window.overlay.resize(w, target, { anchor: 'bottom', instant: true });
-    // setBounds is synchronous on the main side but the renderer hasn't seen
-    // the new viewport yet. Refresh the cap and re-pin scroll on the next tick.
+
+    if (streaming) {
+      // Streaming path: snap window to maxWinH ONCE on first growth pass and
+      // hold for the rest of the stream. Zero further setBounds = zero DWM
+      // flicker. The visible card grows smoothly via the CSS height
+      // transition above — card sits at bottom of window (anchor:'bottom' +
+      // flex flex-end), so growth happens upward into the transparent halo.
+      // chat:done flips chatStreamExe → null; the next sizeForChat falls
+      // through to the idle branch below and shrinks the window back to
+      // natural fit in one setBounds.
+      if (!immediate && lastSent.h >= maxWinH && !flipped && w === lastSent.w) {
+        if (atBottom) requestAnimationFrame(() => { chatScrollEl.scrollTop = chatScrollEl.scrollHeight; });
+        return;
+      }
+      lastSent = { w, h: maxWinH, empty };
+      window.overlay.resize(w, maxWinH, { anchor: 'bottom', instant: true });
+      setTimeout(() => { refreshAvailH(); }, 32);
+      requestAnimationFrame(() => { chatScrollEl.scrollTop = chatScrollEl.scrollHeight; });
+      return;
+    }
+
+    // Idle path (not streaming): window matches natural content size. 6px
+    // deadband so launcher composer keystrokes don't re-resize.
+    if (!immediate && !flipped && Math.abs(naturalTarget - lastSent.h) < 6 && w === lastSent.w) return;
+    lastSent = { w, h: naturalTarget, empty };
+    window.overlay.resize(w, naturalTarget, { anchor: 'bottom', instant: true });
     setTimeout(() => { refreshAvailH(); }, 32);
     if (atBottom) requestAnimationFrame(() => { chatScrollEl.scrollTop = chatScrollEl.scrollHeight; });
   }
   function scheduleChatResize() {
     // Trailing-edge throttle: if a tick is already pending, let it fire
-    // instead of resetting it. Pure debounce here meant a continuous token
-    // stream (chunks faster than `delay`) kept pushing the timer forward and
-    // the window never grew until the stream paused or finished — chat view
-    // stayed collapsed for the whole reply. Throttling guarantees a resize
-    // lands at most `delay`ms after the first dirty chunk, mid-stream.
+    // instead of resetting it. Pure debounce meant a continuous token stream
+    // (chunks faster than `delay`) kept pushing the timer forward and the
+    // window never grew until the stream paused. Throttling guarantees a
+    // resize lands at most `delay`ms after the first dirty chunk.
     if (chatResizeTimer) return;
-    // Streaming bursts MutationObserver callbacks per token. A 60ms tick still
-    // lets ~16 setBounds/sec through, which DWM-flickers the transparent
-    // frameless window. Stretch to ~200ms while a turn is streaming so growth
-    // lands in discrete steps; 60ms for normal edits.
-    const delay = chatStreamExe ? 200 : 60;
+    // Uniform 60ms throttle. Streaming path no longer calls setBounds per
+    // pulse (snap-once-and-hold to maxWinH), so DWM flicker concern is gone.
+    // The CSS height transition on .launcher-card > #chat-scroll interpolates
+    // between 60ms pulse values, animating mid-stream growth smoothly.
+    const delay = 60;
     chatResizeTimer = setTimeout(() => {
       chatResizeTimer = null;
       if (chatResizeRAF) cancelAnimationFrame(chatResizeRAF);
@@ -4774,7 +4987,18 @@ refreshApps();
     if (chatResizeTimer) { clearTimeout(chatResizeTimer); chatResizeTimer = null; }
     if (chatResizeRAF) { cancelAnimationFrame(chatResizeRAF); chatResizeRAF = null; }
   }
-  function sizeForRun()   { window.overlay.resize(WIN_W, cfg.runHeight, { center: true }); }
+  // Grow upward from current bottom edge so the run modal fits inside the
+  // overlay window without re-centering on screen. Centering would (a) make the
+  // modal appear mid-screen instead of docked at the launcher's position, and
+  // (b) cause hideOverlay → saveOverlayPos to persist the centered bounds —
+  // shifting every subsequent hotkey-open of the overlay.
+  function sizeForRun()   {
+    window.overlay.resize(WIN_W, cfg.runHeight, { anchor: 'bottom' });
+    lastSyncedH = -1; // window now differs from launcher card height; force next syncLauncherSize to actually resize
+  }
+  // Exposed so the autoRun modal close handlers (which live outside this IIFE)
+  // can shrink the overlay back to the launcher's natural height after a run.
+  window.__overlayResetAfterRun = () => { lastSyncedH = -1; syncLauncherSize(); };
 
   // ── Inline chat panel: static-composer mode ──
   // The launcher-row at the bottom IS the composer — across both launcher and
@@ -4790,6 +5014,7 @@ refreshApps();
   const chatInputEl = document.getElementById('chat-input');
   const chatTabMenuEl = document.getElementById('chat-tab-menu');
   const chatAppMenuEl = document.getElementById('chat-app-menu');
+  const chatClarifyMenuEl = document.getElementById('chat-clarify-menu');
   const chatWindowPickerEl = document.getElementById('chat-window-picker');
   const chatHeaderEl = pageChat.querySelector('.chat-header');
   const chatComposerEl = pageChat.querySelector('.chat-composer');
@@ -4806,7 +5031,14 @@ refreshApps();
     }
   }
   function enterInlineChat() {
-    if (inlineChatActive) { sizeForChat({ immediate: true }); return; }
+    if (inlineChatActive) {
+      refreshAvailH().then(() => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => sizeForChat({ immediate: true }));
+        });
+      });
+      return;
+    }
     inlineChatActive = true;
     view = 'chat';
     document.body.dataset.overlayView = 'chat';
@@ -4815,6 +5047,7 @@ refreshApps();
       chatInput: saveAnchor(chatInputEl),
       tabMenu: saveAnchor(chatTabMenuEl),
       appMenu: saveAnchor(chatAppMenuEl),
+      clarifyMenu: saveAnchor(chatClarifyMenuEl),
       chatScroll: saveAnchor(chatScrollEl),
       windowPicker: saveAnchor(chatWindowPickerEl),
     };
@@ -4826,6 +5059,13 @@ refreshApps();
     // Reparent chat-scroll and the multi-window picker above lRow.
     if (chatScrollEl) launcherCard.insertBefore(chatScrollEl, lRow);
     if (chatWindowPickerEl) launcherCard.insertBefore(chatWindowPickerEl, chatScrollEl || lRow);
+    // Clarify menu sits between chat-scroll and lRow — full-width across the
+    // launcher card, same slot/look as the launcher-dropdown app-selector. The
+    // question card lives in chat-scroll (transcript) and therefore renders
+    // just ABOVE this choices panel. Slotting clarify into .launcher-input-stack
+    // would constrain width to the middle column only; inserting it BEFORE
+    // chat-scroll would put choices above the question, which we don't want.
+    if (chatClarifyMenuEl) launcherCard.insertBefore(chatClarifyMenuEl, lRow);
     // pageChat still in main tree but its children moved out — keep .active off
     // so chat-empty / chat-header CSS quirks elsewhere don't kick in.
     pageChat.classList.remove('active', 'chat-enter', 'chat-leave', 'inline-enter');
@@ -4859,8 +5099,10 @@ refreshApps();
       lastSent = { w: 0, h: 0, empty: false };
       pageChat.classList.remove('active', 'inline-enter', 'chat-leave', 'chat-empty');
       chatScrollEl.classList.remove('chat-leave');
-      // Drop the inline max-height sizeForChat set during chat mode; next
-      // enter re-derives it from the new chat-messages content.
+      // Drop the inline height + max-height sizeForChat set during chat mode;
+      // next enter re-derives them from the new chat-messages content. Also
+      // strip them in the empty branch of sizeForChat for the same reason.
+      chatScrollEl.style.height = '';
       chatScrollEl.style.maxHeight = '';
       inputStack.classList.remove('has-chat-input');
       // Restore all four reparented nodes to their original anchors.
@@ -4868,6 +5110,7 @@ refreshApps();
         restoreAnchor(chatInputEl, inlineSaved.chatInput);
         restoreAnchor(chatTabMenuEl, inlineSaved.tabMenu);
         restoreAnchor(chatAppMenuEl, inlineSaved.appMenu);
+        restoreAnchor(chatClarifyMenuEl, inlineSaved.clarifyMenu);
         restoreAnchor(chatScrollEl, inlineSaved.chatScroll);
         restoreAnchor(chatWindowPickerEl, inlineSaved.windowPicker);
       }
@@ -4921,6 +5164,7 @@ refreshApps();
       return `<div class="ld-row${active}" role="option" data-i="${i}">
         <span class="ld-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg></span>
         <span class="ld-text"><span class="ld-name">${escapeHtml(it.name)}</span><span class="ld-sub">${sub}</span></span>
+        <span class="ld-enter">hit <kbd>enter</kbd></span>
       </div>`;
     }
     const iconHtml = it.icon ? `<img class="ld-icon-img" src="${it.icon}" alt="">` : ICON_PLACEHOLDER;
@@ -5142,7 +5386,7 @@ refreshApps();
       return;
     }
     if (stage === 'app') lHint.textContent = '↑↓ navigate · Tab to pick an app · Enter to chat with GPT-5.5 · Esc to close';
-    else if (mode === 'automation') lHint.textContent = `Run an automation on ${selApp ? selApp.name : ''} · Enter to run`;
+    else if (mode === 'automation') lHint.textContent = `Run an automation on ${selApp ? selApp.name : ''} · Enter to run · Tab to fill · Hold Tab to delete`;
     else lHint.textContent = `Ask ${selApp ? selApp.name : 'the app'} to do something · Enter to send`;
   }
 
@@ -5443,9 +5687,60 @@ refreshApps();
         if (pick) { selectApp(pick); return; }
         return;
       }
+      if (mode === 'automation' && stage === 'task') {
+        e.preventDefault();
+        if (tabSuppressUntilKeyup) return;
+        if (e.repeat) return;
+        if (tabHoldTimer) return;
+        const target = items[activeIdx] || items[0] || null;
+        if (!target || !target.id || !selApp) {
+          // Nothing to hold-delete — fall back to plain autocomplete.
+          completeGhost();
+          return;
+        }
+        tabHoldTarget = target;
+        tabHoldStart = performance.now();
+        tabDeleteFired = false;
+        tabPrevHint = lHint ? lHint.textContent : '';
+        if (lHint) lHint.textContent = `Hold to delete "${target.name}" · release to cancel`;
+        const tick = () => {
+          if (!tabHoldStart) return;
+          const p = Math.min(1, (performance.now() - tabHoldStart) / TAB_HOLD_MS);
+          setLogoRing(p);
+          if (p < 1) tabHoldRaf = requestAnimationFrame(tick);
+        };
+        tabHoldRaf = requestAnimationFrame(tick);
+        tabHoldTimer = setTimeout(async () => {
+          tabHoldTimer = null;
+          if (!tabHoldTarget) { cancelTabHold(); return; }
+          const t = tabHoldTarget;
+          tabDeleteFired = true;
+          tabSuppressUntilKeyup = true;
+          setLogoRing(1);
+          try {
+            await window.automation.remove({ exe: selApp.exe, id: t.id });
+            if (typeof refreshAutomationsForApp === 'function') {
+              try { await refreshAutomationsForApp(selApp.exe); } catch {}
+            }
+            try { autos = await window.automation.list(selApp.exe) || []; } catch { autos = []; }
+            refreshSuggestions();
+            setHint();
+            tabPrevHint = '';
+          } catch (err) {
+            if (lHint) lHint.textContent = `Delete failed: ${err && err.message ? err.message : err}`;
+          } finally {
+            setLogoRing(0);
+            tabHoldTarget = null;
+            tabHoldStart = 0;
+            if (tabHoldRaf) { cancelAnimationFrame(tabHoldRaf); tabHoldRaf = null; }
+          }
+        }, TAB_HOLD_MS);
+        return;
+      }
       if (mode === 'automation' && completeGhost()) { e.preventDefault(); return; }
     }
     if (e.key === 'Escape') {
+      if (tabHoldStart || tabHoldTimer) { cancelTabHold(); if (lHint && tabPrevHint) { lHint.textContent = tabPrevHint; tabPrevHint = ''; } }
       if (stage === 'task') { e.preventDefault(); popApp(); return; }
       if (allowOverlayClose) { e.preventDefault(); window.overlay.dismiss(); }
       return;
@@ -5563,7 +5858,7 @@ refreshApps();
   })();
 
   // Chat back button → return to the launcher (instead of the hidden workspace).
-  chatBackBtn.addEventListener('click', () => { if (view === 'chat') enterLauncher('chat'); });
+  chatBackBtn.addEventListener('click', () => { if (view === 'chat') { closeAutoPanel(); enterLauncher('chat'); } });
 
   // Chat-view Esc:
   //   - Tap (release < 1s): dismiss the overlay (original behaviour).
@@ -5624,6 +5919,35 @@ refreshApps();
     setLogoRing(0);
     try { window.overlay.setResetProgress(0); } catch {}
   }
+
+  // Tab-hold-to-delete (automation+task stage only). Tap-Tab still autocompletes
+  // via completeGhost() — distinguished on keyup by elapsed time. Mirrors the
+  // Esc-hold pattern above (rAF ring + setTimeout fire + suppressUntilKeyup).
+  const TAB_HOLD_MS = 1000;
+  let tabHoldStart = 0;
+  let tabHoldTimer = null;
+  let tabHoldRaf = null;
+  let tabDeleteFired = false;
+  let tabHoldTarget = null;
+  let tabSuppressUntilKeyup = false;
+  let tabPrevHint = '';
+  function cancelTabHold() {
+    if (tabHoldTimer) { clearTimeout(tabHoldTimer); tabHoldTimer = null; }
+    if (tabHoldRaf) { cancelAnimationFrame(tabHoldRaf); tabHoldRaf = null; }
+    tabHoldStart = 0;
+    tabHoldTarget = null;
+    setLogoRing(0);
+  }
+  lInput.addEventListener('keyup', (e) => {
+    if (e.key !== 'Tab') return;
+    if (tabSuppressUntilKeyup) { tabSuppressUntilKeyup = false; return; }
+    if (!tabHoldStart) return;
+    const armed = !tabDeleteFired;
+    cancelTabHold();
+    if (lHint && tabPrevHint) { lHint.textContent = tabPrevHint; tabPrevHint = ''; }
+    tabDeleteFired = false;
+    if (armed) completeGhost();
+  });
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (e.isComposing || e.keyCode === 229) return; // IME composition cancel — not ours
@@ -5631,6 +5955,16 @@ refreshApps();
     // releases the key after a hold-to-reset. Prevents the held key from
     // immediately exiting the overlay once the reset drops us into launcher.
     if (escSuppressUntilKeyup) { e.preventDefault(); e.stopPropagation(); return; }
+    // Inline automation panel owns Esc when open: close it and restore chat.
+    // Exception: the inline step-editor textarea handles its own Esc to close
+    // just the editor without collapsing the whole panel.
+    if (isAutoPanelOpen()) {
+      if (e.target && e.target.classList && e.target.classList.contains('auto-modal-step-editor')) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      closeAutoPanel();
+      return;
+    }
     if (view !== 'chat' || !allowOverlayClose) return;
     if (e.repeat) { e.preventDefault(); return; }
     if (escHoldTimer) { e.preventDefault(); return; }
@@ -5690,6 +6024,11 @@ refreshApps();
   // ── Show / hide from the hotkey ──
   // Strip the closing class on every show so a re-summon during the close
   // fade snaps back to fully opaque without any half-state flash.
+  window.overlay.onToggleMode(() => {
+    if (autoRunModal && autoRunModal.classList.contains('show')) return;
+    enterLauncher(mode === 'automation' ? 'chat' : 'automation');
+  });
+
   window.overlay.onShow((data) => {
     document.body.classList.remove('overlay-closing');
     window.overlay.getConfig().then((c) => {
@@ -5702,6 +6041,18 @@ refreshApps();
     // (preloaded) overlay window first loaded its in-memory copy.
     selectedUiaExes = loadSelectedUiaExes();
     const reqMode = (data && data.mode) || 'chat';
+    // A hidden automation run modal can still be mounted when the user closes
+    // the overlay via hotkey/blur before pressing the modal's Close button.
+    // Do not rebuild the launcher underneath it on the next hotkey summon:
+    // overlay-mode modals use a transparent backdrop to preserve rounded-window
+    // transparency, so launcher pixels would otherwise show through above the
+    // run sheet.
+    if (autoRunModal && autoRunModal.classList.contains('show')) {
+      syncAutoModalChrome();
+      sizeForRun();
+      lInput.blur();
+      return;
+    }
     // Restore an in-flight chat instead of resetting it out from under a stream.
     if (reqMode === 'chat' && chatBusy && chatCurrentExe) { showChatView(); lInput.blur(); return; }
     // Restore a paused conversation when reopening the overlay — covers both
@@ -5736,29 +6087,9 @@ refreshApps();
   window.overlay.onHide(() => {
     // Keep chat state for restore; just clear the launcher input.
     if (view === 'launcher') { lInput.value = ''; lGhost.textContent = ''; }
-    // Play the close animation, then tell main to actually hide() the window.
-    // requestAnimationFrame gives the browser a frame to commit the starting
-    // styles before the transition class is applied — without it the class
-    // change can collapse into the same frame and skip the transition.
-    const ackFinished = () => {
-      try { window.overlay.finishHide(); } catch {}
-    };
-    let done = false;
-    const onEnd = (e) => {
-      if (e && e.target !== document.body) return; // ignore bubbled child transitions
-      if (done) return;
-      done = true;
-      document.body.removeEventListener('transitionend', onEnd);
-      ackFinished();
-    };
-    document.body.addEventListener('transitionend', onEnd);
-    // Belt-and-suspenders fallback: if transitionend never fires (DevTools
-    // paused, prefers-reduced-motion stubs the transition out) ack anyway so
-    // main's own 240ms fallback never has to fire (which would look laggy).
-    setTimeout(() => { if (!done) { done = true; document.body.removeEventListener('transitionend', onEnd); ackFinished(); } }, 200);
-    requestAnimationFrame(() => {
-      document.body.classList.add('overlay-closing');
-    });
+    // Hide immediately. Leaving the transparent native window visible during a
+    // close fade gives Windows/Electron time to paint the top gutter strip.
+    try { window.overlay.finishHide(); } catch {}
   });
 
   // Refresh the running-apps list at load so suggestions are warm by first
