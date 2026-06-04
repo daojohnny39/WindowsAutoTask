@@ -860,6 +860,54 @@ let chatStreamExe      = null;
 let chatBusy           = false;
 let chatStreamSources  = [];        // collected URL citations for the streaming assistant msg
 
+// ── Screenshot pending state (per-context) ─────────────────────────────────
+const pendingShotIdsByContext     = new Map(); // ownerId -> Set<string>
+const pendingTurnShotIdsByContext = new Map(); // ownerId -> Set<string>
+function getOwnerIdForChat() {
+  return chatCurrentExe || DIRECT_CHAT_ID;
+}
+function trackShot(ownerId, id) {
+  if (!pendingShotIdsByContext.has(ownerId)) pendingShotIdsByContext.set(ownerId, new Set());
+  pendingShotIdsByContext.get(ownerId).add(id);
+}
+function untrackShot(ownerId, id) {
+  const s = pendingShotIdsByContext.get(ownerId);
+  if (s) s.delete(id);
+}
+
+function handleOrphanShot(pill) {
+  const id = pill.dataset.shotId;
+  const ownerId = pill.dataset.ownerId;
+  if (!id || !ownerId) return;
+  // If id is pending for an in-flight turn, do NOT release — main releases after request finally
+  const turnSet = pendingTurnShotIdsByContext.get(ownerId);
+  if (turnSet && turnSet.has(id)) return;
+  try { window.chat.releaseScreenshot(id); } catch {}
+  untrackShot(ownerId, id);
+}
+
+function observeShotPillRemoval(container) {
+  const observer = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      for (const node of m.removedNodes) {
+        if (!(node instanceof HTMLElement)) continue;
+        if (node.classList && node.classList.contains('chat-shot-pill')) {
+          handleOrphanShot(node);
+        }
+        const nested = node.querySelectorAll ? node.querySelectorAll('.chat-shot-pill') : [];
+        nested.forEach(handleOrphanShot);
+      }
+    }
+  });
+  observer.observe(container, { childList: true, subtree: true });
+}
+
+// Wire up after DOM is defined (chatInput is defined just above)
+observeShotPillRemoval(chatInput);
+// Launcher input is inside an IIFE; observe lazily once it exists in the DOM
+const _lInputEl = document.getElementById('launcher-input');
+if (_lInputEl) observeShotPillRemoval(_lInputEl);
+
 // Per-turn token used to drop stale chat:* IPC events after a Stop / Reset.
 // Backend stamps every chat:* send with the turnId it received from sendChatMessage;
 // renderer keeps `currentTurnId` and discards events whose id no longer matches.
@@ -1691,7 +1739,7 @@ window.chat.onToolResult((data) => {
 // as a transient `#chat-clarify-card` in the message list (scrollback context +
 // where the chosen answer is stamped). The CHOICES render in a floating
 // `#chat-clarify-menu` above the composer — same look + keyboard model as the
-// app-selector dropdown: Up/Down highlight, Tab submits the highlight. The user
+// app-selector dropdown: Up/Down highlight, Enter submits the highlight. The user
 // can also type a custom answer in the main composer and hit Enter; an empty
 // composer + Enter submits the highlighted choice. Choices stay mouse-clickable.
 const CLARIFY_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M9 12l2 2 4-4"></path></svg>';
@@ -1730,6 +1778,8 @@ window.chat.onAsk((data) => {
   if (options.length) {
     renderClarifyMenu();
     clarifyMenuEl.hidden = false;
+    // Composer becomes the custom-answer escape hatch while choices are shown.
+    try { chatInput.dataset.placeholder = 'Type a Custom Answer…'; } catch {}
     // No positionMenu — clarify menu pins full-width above .chat-input-wrap via CSS
     // (app-selector look), unlike the caret-anchored slash/app/tab popovers.
     if (typeof window.__overlaySizeForChat === 'function') {
@@ -1743,7 +1793,7 @@ window.chat.onAsk((data) => {
 function renderClarifyMenu() {
   if (!clarifyState || !clarifyState.options.length) return;
   // Render rows in the launcher app-selector look (.ld-row): icon tile, bold
-  // label, and a "hit tab" badge that appears on the active row. Identical
+  // label, and a "hit enter" badge that appears on the active row. Identical
   // visual + keyboard model to the overlay app picker.
   const rows = clarifyMenuListEl.children;
   if (rows.length === clarifyState.options.length) {
@@ -1760,7 +1810,7 @@ function renderClarifyMenu() {
            data-i="${i}" aria-selected="${i === clarifyState.idx}">
         <span class="ld-icon">${CLARIFY_GLYPH_SVG}</span>
         <span class="ld-text"><span class="ld-name">${escapeHtml(opt)}</span></span>
-        <span class="ld-enter">hit <kbd>tab</kbd></span>
+        <span class="ld-enter">hit <kbd>enter</kbd></span>
       </div>`).join('');
   }
   const ar = clarifyMenuListEl.querySelector('.ld-row.active');
@@ -1775,6 +1825,8 @@ function closeClarify() {
     clarifyMenuEl.hidden = true;
     clarifyMenuListEl.innerHTML = '';
   }
+  // Restore the default composer placeholder after a clarify closes.
+  try { chatInput.dataset.placeholder = 'Send a message…'; } catch {}
   if (typeof window.__overlaySizeForChat === 'function') {
     requestAnimationFrame(() => window.__overlaySizeForChat({ immediate: true }));
   }
@@ -2401,18 +2453,45 @@ window.chat.onDone((data) => {
     renderChat();
   }
   updateChatEmptyClass();
+
+  // Release screenshot ids that were in-flight for this turn
+  const doneOwnerId = targetExe || null;
+  if (doneOwnerId) {
+    const turnSet = pendingTurnShotIdsByContext.get(doneOwnerId);
+    if (turnSet && turnSet.size) {
+      for (const id of turnSet) { try { window.chat.releaseScreenshot(id); } catch {} }
+      turnSet.clear();
+    }
+  }
 });
 
-async function sendChatMessage(forcedText, forcedApps) {
-  const text = forcedText !== undefined ? forcedText : serializeChatInput().trim();
-  if (!text || chatBusy) return;
+async function sendChatMessage(forcedText, forcedApps, forcedAttachments) {
+  const rawText = forcedText !== undefined ? forcedText : serializeChatInput().trim();
+  const forcedShots = (forcedText !== undefined && Array.isArray(forcedAttachments))
+    ? forcedAttachments.filter(a => a && a.type === 'image' && a.id)
+    : [];
+  const hasShots = (forcedText === undefined && chatInput.querySelectorAll('.chat-shot-pill').length > 0)
+    || forcedShots.length > 0;
+  if ((!rawText && !hasShots) || chatBusy) return;
+  const text = rawText || (hasShots ? 'Screenshot attached.' : rawText);
+  // Capture ownerId before any async/DOM work so the catch can reference it
+  const sendOwnerId = getOwnerIdForChat();
 
-  // Extract file attachments + /app references before clearing the input
+  // Extract file attachments, image attachments, + /app references before clearing the input
   let fileAttachments = [];
+  let imageAttachments = [];
   let appRefs = [];
   if (forcedText === undefined) {
     const filePills = chatInput.querySelectorAll('.chat-file-pill');
     fileAttachments = [...filePills].map(p => ({ type: 'file', id: p.dataset.fileId })).filter(a => a.id);
+    const shotPills = chatInput.querySelectorAll('.chat-shot-pill');
+    const seenShot = new Set();
+    shotPills.forEach(p => {
+      const id = p.dataset.shotId;
+      if (!id || seenShot.has(id)) return;
+      seenShot.add(id);
+      imageAttachments.push({ type: 'image', id });
+    });
     const appPills = chatInput.querySelectorAll('.chat-app-pill');
     const seenApp = new Set();
     appPills.forEach(p => {
@@ -2422,6 +2501,17 @@ async function sendChatMessage(forcedText, forcedApps) {
       const m = resolveAppMeta(exe, p.dataset.appName);
       appRefs.push({ key: p.dataset.appKey || appKeyFor(exe), exe: m.exe, name: m.name, type: m.type, pid: m.pid, port: m.port });
     });
+    // Move image ids to pendingTurnShotIdsByContext BEFORE clearChatInput so
+    // the MutationObserver's handleOrphanShot sees them as in-flight and skips release.
+    const pending = pendingShotIdsByContext.get(sendOwnerId);
+    if (pending && imageAttachments.length) {
+      if (!pendingTurnShotIdsByContext.has(sendOwnerId)) pendingTurnShotIdsByContext.set(sendOwnerId, new Set());
+      const turnSet = pendingTurnShotIdsByContext.get(sendOwnerId);
+      for (const a of imageAttachments) {
+        pending.delete(a.id);
+        turnSet.add(a.id);
+      }
+    }
     closeTabMenu();
     closeAppMenu();
     clearChatInput();
@@ -2433,6 +2523,21 @@ async function sendChatMessage(forcedText, forcedApps) {
   // /app tokens itself (the composer there is the plain #launcher-input, not the
   // pill-aware #chat-input), so honour an explicit apps[] when provided.
   if (forcedText !== undefined && Array.isArray(forcedApps)) appRefs = forcedApps;
+  // Same story for /screenshot pills captured in the launcher pre-app-pick:
+  // chatInput is empty, so the caller hands the ids over directly. Migrate
+  // them into the turn set so onDone releases (and handleOrphanShot, when the
+  // pill is later torn out of lInput by enterLauncher's reset, treats the id
+  // as in-flight instead of releasing it twice).
+  if (forcedShots.length) {
+    if (!pendingTurnShotIdsByContext.has(sendOwnerId)) pendingTurnShotIdsByContext.set(sendOwnerId, new Set());
+    const turnSet = pendingTurnShotIdsByContext.get(sendOwnerId);
+    const pending = pendingShotIdsByContext.get(sendOwnerId);
+    for (const a of forcedShots) {
+      imageAttachments.push({ type: 'image', id: a.id });
+      if (pending) pending.delete(a.id);
+      turnSet.add(a.id);
+    }
+  }
   addChatMessage('user', text);
   lastUserMessage = text;
 
@@ -2462,13 +2567,23 @@ async function sendChatMessage(forcedText, forcedApps) {
     .filter(m => m.role === 'user' || m.role === 'assistant')
     .map(m => ({ role: m.role, content: m.content }));
 
+  const allAttachments = [...fileAttachments, ...imageAttachments];
+
   try {
     if (isDirect) {
-      await window.chat.sendDirect({ turnId, messages: apiMessages, attachments: fileAttachments, apps: appRefs });
+      await window.chat.sendDirect({ turnId, messages: apiMessages, attachments: allAttachments, apps: appRefs });
     } else {
-      await window.chat.send({ turnId, meta, messages: apiMessages, attachments: fileAttachments, apps: appRefs });
+      await window.chat.send({ turnId, meta, messages: apiMessages, attachments: allAttachments, apps: appRefs });
     }
   } catch (err) {
+    // Release any pending-for-turn screenshot ids on failure
+    if (forcedText === undefined) {
+      const turnSet = pendingTurnShotIdsByContext.get(sendOwnerId);
+      if (turnSet) {
+        for (const id of turnSet) { try { window.chat.releaseScreenshot(id); } catch {} }
+        turnSet.clear();
+      }
+    }
     hideThinking();
     destroyLiveActivity();
     const streamMsg = document.getElementById('chat-stream-msg');
@@ -2503,7 +2618,7 @@ chatInput.addEventListener('keydown', (e) => {
         newRange.collapse(true);
         pill.remove();
         // If nothing meaningful is left, reset so the :empty placeholder returns.
-        if (!chatInput.querySelector('.chat-tab-pill, .chat-file-pill, .chat-app-pill') && chatInput.textContent.trim() === '') {
+        if (!chatInput.querySelector('.chat-tab-pill, .chat-file-pill, .chat-app-pill, .chat-shot-pill') && chatInput.textContent.trim() === '') {
           chatInput.innerHTML = '';
           chatInput.focus();
         } else {
@@ -2531,11 +2646,6 @@ chatInput.addEventListener('keydown', (e) => {
       e.preventDefault();
       clarifyState.idx = Math.max(0, clarifyState.idx - 1);
       renderClarifyMenu();
-      return;
-    }
-    if (e.key === 'Tab' && opts.length) {
-      e.preventDefault();
-      answerClarify(opts[clarifyState.idx]);
       return;
     }
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -2664,6 +2774,8 @@ const FILE_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="no
 
 const APP_GLYPH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect></svg>';
 
+const SHOT_GLYPH_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M9 4l-2 2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-3l-2-2H9zm3 4a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>';
+
 // Serialise the composer to plain text, turning pills into [tab:id "title"] tokens
 // and contenteditable's per-line <div> wrappers back into newlines.
 function serializeChatInput() {
@@ -2707,14 +2819,15 @@ function clearChatInput() {
 // Is the caret sitting right after a `/tab`-style slash token? Returns its text
 // node + offsets so we can later splice in a pill.
 const SLASH_COMMANDS = [
-  { name: 'app',  label: '/app',  hint: 'Reference a running app', glyph: APP_GLYPH_SVG,  arg: 'app'  },
-  { name: 'tab',  label: '/tab',  hint: 'Reference a Chrome tab',  glyph: TAB_GLYPH_SVG,  arg: 'tab',
+  { name: 'app',        label: '/app',        hint: 'Reference a running app',   glyph: APP_GLYPH_SVG,  arg: 'app'  },
+  { name: 'tab',        label: '/tab',        hint: 'Reference a Chrome tab',    glyph: TAB_GLYPH_SVG,  arg: 'tab',
     guard: () => {
       // Caret-after-`/app`-pill scopes to that app instead of the chat's primary.
       const meta = scopedMetaForSlash();
       return !!(meta && meta.type === 'electron' && meta.port);
     } },
-  { name: 'file', label: '/file', hint: 'Attach a file',           glyph: FILE_GLYPH_SVG, arg: 'file' },
+  { name: 'file',       label: '/file',       hint: 'Attach a file',             glyph: FILE_GLYPH_SVG, arg: 'file' },
+  { name: 'screenshot', label: '/screenshot', hint: 'Capture a screen region',   glyph: SHOT_GLYPH_SVG, arg: null, immediate: true },
 ];
 
 // When a slash sits to the right of a `/app` pill in the composer, subsequent
@@ -2962,6 +3075,17 @@ function commitSlashCmd(cmd) {
   slashPaletteCtx = null;
   slashPaletteItems = [];
 
+  // Immediate commands (e.g. /screenshot) do not enter arg phase
+  if (cmd.immediate && cmd.name === 'screenshot') {
+    console.log('[screenshot] commit', cmd.name);
+    slashState = 'closed';
+    slashCmd = null;
+    slashAnchor = null;
+    slashFilter = '';
+    takeChatScreenshot();
+    return;
+  }
+
   if (cmd.arg === 'file') {
     slashState = 'closed';
     slashCmd = null;
@@ -3087,12 +3211,52 @@ function buildAppPill(app) {
   return span;
 }
 
+function buildScreenshotPill({ id, thumbDataUrl, w, h, ownerId }) {
+  const pill = document.createElement('span');
+  pill.className = 'chat-shot-pill';
+  pill.contentEditable = 'false';
+  pill.dataset.attachmentType = 'image';
+  pill.dataset.attachmentId = id;
+  pill.dataset.shotId = id;
+  pill.dataset.ownerId = ownerId;
+
+  const img = document.createElement('img');
+  img.className = 'chat-shot-thumb';
+  img.src = thumbDataUrl;
+  img.alt = '';
+  img.width = 20;
+  img.height = 20;
+  pill.appendChild(img);
+
+  const label = document.createElement('span');
+  label.className = 'chat-shot-label';
+  label.textContent = 'Screenshot ' + w + '\xd7' + h;
+  pill.appendChild(label);
+
+  const x = document.createElement('button');
+  x.className = 'chat-pill-x';
+  x.type = 'button';
+  x.setAttribute('aria-label', 'Remove screenshot');
+  x.textContent = '\xd7';
+  x.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    try { window.chat.releaseScreenshot(id); } catch {}
+    untrackShot(ownerId, id);
+    pill.remove();
+  });
+  pill.appendChild(x);
+
+  return pill;
+}
+
 function isTabPill(n) {
   return n && n.nodeType === Node.ELEMENT_NODE && n.classList && n.classList.contains('chat-tab-pill');
 }
 function isAnyPill(n) {
   return n && n.nodeType === Node.ELEMENT_NODE && n.classList &&
-    (n.classList.contains('chat-tab-pill') || n.classList.contains('chat-file-pill') || n.classList.contains('chat-app-pill'));
+    (n.classList.contains('chat-tab-pill') || n.classList.contains('chat-file-pill') ||
+     n.classList.contains('chat-app-pill') || n.classList.contains('chat-shot-pill'));
 }
 const isEmptyText = (n) => n && n.nodeType === Node.TEXT_NODE && n.nodeValue === '';
 
@@ -3346,6 +3510,54 @@ function insertFilePillAtCaret(file) {
   newRange.collapse(true);
   sel.removeAllRanges();
   sel.addRange(newRange);
+}
+
+// ── Screenshot capture helpers ──────────────────────────────────────────────
+
+async function takeChatScreenshot() {
+  if (chatBusy) return;
+  // Save caret so we can restore it after the OS region picker steals focus
+  const sel = window.getSelection();
+  let savedRange = null;
+  if (sel && sel.rangeCount > 0) {
+    const r = sel.getRangeAt(0);
+    if (chatInput.contains(r.startContainer)) savedRange = r.cloneRange();
+  }
+  const ownerId = getOwnerIdForChat();
+  try {
+    const result = await window.chat.captureScreenshot({ ownerId });
+    if (!result || !result.id) return; // user cancelled
+    const pill = buildScreenshotPill({ ...result, ownerId });
+    // Restore caret into chatInput, then insert pill using same mechanism as /file
+    try { chatInput.focus(); } catch {}
+    if (savedRange) {
+      const s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(savedRange);
+    }
+    // Insert pill at caret (mirrors insertFilePillAtCaret)
+    const trailing = document.createTextNode(' ');
+    const curSel = window.getSelection();
+    if (!curSel || curSel.rangeCount === 0) {
+      chatInput.appendChild(pill);
+      chatInput.appendChild(trailing);
+    } else {
+      const range = curSel.getRangeAt(0);
+      range.deleteContents();
+      range.insertNode(trailing);
+      range.insertNode(pill);
+      const newRange = document.createRange();
+      newRange.setStartAfter(trailing);
+      newRange.collapse(true);
+      curSel.removeAllRanges();
+      curSel.addRange(newRange);
+    }
+    trackShot(ownerId, result.id);
+  } catch (err) {
+    console.error('[screenshot] capture failed:', err);
+    showStatus('Screenshot failed: ' + String(err && err.message || err), 'error');
+    setTimeout(hideStatus, 6000);
+  }
 }
 
 // ── Markdown renderer (kept from prior, ChatGPT-style code chrome) ──
@@ -4499,6 +4711,10 @@ refreshApps();
       const title = (el.dataset.tabTitle || '').replace(/"/g, "'");
       return `[tab:${id} "${title}"]`;
     }
+    // Screenshot pills are attachments, not part of the message text — scraped
+    // separately at submit time. Serialising them would inject the visible
+    // "Screenshot WxH×" label into the prompt and the value-shim caret math.
+    if (el.classList.contains('chat-shot-pill')) return '';
     return el.textContent || '';
   }
   function lSerialize(root) {
@@ -4508,7 +4724,9 @@ refreshApps();
         if (n.nodeType === Node.TEXT_NODE) {
           out += n.nodeValue;
         } else if (n.nodeType === Node.ELEMENT_NODE) {
-          if (n.classList && (n.classList.contains('chat-app-pill') || n.classList.contains('chat-tab-pill'))) {
+          if (n.classList && n.classList.contains('chat-shot-pill')) {
+            // skip — screenshots are scraped as attachments, not message text
+          } else if (n.classList && (n.classList.contains('chat-app-pill') || n.classList.contains('chat-tab-pill'))) {
             out += lTokenForPill(n);
           } else if (n.tagName === 'BR') {
             out += '\n';
@@ -4537,6 +4755,11 @@ refreshApps();
         return false;
       }
       if (n.nodeType === Node.ELEMENT_NODE) {
+        if (n.classList && n.classList.contains('chat-shot-pill')) {
+          // Zero-width in the text-shim: caret never lands "inside" a shot pill
+          // and its visible label doesn't count toward offsets. Skip children.
+          return false;
+        }
         if (n.classList && (n.classList.contains('chat-app-pill') || n.classList.contains('chat-tab-pill'))) {
           const len = lTokenForPill(n).length;
           if (remaining < len) {
@@ -4693,12 +4916,13 @@ refreshApps();
   // (e.g. `/tab`) scope to THAT app instead of the launcher's selApp primary.
   let lSlashScopedExe = null;
   const L_SLASH_COMMANDS = [
-    { name: 'app', label: '/app', hint: 'Reference a running app', arg: 'app' },
-    { name: 'tab', label: '/tab', hint: 'Reference a Chrome tab',  arg: 'tab',
+    { name: 'app',        label: '/app',        hint: 'Reference a running app', arg: 'app' },
+    { name: 'tab',        label: '/tab',        hint: 'Reference a Chrome tab',  arg: 'tab',
       guard: () => {
         const meta = lScopedAppMeta();
         return !!(meta && meta.type === 'electron' && meta.port);
       } },
+    { name: 'screenshot', label: '/screenshot', hint: 'Capture a screen region', arg: null, immediate: true },
   ];
 
   // Walk lInput pills, return the last `/app` pill whose serialised text offset
@@ -4773,7 +4997,7 @@ refreshApps();
   // chat is appless: no CDP/UIA snapshot, no scope guard, no per-app tools.
   // Optional `msg` is sent as the first turn; empty just drops the user into
   // the direct chat panel to type.
-  async function chatWithGptDirect(msg) {
+  async function chatWithGptDirect(msg, attachments) {
     showChatView();
     try {
       await openDirectChat();
@@ -4781,7 +5005,16 @@ refreshApps();
       console.warn('openDirectChat failed', err);
     }
     const t = (msg || '').trim();
-    if (t) sendChatMessage(t);
+    const att = Array.isArray(attachments) ? attachments.filter(a => a && a.id) : [];
+    if (t || att.length) {
+      sendChatMessage(t || 'Screenshot attached.', [], att);
+    }
+    // Clearing lInput here would orphan the shot pills; the MutationObserver
+    // honours pendingTurnShotIdsByContext (sendChatMessage migrates ids into
+    // it before any await), so the next enterLauncher() reset is safe.
+    if (att.length) {
+      try { lInput.innerHTML = ''; } catch {}
+    }
   }
 
   // prefix matches first, then substring; cap to keep the dropdown tight
@@ -5235,7 +5468,9 @@ refreshApps();
   // Detect a `/[cmd]` token at the caret. Returns the splice span + the
   // characters typed after the slash so the palette can filter against them.
   function lDetectSlash() {
-    if (stage !== 'task' || mode === 'automation' || lComposing) return null;
+    if (mode === 'automation' || lComposing) return null;
+    // Allow /screenshot in app-stage too (palette filters out /app and /tab there).
+    if (stage !== 'task' && stage !== 'app') return null;
     if (lInput.selectionStart !== lInput.selectionEnd) return null; // bail on range selection
     const caret = (lInput.selectionStart == null) ? lInput.value.length : lInput.selectionStart;
     const before = lInput.value.slice(0, caret);
@@ -5253,10 +5488,44 @@ refreshApps();
   function lFilterPalette(query) {
     const q = (query || '').toLowerCase();
     return L_SLASH_COMMANDS.filter(c => {
+      // /app and /tab need a scoped app — only useful after one is selected.
+      if (stage !== 'task' && c.name !== 'screenshot') return false;
       if (c.guard && !c.guard()) return false;
       if (!q) return true;
       return c.name.startsWith(q);
     });
+  }
+
+  // Scrape any /screenshot pills present in lInput into the attachments shape
+  // sendChatMessage expects. Used by the launcher's app-stage Enter / click
+  // paths because chatInput is empty at that point — sendChatMessage's own
+  // pill scrape only looks at chatInput.
+  function lScrapeShotAttachments() {
+    const out = [];
+    const seen = new Set();
+    lInput.querySelectorAll('.chat-shot-pill').forEach((p) => {
+      const id = p.dataset.shotId;
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      out.push({ type: 'image', id });
+    });
+    return out;
+  }
+
+  async function takeLauncherScreenshot() {
+    const realOwner = (selApp && selApp.exe) ? appKeyFor(selApp.exe) : DIRECT_CHAT_ID;
+    try {
+      const result = await window.chat.captureScreenshot({ ownerId: realOwner });
+      if (!result || !result.id) return;
+      const pill = buildScreenshotPill({ ...result, ownerId: realOwner });
+      // Insert pill at current caret position in lInput using lInsertPill
+      const caret = (lInput.selectionStart == null) ? lInput.value.length : lInput.selectionStart;
+      lInsertPill(caret, caret, pill);
+      trackShot(realOwner, result.id);
+    } catch (err) {
+      console.error('[screenshot] capture failed:', err);
+      lHint.textContent = 'Screenshot failed: ' + String(err && err.message || err);
+    }
   }
 
   // Commit a palette command: splice `/cmd` text out of lInput, anchor the
@@ -5276,10 +5545,23 @@ refreshApps();
     const sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(r);
+    lSlashPalCtx = null;
+
+    // Immediate commands (e.g. /screenshot) do not enter arg phase
+    if (cmd.immediate && cmd.name === 'screenshot') {
+      console.log('[screenshot] commit', cmd.name);
+      lSlashState = 'closed';
+      lSlashCmd   = null;
+      lSlashAnchor = -1;
+      items = []; activeIdx = -1;
+      lDropdown.hidden = true;
+      takeLauncherScreenshot();
+      return;
+    }
+
     lSlashAnchor = ctx.slashOffset;
     lSlashState  = 'arg';
     lSlashCmd    = cmd.arg;
-    lSlashPalCtx = null;
     if (cmd.arg === 'tab' && (!lTabAllTabs || !lTabAllTabs.length)) loadLauncherTabs();
     refreshSuggestions();
   }
@@ -5328,8 +5610,21 @@ refreshApps();
   function refreshSuggestions() {
     const q = lInput.value.trim();
     if (stage === 'app') {
-      items = filterApps(q);
-      lCloseSlash();
+      // /screenshot is usable pre-app-pick. Detect first; fall back to app filter
+      // only when there's no slash token at the caret.
+      const ctx = lDetectSlash();
+      if (ctx) {
+        lSlashState = 'palette';
+        lSlashPalCtx = ctx;
+        lSlashScopedExe = null;
+        const cmds = lFilterPalette(ctx.query);
+        items = cmds.map(c => ({ slashCmd: c, name: c.label, hint: c.hint }));
+        lAppMode = false; lAppCtx = null;
+        lTabMode = false; lTabCtx = null;
+      } else {
+        lCloseSlash();
+        items = filterApps(q);
+      }
     }
     else if (mode === 'automation') {
       items = filterAutos(q);
@@ -5403,7 +5698,11 @@ refreshApps();
     else lHint.textContent = `Ask ${selApp ? selApp.name : 'the app'} to do something · Enter to send`;
   }
 
-  function enterLauncher(nextMode) {
+  function enterLauncher(nextMode, opts) {
+    // animate=false is the in-place mode toggle path: the launcher is already
+    // on-screen, so replaying the entrance fade + forcing a resize would read
+    // as a view switch / flicker. Only a real overlay show/boot animates.
+    const animate = !opts || opts.animate !== false;
     // If we were in inline chat, unmount it (DOM reparent + state clear)
     // before resetting the launcher.
     const wasInline = inlineChatActive;
@@ -5426,9 +5725,11 @@ refreshApps();
     // Reset to a sentinel so any later page switch actually re-applies .active.
     currentPage = 'launcher';
     launcher.hidden = false;
-    launcherCard.classList.remove('anim');
-    void launcherCard.offsetWidth;          // reflow so the entrance anim replays each show
-    launcherCard.classList.add('anim');
+    if (animate) {
+      launcherCard.classList.remove('anim');
+      void launcherCard.offsetWidth;        // reflow so the entrance anim replays each show
+      launcherCard.classList.add('anim');
+    }
     setModeChip();
     setHint();
     refreshSuggestions();
@@ -5440,11 +5741,14 @@ refreshApps();
     if (wasInline) {
       setTimeout(() => { try { lInput.focus(); } catch {} }, 160);
     }
-    // Force a fresh resize on every launcher entry (incl. each overlay show):
-    // the dedup in syncLauncherSize would otherwise skip the corrective resize
-    // when the collapsed card measures the same as the prior session, leaving
-    // the window stuck at showOverlay's collapsedHeight and clipping the top.
-    lastSyncedH = 0;
+    // Force a fresh resize on every overlay show: the dedup in syncLauncherSize
+    // would otherwise skip the corrective resize when the collapsed card
+    // measures the same as the prior session, leaving the window stuck at
+    // showOverlay's collapsedHeight and clipping the top. Skip the force on an
+    // in-place mode toggle (animate=false) — there the window is already sized
+    // and a redundant tween reads as a flicker; syncLauncherSize's dedup still
+    // resizes if the height genuinely changed (e.g. exiting inline chat).
+    if (animate) lastSyncedH = 0;
     syncLauncherSize();
   }
 
@@ -5770,7 +6074,10 @@ refreshApps();
       e.preventDefault();
       if (stage === 'app') {
         // Enter is reserved for direct GPT-5.5 chat. App selection uses Tab.
-        chatWithGptDirect(lInput.value.trim());
+        // Forward any /screenshot pills captured here so the direct chat send
+        // attaches them — chatInput is empty at this point so sendChatMessage
+        // can't scrape them itself.
+        chatWithGptDirect(lInput.value.trim(), lScrapeShotAttachments());
         return;
       }
       if (mode === 'automation') { submitAutomation(lInput.value); return; }
@@ -5789,7 +6096,7 @@ refreshApps();
     if (lAppMode) { pickLauncherApp(items[i]); return; }
     if (lTabMode) { pickLauncherTab(items[i]); return; }
     if (stage === 'app') {
-      if (items[i].gptDirect) chatWithGptDirect(lInput.value.trim());
+      if (items[i].gptDirect) chatWithGptDirect(lInput.value.trim(), lScrapeShotAttachments());
       else selectApp(items[i]);
     }
     else if (mode === 'automation') { activeIdx = i; submitAutomation(items[i].name); }
@@ -6044,7 +6351,7 @@ refreshApps();
   // fade snaps back to fully opaque without any half-state flash.
   window.overlay.onToggleMode(() => {
     if (autoRunModal && autoRunModal.classList.contains('show')) return;
-    enterLauncher(mode === 'automation' ? 'chat' : 'automation');
+    enterLauncher(mode === 'automation' ? 'chat' : 'automation', { animate: false });
   });
 
   window.overlay.onShow((data) => {

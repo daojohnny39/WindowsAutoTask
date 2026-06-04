@@ -12,7 +12,10 @@ const path = require('path');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const CONFIG_PATH = path.join(REPO_ROOT, 'config.json');
-const DEFAULT_CONFIG = { logging: { enabled: true, dir: 'logs' } };
+const DEFAULT_CONFIG = {
+  logging: { enabled: true, dir: 'logs' },
+  experimental: { allowProxyImages: false },
+};
 
 function noop() {}
 
@@ -30,10 +33,14 @@ function loadConfig(log = noop) {
     raw = DEFAULT_CONFIG;
   }
   const logging = (raw && typeof raw.logging === 'object' && raw.logging) || {};
+  const experimental = (raw && typeof raw.experimental === 'object' && raw.experimental) || {};
   return {
     logging: {
       enabled: logging.enabled === true,
       dir: (typeof logging.dir === 'string' && logging.dir.trim()) ? logging.dir.trim() : DEFAULT_CONFIG.logging.dir,
+    },
+    experimental: {
+      allowProxyImages: experimental.allowProxyImages === true,
     },
   };
 }

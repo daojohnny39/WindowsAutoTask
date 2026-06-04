@@ -1340,7 +1340,7 @@ body {
 .chat-clarify-card.answered { border-left-color: var(--border-strong); opacity: 0.85; }
 
 /* Clarify choices render as a full-width app-selector panel (icon tile + bold
-   label + "hit tab" badge on the active row) — same look as the overlay
+   label + "hit enter" badge on the active row) — same look as the overlay
    launcher app picker. Two host slots:
      • Settings chat: parent is .chat-input-wrap → absolute, pinned just above
        the rounded composer pill (bottom 100% + gap).
@@ -3413,3 +3413,49 @@ body[data-mode="overlay"] .launcher-card.anim .launcher-dropdown:not([hidden]) {
     animation-duration: 1ms !important;
   }
 }
+
+/* ─── Screenshot pill ─── */
+.chat-shot-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px 2px 4px;
+  margin: 0 2px;
+  border-radius: var(--r-pill, 10px);
+  background: color-mix(in oklch, #78b4ff 12%, transparent);
+  border: 1px solid color-mix(in oklch, #78b4ff 25%, transparent);
+  color: var(--text, #e4e4e7);
+  font-size: 12px;
+  line-height: 1.2;
+  vertical-align: middle;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.chat-shot-pill .chat-shot-thumb {
+  width: 20px;
+  height: 20px;
+  object-fit: cover;
+  border-radius: 3px;
+  flex-shrink: 0;
+  display: block;
+}
+
+.chat-shot-pill .chat-shot-label {
+  font-family: inherit;
+  color: inherit;
+  opacity: 0.9;
+}
+
+.chat-shot-pill .chat-pill-x {
+  border: none;
+  background: transparent;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 3px;
+}
+.chat-shot-pill .chat-pill-x:hover { opacity: 1; background: color-mix(in oklch, white 10%, transparent); }

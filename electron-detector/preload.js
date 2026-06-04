@@ -38,6 +38,8 @@ contextBridge.exposeInMainWorld('chat', {
   selectWindow: (payload) => ipcRenderer.invoke('chat:select-window', payload),
   listTabs: (port) => ipcRenderer.invoke('chat:list-tabs', port),
   pickFile: () => ipcRenderer.invoke('chat:pick-file'),
+  captureScreenshot: (opts) => ipcRenderer.invoke('screenshot:capture', opts),
+  releaseScreenshot: (id) => ipcRenderer.invoke('screenshot:release', id),
   onChunk: (callback) => {
     ipcRenderer.on('chat:chunk', (_e, data) => callback(data));
   },

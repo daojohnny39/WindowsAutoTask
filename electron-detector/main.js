@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, dialog, globalShortcut, Tray, Menu, nativeImage, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, globalShortcut, Tray, Menu, nativeImage, screen, desktopCapturer } = require('electron');
 const { execFile: _rawExecFile, spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
@@ -3562,6 +3562,15 @@ function getCodexAuth() {
   }
 }
 
+function proxyImagesEnabled() {
+  try {
+    const cfg = chatLogger.loadConfig(debugLog);
+    return cfg && cfg.experimental && cfg.experimental.allowProxyImages === true;
+  } catch {
+    return false;
+  }
+}
+
 // ── Per-app agent files ──
 
 function appKey(exe) {
@@ -4778,6 +4787,15 @@ const chatAbortFlags = new Map();
 const chatRefMaps = new Map();
 const chatPendingAsks = new Map(); // exe -> { resolve } for an in-flight ask_user clarification
 const fileAttachments = new Map(); // id → {canonicalPath, name, size, ext}
+const imageAttachments = new Map(); // id -> {ownerId, mime, width, height, byteLength, buffer, createdAt}
+const MAX_SCREENSHOT_BYTES = 4 * 1024 * 1024;
+const MAX_PROXY_IMAGE_BYTES = 3 * 1024 * 1024;
+const MAX_SCREENSHOT_LONGEST_SIDE = 2048;
+const SCREENSHOT_JPEG_QUALITY = 85;
+const SCREENSHOT_BLANK_SAMPLE_COUNT = 64;
+const SCREENSHOT_BLANK_CHANNEL_THRESHOLD = 8;
+const SCREENSHOT_CAPTURE_TIMEOUT_MS = 60_000;
+let activeScreenshotCapture = null; // mutex object {captureId, ownerId, snipperWindows:[], cleanup, settled}
 
 // Suspend the tool loop until the renderer replies via chat:answer (or stop/reset
 // aborts). No socket is open while waiting, so the streamOneRound timeouts do not
@@ -5399,6 +5417,29 @@ async function executeTool(name, args, meta, refMapHolder) {
     const listExpr = `(function(){
       function clean(s){return String(s||'').replace(/[\\u0000-\\u001F\\u007F-\\u009F]/g,'').replace(/\\s+/g,' ').trim();}
       function norm(id){return String(id||'').replace(/-/g,'').toLowerCase();}
+      function ownCheckbox(row){
+        var ownId=(row.getAttribute&&row.getAttribute('data-block-id'))||null;
+        function belongsToRow(el){
+          if(!ownId)return true;
+          var anc=el.closest&&el.closest('[data-block-id]');
+          return !anc||anc===row;
+        }
+        var sels=[
+          'input[type="checkbox"]',
+          '[role="checkbox"][aria-checked]',
+          '.notion-record-icon[class*="checkbox" i]',
+          '.notion-property-checkbox [role="checkbox"]',
+          '.notion-property-checkbox',
+          '[class*="checkbox" i]'
+        ];
+        for(var i=0;i<sels.length;i++){
+          var list=row.querySelectorAll(sels[i]);
+          for(var j=0;j<list.length;j++){
+            if(belongsToRow(list[j]))return list[j];
+          }
+        }
+        return null;
+      }
       var todoEls=Array.from(document.querySelectorAll('.notion-to_do-block[data-block-id]'));
       var byId={};
       todoEls.forEach(function(el){
@@ -5434,18 +5475,22 @@ async function executeTool(name, args, meta, refMapHolder) {
         if(!content) content=clean((row.textContent||'').slice(0,200));
         var checked=false;
         try{
-          var inp=row.querySelector('input[type="checkbox"]');
-          if(inp){
-            if(inp.checked===true)checked=true;
-            else if(inp.hasAttribute('checked'))checked=true;
+          var cb=ownCheckbox(row);
+          if(cb){
+            if(cb.tagName==='INPUT'&&cb.type==='checkbox'){
+              checked=cb.checked===true;
+            }else if(cb.getAttribute&&cb.getAttribute('aria-checked')==='true'){
+              checked=true;
+            }else if(/checkbox-?on/i.test(cb.className||'')||cb.getAttribute('data-checked')==='true'){
+              checked=true;
+            }
           }
           if(!checked){
-            var rcb=row.querySelector('[role="checkbox"][aria-checked="true"]');
-            if(rcb)checked=true;
-          }
-          if(!checked){
-            var cbCell=row.querySelector('[class*="checkbox-on"], [class*="checkboxOn"], [data-checked="true"]');
-            if(cbCell)checked=true;
+            var legacy=row.querySelectorAll('[class*="checkbox-on"], [class*="checkboxOn"], [data-checked="true"]');
+            for(var li=0;li<legacy.length;li++){
+              var anc=legacy[li].closest('[data-block-id]');
+              if(!anc||anc===row){checked=true;break;}
+            }
           }
         }catch(e){}
         out.push({rowId:norm(rid)||rid||'',content:content,checked:!!checked,displayIndex:idx});
@@ -5474,12 +5519,27 @@ async function executeTool(name, args, meta, refMapHolder) {
       var raw=${JSON.stringify(noHy)};
       var rows=document.querySelectorAll('[data-block-id]');
       function findCb(c){
-        return c.querySelector('input[type="checkbox"]')
-          ||c.querySelector('[role="checkbox"][aria-checked]')
-          ||c.querySelector('.notion-record-icon[class*="checkbox" i]')
-          ||c.querySelector('.notion-property-checkbox [role="checkbox"]')
-          ||c.querySelector('.notion-property-checkbox')
-          ||c.querySelector('[class*="checkbox" i]');
+        var ownId=(c.getAttribute&&c.getAttribute('data-block-id'))||null;
+        function belongsToRow(el){
+          if(!ownId)return true;
+          var anc=el.closest&&el.closest('[data-block-id]');
+          return !anc||anc===c;
+        }
+        var sels=[
+          'input[type="checkbox"]',
+          '[role="checkbox"][aria-checked]',
+          '.notion-record-icon[class*="checkbox" i]',
+          '.notion-property-checkbox [role="checkbox"]',
+          '.notion-property-checkbox',
+          '[class*="checkbox" i]'
+        ];
+        for(var i=0;i<sels.length;i++){
+          var list=c.querySelectorAll(sels[i]);
+          for(var j=0;j<list.length;j++){
+            if(belongsToRow(list[j]))return list[j];
+          }
+        }
+        return null;
       }
       var cands=[];
       for(var i=0;i<rows.length;i++){
@@ -5507,9 +5567,8 @@ async function executeTool(name, args, meta, refMapHolder) {
       }
       if(r.width===0||r.height===0)return JSON.stringify({error:'checkbox_not_visible'});
       var checked=false;
-      if(cb.checked===true)checked=true;
+      if(cb.tagName==='INPUT'&&cb.type==='checkbox')checked=cb.checked===true;
       else if(cb.getAttribute&&cb.getAttribute('aria-checked')==='true')checked=true;
-      else if(cb.hasAttribute&&cb.hasAttribute('checked'))checked=true;
       return JSON.stringify({ok:true,checked:checked,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});
     })()`;
     try {
@@ -5816,6 +5875,9 @@ ipcMain.handle('chat:reset', (_event, exe) => {
   }
   resolvePendingAsk(exe, { aborted: true }); // unblock a loop waiting on ask_user
   chatLogSessions.delete(exe); // "New chat" → next message opens a fresh log file
+  // Release any image attachments belonging to this chat
+  const ownKey = appKey(exe);
+  for (const [id, entry] of imageAttachments) if (entry.ownerId === ownKey) imageAttachments.delete(id);
 });
 
 ipcMain.handle('chat:stop', (_event, exe) => {
@@ -6055,7 +6117,20 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
     if (res.statusCode !== 200) {
       let body = '';
       res.on('data', d => body += d);
-      res.on('end', () => reject(new Error(`API error ${res.statusCode}: ${body.slice(0, 500)}`)));
+      res.on('end', () => {
+        const status = res.statusCode;
+        if (status === 400 || status === 413 || status === 415 || status === 422) {
+          try {
+            const sanitized = body
+              .replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/g, (m) => '[base64 ' + (m.length - m.indexOf(',') - 1) + ' chars]')
+              .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, 'Bearer [redacted]')
+              .replace(/sk-[A-Za-z0-9_\-]+/g, 'sk-[redacted]')
+              .slice(0, 1024);
+            debugLog('[proxy 4xx ' + status + '] ' + sanitized);
+          } catch {}
+        }
+        reject(new Error(`API error ${status}: ${body.slice(0, 500)}`));
+      });
       return;
     }
 
@@ -6442,6 +6517,42 @@ async function runChatSend(event, payload) {
     }
   }
 
+  // ── Image-attachment injection ──
+  const imageIds = Array.isArray(payload.attachments)
+    ? payload.attachments.filter(a => a && a.type === 'image' && a.id).map(a => a.id)
+    : [];
+  const ownedImages = [];
+  const allowProxyImg = !useDirectApi && proxyImagesEnabled() && !!token;
+  if (imageIds.length) {
+    if (!useDirectApi && !allowProxyImg) {
+      throw new Error('Screenshots require an OPENAI_API_KEY, or set experimental.allowProxyImages=true with a valid ChatGPT login.');
+    }
+    if (allowProxyImg) {
+      debugLog('[image] experimental codex-proxy image path active (runChatSend)');
+    }
+    const expectedOwner = appKey(exe);
+    for (const iid of imageIds) {
+      const entry = imageAttachments.get(iid);
+      if (!entry) throw new Error('Screenshot attachment not found: ' + iid);
+      if (entry.ownerId !== expectedOwner) throw new Error('Screenshot attachment does not belong to this chat');
+      if (allowProxyImg && entry.byteLength > MAX_PROXY_IMAGE_BYTES) {
+        throw new Error('Screenshot too large for codex-proxy path (' + entry.byteLength + ' B > ' + MAX_PROXY_IMAGE_BYTES + ' B cap). Re-snip a smaller region or set OPENAI_API_KEY for the direct path.');
+      }
+      ownedImages.push({ id: iid, entry });
+    }
+    // Convert last user message content to multimodal
+    const lastMsg = input.length ? input[input.length - 1] : null;
+    if (lastMsg && lastMsg.role === 'user') {
+      const baseText = typeof lastMsg.content === 'string' ? lastMsg.content : '';
+      const parts = [{ type: 'input_text', text: baseText || 'Screenshot attached.' }];
+      for (const { entry } of ownedImages) {
+        const dataUrl = 'data:' + entry.mime + ';base64,' + entry.buffer.toString('base64');
+        parts.push({ type: 'input_image', image_url: dataUrl, detail: 'high' });
+      }
+      lastMsg.content = parts;
+    }
+  }
+
   const tools = multiApp
     ? [...CDP_TOOLS, ...UIA_TOOLS, ASK_USER_TOOL, SELECT_APP_TOOL]
     : toolsForBackend(snap.backend);
@@ -6635,9 +6746,11 @@ async function runChatSend(event, payload) {
     chatAbortFlags.delete(exe);
     activeChats.delete(exe);
     if (aborted) errorReason = 'Stopped by user';
+    // Release owned image attachments
+    for (const { id } of ownedImages) imageAttachments.delete(id);
     if (logSession) {
       chatLogger.logChatTurn(logSession, {
-        userMsg: lastUserMsg,
+        userMsg: redactImageContentForLog(lastUserMsg),
         reasoning: reasoningSink.text,
         reply: fullContent,
         trail: turnTrail,
@@ -6733,6 +6846,42 @@ async function runDirectChat(event, payload) {
         }
       }
       if (sections.length) lastMsg.content += `\n\n---\n## Attached files\n\n${sections.join('\n\n')}`;
+    }
+  }
+
+  // ── Image-attachment injection (direct chat) ──
+  const imageIds = Array.isArray(payload && payload.attachments)
+    ? payload.attachments.filter(a => a && a.type === 'image' && a.id).map(a => a.id)
+    : [];
+  const ownedImages = [];
+  const allowProxyImg = !useDirectApi && proxyImagesEnabled() && !!token;
+  if (imageIds.length) {
+    if (!useDirectApi && !allowProxyImg) {
+      throw new Error('Screenshots require an OPENAI_API_KEY, or set experimental.allowProxyImages=true with a valid ChatGPT login.');
+    }
+    if (allowProxyImg) {
+      debugLog('[image] experimental codex-proxy image path active (runDirectChat)');
+    }
+    const expectedOwner = DIRECT_CHAT_ID;
+    for (const iid of imageIds) {
+      const entry = imageAttachments.get(iid);
+      if (!entry) throw new Error('Screenshot attachment not found: ' + iid);
+      if (entry.ownerId !== expectedOwner) throw new Error('Screenshot attachment does not belong to this chat');
+      if (allowProxyImg && entry.byteLength > MAX_PROXY_IMAGE_BYTES) {
+        throw new Error('Screenshot too large for codex-proxy path (' + entry.byteLength + ' B > ' + MAX_PROXY_IMAGE_BYTES + ' B cap). Re-snip a smaller region or set OPENAI_API_KEY for the direct path.');
+      }
+      ownedImages.push({ id: iid, entry });
+    }
+    // Convert last user message content to multimodal
+    const lastMsg = input.length ? input[input.length - 1] : null;
+    if (lastMsg && lastMsg.role === 'user') {
+      const baseText = typeof lastMsg.content === 'string' ? lastMsg.content : '';
+      const parts = [{ type: 'input_text', text: baseText || 'Screenshot attached.' }];
+      for (const { entry } of ownedImages) {
+        const dataUrl = 'data:' + entry.mime + ';base64,' + entry.buffer.toString('base64');
+        parts.push({ type: 'input_image', image_url: dataUrl, detail: 'high' });
+      }
+      lastMsg.content = parts;
     }
   }
 
@@ -6883,11 +7032,13 @@ async function runDirectChat(event, payload) {
     if (!resetDuringTurn) chatAbortFlags.delete(exe);
     activeChats.delete(exe);
     if (aborted) errorReason = 'Stopped by user';
+    // Release owned image attachments
+    for (const { id } of ownedImages) imageAttachments.delete(id);
     // Persist the turn to disk (skip if aborted before any reply or on hard error
     // with no content). Append-only, atomic write inside the store.
     if (!resetDuringTurn && lastUserMsg && (fullContent || !errorReason)) {
       try {
-        directChatStore.appendTurn({ userContent: lastUserMsg, assistantContent: fullContent }, debugLog);
+        directChatStore.appendTurn({ userContent: redactImageContentForLog(lastUserMsg), assistantContent: fullContent }, debugLog);
       } catch (err) {
         debugLog(`[chat:send-direct] persist failed: ${err.message}`);
       }
@@ -6900,6 +7051,398 @@ async function runDirectChat(event, payload) {
 ipcMain.handle('chat:send', runChatSend);
 ipcMain.handle('chat:send-direct', runDirectChat);
 ipcMain.handle('chat:load-direct', () => directChatStore.load(debugLog));
+
+// ── Screenshot capture ──
+
+ipcMain.handle('screenshot:capture', async (event, opts) => {
+  const ownerId = opts && typeof opts.ownerId === 'string' ? opts.ownerId : null;
+  console.log('[screenshot] handler entered', { ownerId });
+  if (!ownerId) throw new Error('screenshot:capture requires {ownerId}');
+
+  // Pre-flight: direct API key, or experimental proxy fallback with a valid OAuth token
+  const { apiKey, token } = getCodexAuth();
+  const proxyFallback = proxyImagesEnabled() && !!token;
+  if (!apiKey && !proxyFallback) {
+    throw new Error('Screenshots require an OPENAI_API_KEY in ~/.codex/auth.json, or set experimental.allowProxyImages=true with a valid ChatGPT login.');
+  }
+
+  // Mutex
+  if (activeScreenshotCapture) throw new Error('A screenshot capture is already in progress.');
+
+  const captureId = crypto.randomUUID();
+  const session = {
+    captureId, ownerId, snipperWindows: [],
+    submitted: false, settled: false, timeout: null,
+    pendingHandler: null, resolveResult: null, rejectResult: null,
+    overlayWasVisible: false, hotkeyWasRegistered: false,
+  };
+  activeScreenshotCapture = session;
+
+  const cleanup = () => {
+    if (session.cleanedUp) return;
+    session.cleanedUp = true;
+    if (session.timeout) { clearTimeout(session.timeout); session.timeout = null; }
+    if (session.pendingHandler) {
+      try { ipcMain.removeHandler('screenshot:snipper-region'); } catch {}
+      session.pendingHandler = null;
+    }
+    for (const w of session.snipperWindows) {
+      try { if (!w.isDestroyed()) w.destroy(); } catch {}
+    }
+    session.snipperWindows = [];
+    // Restore overlay visibility
+    try {
+      if (session.overlayWasVisible && overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.show();
+    } catch {}
+    // Re-register hotkey
+    try {
+      if (session.hotkeyWasRegistered && registeredHotkey) {
+        globalShortcut.register(registeredHotkey, onHotkey);
+      }
+    } catch {}
+    if (activeScreenshotCapture === session) activeScreenshotCapture = null;
+  };
+  session.cleanup = cleanup;
+
+  try {
+    return await runScreenshotCaptureSession(session);
+  } finally {
+    cleanup();
+  }
+});
+
+ipcMain.handle('screenshot:release', async (_e, id) => {
+  if (typeof id !== 'string') return;
+  imageAttachments.delete(id);
+});
+
+async function runScreenshotCaptureSession(session) {
+  // 1. Hide overlay, await hide event, +1 compositor tick
+  session.overlayWasVisible = !!(overlayWindow && !overlayWindow.isDestroyed() && overlayWindow.isVisible());
+  if (session.overlayWasVisible) {
+    await new Promise((resolve) => {
+      const onHide = () => { overlayWindow.removeListener('hide', onHide); resolve(); };
+      overlayWindow.once('hide', onHide);
+      overlayWindow.hide();
+      // Safety timeout in case 'hide' never fires
+      setTimeout(() => { overlayWindow.removeListener('hide', onHide); resolve(); }, 200);
+    });
+    await new Promise((r) => setTimeout(r, 50)); // compositor settle
+  }
+
+  // 2. Disable Ctrl+Space
+  session.hotkeyWasRegistered = !!(registeredHotkey && globalShortcut.isRegistered(registeredHotkey));
+  if (session.hotkeyWasRegistered) {
+    try { globalShortcut.unregister(registeredHotkey); } catch {}
+  }
+
+  // 3. Collect displays + capture sources
+  const displays = screen.getAllDisplays();
+  const virtualBounds = computeVirtualBounds(displays);
+
+  // Capture at requested thumbnail size = max physical pixel size across displays
+  const maxW = Math.max(...displays.map(d => Math.round(d.bounds.width * d.scaleFactor)));
+  const maxH = Math.max(...displays.map(d => Math.round(d.bounds.height * d.scaleFactor)));
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: maxW, height: maxH },
+    fetchWindowIcons: false,
+  });
+
+  // 4. Match sources to displays
+  const matched = matchSourcesToDisplays(sources, displays);
+
+  // 5. Spawn one snipper per display, then push init payloads after did-finish-load
+  const snipperPromises = matched.map(m => spawnSnipperForDisplay(session, m, virtualBounds));
+  await Promise.all(snipperPromises);
+
+  // 6. Register single-use region IPC, await reply
+  const regionResult = await new Promise((resolve, reject) => {
+    session.resolveResult = resolve;
+    session.rejectResult = reject;
+    session.timeout = setTimeout(() => {
+      reject(new Error('Screenshot capture timed out after 60s'));
+    }, SCREENSHOT_CAPTURE_TIMEOUT_MS);
+
+    const handler = async (_e, payload) => {
+      if (!payload || payload.captureId !== session.captureId) return { ack: false }; // stale
+      if (session.submitted) return { ack: false };
+      session.submitted = true;
+      try { ipcMain.removeHandler('screenshot:snipper-region'); } catch {}
+      session.pendingHandler = null;
+      if (payload.canceled) {
+        resolve({ canceled: true });
+      } else {
+        resolve({ canceled: false, rectDip: payload.rectDip });
+      }
+      return { ack: true };
+    };
+    try { ipcMain.removeHandler('screenshot:snipper-region'); } catch {}
+    ipcMain.handle('screenshot:snipper-region', handler);
+    session.pendingHandler = handler;
+
+    // Sibling-close cancellation: any snipper closing pre-submit cancels
+    for (const win of session.snipperWindows) {
+      win.once('closed', () => {
+        if (session.submitted) return;
+        session.submitted = true;
+        try { ipcMain.removeHandler('screenshot:snipper-region'); } catch {}
+        session.pendingHandler = null;
+        resolve({ canceled: true });
+      });
+    }
+  });
+
+  if (regionResult.canceled) {
+    return { canceled: true };
+  }
+
+  // 7. Crop + stitch
+  const finalImage = await cropAndStitch(matched, regionResult.rectDip);
+
+  // 8. Blank detection
+  if (isBlankCapture(finalImage)) {
+    throw new Error('Screenshot region captured no visible content (may be DRM/UAC-protected)');
+  }
+
+  // 9. Compression cascade
+  const { buffer, mime, width, height } = compressScreenshot(finalImage);
+
+  // 10. Store
+  const id = crypto.randomUUID();
+  imageAttachments.set(id, {
+    ownerId: session.ownerId, mime, width, height,
+    byteLength: buffer.byteLength, buffer, createdAt: Date.now(),
+  });
+
+  // 11. Build thumb
+  const thumbImg = nativeImage.createFromBuffer(buffer).resize({ width: 64, quality: 'good' });
+  const thumbDataUrl = 'data:image/jpeg;base64,' + thumbImg.toJPEG(70).toString('base64');
+
+  return { id, thumbDataUrl, w: width, h: height, mime };
+}
+
+function computeVirtualBounds(displays) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const d of displays) {
+    minX = Math.min(minX, d.bounds.x);
+    minY = Math.min(minY, d.bounds.y);
+    maxX = Math.max(maxX, d.bounds.x + d.bounds.width);
+    maxY = Math.max(maxY, d.bounds.y + d.bounds.height);
+  }
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+function matchSourcesToDisplays(sources, displays) {
+  const out = [];
+  const used = new Set();
+  for (const d of displays) {
+    const idStr = String(d.id);
+    let src = sources.find(s => !used.has(s.id) && String(s.display_id || '') === idStr);
+    if (!src) {
+      const remaining = sources.filter(s => !used.has(s.id));
+      if (remaining.length === displays.length - out.length) {
+        if (sources.length === displays.length) {
+          src = remaining[0];
+        }
+      }
+      if (!src) throw new Error('Screenshot capture: could not match display ' + d.id + ' to a desktop source (display_id missing or ambiguous)');
+    }
+    used.add(src.id);
+    const img = src.thumbnail;
+    const sz = img.getSize();
+    out.push({
+      display: d,
+      source: src,
+      nativeImage: img,
+      bitmapWidth: sz.width,
+      bitmapHeight: sz.height,
+      scaleX: sz.width / d.bounds.width,
+      scaleY: sz.height / d.bounds.height,
+    });
+  }
+  return out;
+}
+
+async function spawnSnipperForDisplay(session, m, virtualBounds) {
+  const win = new BrowserWindow({
+    x: m.display.bounds.x,
+    y: m.display.bounds.y,
+    width: m.display.bounds.width,
+    height: m.display.bounds.height,
+    frame: false,
+    transparent: false,
+    backgroundColor: '#000000',
+    alwaysOnTop: true,
+    fullscreen: false,
+    skipTaskbar: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    hasShadow: false,
+    focusable: true,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'snipper-preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+    },
+  });
+  session.snipperWindows.push(win);
+
+  win.setAlwaysOnTop(true, 'screen-saver');
+  win.on('show', () => { try { win.setAlwaysOnTop(true, 'screen-saver'); } catch {} });
+  win.on('focus', () => { try { win.setAlwaysOnTop(true, 'screen-saver'); } catch {} });
+  win.setMenuBarVisibility(false);
+
+  // Build low-res preview (cap to display's CSS-pixel size to limit IPC weight)
+  const previewMax = 1280;
+  const scale = Math.min(1, previewMax / Math.max(m.bitmapWidth, m.bitmapHeight));
+  const previewImg = scale < 1
+    ? m.nativeImage.resize({ width: Math.round(m.bitmapWidth * scale), height: Math.round(m.bitmapHeight * scale), quality: 'good' })
+    : m.nativeImage;
+  const previewDataUrl = 'data:image/jpeg;base64,' + previewImg.toJPEG(70).toString('base64');
+
+  await win.loadFile(path.join(__dirname, 'snipper.html'));
+  win.webContents.send('screenshot:snipper-init', {
+    captureId: session.captureId,
+    previewDataUrl,
+    displayBounds: { x: m.display.bounds.x, y: m.display.bounds.y, width: m.display.bounds.width, height: m.display.bounds.height },
+    virtualBounds,
+    scaleFactor: m.display.scaleFactor,
+  });
+  win.show();
+  win.focus();
+}
+
+async function cropAndStitch(matched, rectDip) {
+  // Find intersecting displays
+  const intersections = [];
+  for (const m of matched) {
+    const db = m.display.bounds;
+    const ix = Math.max(rectDip.x, db.x);
+    const iy = Math.max(rectDip.y, db.y);
+    const iw = Math.min(rectDip.x + rectDip.width, db.x + db.width) - ix;
+    const ih = Math.min(rectDip.y + rectDip.height, db.y + db.height) - iy;
+    if (iw > 0 && ih > 0) {
+      intersections.push({ m, dip: { x: ix, y: iy, width: iw, height: ih } });
+    }
+  }
+  if (intersections.length === 0) throw new Error('Screenshot region does not intersect any display');
+
+  if (intersections.length === 1) {
+    const { m, dip } = intersections[0];
+    const local = { x: dip.x - m.display.bounds.x, y: dip.y - m.display.bounds.y, width: dip.width, height: dip.height };
+    return m.nativeImage.crop({
+      x: Math.round(local.x * m.scaleX),
+      y: Math.round(local.y * m.scaleY),
+      width: Math.max(1, Math.round(local.width * m.scaleX)),
+      height: Math.max(1, Math.round(local.height * m.scaleY)),
+    });
+  }
+
+  // Multi-display: stitch at max scale
+  const targetScale = Math.max(...intersections.map(i => i.m.display.scaleFactor));
+  const finalW = Math.max(1, Math.round(rectDip.width * targetScale));
+  const finalH = Math.max(1, Math.round(rectDip.height * targetScale));
+  const composite = Buffer.alloc(finalW * finalH * 4);
+
+  for (const { m, dip } of intersections) {
+    const local = { x: dip.x - m.display.bounds.x, y: dip.y - m.display.bounds.y, width: dip.width, height: dip.height };
+    let crop = m.nativeImage.crop({
+      x: Math.round(local.x * m.scaleX),
+      y: Math.round(local.y * m.scaleY),
+      width: Math.max(1, Math.round(local.width * m.scaleX)),
+      height: Math.max(1, Math.round(local.height * m.scaleY)),
+    });
+    // Resize crop to target scale if below
+    if (m.display.scaleFactor < targetScale) {
+      const ratio = targetScale / m.display.scaleFactor;
+      const cs = crop.getSize();
+      crop = crop.resize({ width: Math.round(cs.width * ratio), height: Math.round(cs.height * ratio), quality: 'better' });
+    }
+    const cropSize = crop.getSize();
+    const cropBitmap = crop.getBitmap(); // BGRA, packed (assume row stride = width*4)
+    if (cropBitmap.length !== cropSize.width * cropSize.height * 4) {
+      throw new Error('Screenshot stitch: unexpected bitmap stride on display ' + m.display.id);
+    }
+    const destX = Math.round((dip.x - rectDip.x) * targetScale);
+    const destY = Math.round((dip.y - rectDip.y) * targetScale);
+    for (let row = 0; row < cropSize.height; row++) {
+      const srcOff = row * cropSize.width * 4;
+      const dstY = destY + row;
+      if (dstY < 0 || dstY >= finalH) continue;
+      const dstOff = (dstY * finalW + destX) * 4;
+      const copyW = Math.min(cropSize.width, finalW - destX);
+      if (copyW <= 0) continue;
+      cropBitmap.copy(composite, dstOff, srcOff, srcOff + copyW * 4);
+    }
+  }
+  return nativeImage.createFromBitmap(composite, { width: finalW, height: finalH, scaleFactor: targetScale });
+}
+
+function isBlankCapture(img) {
+  const sz = img.getSize();
+  const bmp = img.getBitmap(); // BGRA
+  const total = sz.width * sz.height;
+  if (total === 0) return true;
+  let maxChannel = 0;
+  let allAlphaZero = true;
+  const step = Math.max(1, Math.floor(total / SCREENSHOT_BLANK_SAMPLE_COUNT));
+  for (let i = 0, taken = 0; i < total && taken < SCREENSHOT_BLANK_SAMPLE_COUNT; i += step, taken++) {
+    const off = i * 4;
+    const b = bmp[off], g = bmp[off+1], r = bmp[off+2], a = bmp[off+3];
+    if (a !== 0) allAlphaZero = false;
+    if (b > maxChannel) maxChannel = b;
+    if (g > maxChannel) maxChannel = g;
+    if (r > maxChannel) maxChannel = r;
+  }
+  return allAlphaZero || maxChannel < SCREENSHOT_BLANK_CHANNEL_THRESHOLD;
+}
+
+function compressScreenshot(img) {
+  const sz = img.getSize();
+  let current = img;
+  let width = sz.width, height = sz.height;
+
+  // 1. PNG
+  let buffer = current.toPNG();
+  if (buffer.byteLength <= MAX_SCREENSHOT_BYTES) return { buffer, mime: 'image/png', width, height };
+
+  // 2. JPEG 85
+  buffer = current.toJPEG(SCREENSHOT_JPEG_QUALITY);
+  if (buffer.byteLength <= MAX_SCREENSHOT_BYTES) return { buffer, mime: 'image/jpeg', width, height };
+
+  // 3. Resize longest side to 2048
+  const longest = Math.max(width, height);
+  if (longest > MAX_SCREENSHOT_LONGEST_SIDE) {
+    const ratio = MAX_SCREENSHOT_LONGEST_SIDE / longest;
+    width = Math.max(1, Math.round(width * ratio));
+    height = Math.max(1, Math.round(height * ratio));
+    current = current.resize({ width, height, quality: 'better' });
+  }
+
+  // 4. Retry PNG
+  buffer = current.toPNG();
+  if (buffer.byteLength <= MAX_SCREENSHOT_BYTES) return { buffer, mime: 'image/png', width, height };
+
+  // 5. Retry JPEG 85
+  buffer = current.toJPEG(SCREENSHOT_JPEG_QUALITY);
+  if (buffer.byteLength <= MAX_SCREENSHOT_BYTES) return { buffer, mime: 'image/jpeg', width, height };
+
+  throw new Error('Screenshot too large after compression');
+}
+
+function redactImageContentForLog(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return content;
+  return content.map(p => {
+    if (p && p.type === 'input_image') return { type: 'input_text', text: '[Screenshot]' };
+    return p;
+  });
+}
 
 // Renderer-side links (chat-message anchors, web_search citations) route through
 // the OS browser via this bridge — never let an http(s) URL navigate the
@@ -6919,6 +7462,8 @@ ipcMain.handle('chat:reset-direct', () => {
   const req = activeChats.get(DIRECT_CHAT_ID);
   if (req) { try { req.destroy(); } catch {} activeChats.delete(DIRECT_CHAT_ID); }
   resolvePendingAsk(DIRECT_CHAT_ID, { aborted: true });
+  // Release any image attachments belonging to direct chat
+  for (const [id, entry] of imageAttachments) if (entry.ownerId === DIRECT_CHAT_ID) imageAttachments.delete(id);
   return directChatStore.reset(debugLog);
 });
 
@@ -8665,6 +9210,7 @@ app.on('before-quit', () => {
   isQuitting = true;
   try { globalShortcut.unregisterAll(); } catch {}
   saveOverlayPos();
+  imageAttachments.clear();
 });
 
 // ── Overlay / settings IPC ──
