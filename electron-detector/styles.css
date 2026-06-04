@@ -2958,6 +2958,21 @@ body[data-mode="overlay"] .status-bar { display: none !important; }
 }
 .launcher-foot:active { cursor: grabbing; }
 .launcher-hint { font-size: 11.5px; color: var(--text-faint); cursor: move; }
+.launcher-hint kbd {
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 2px 5px;
+  margin: 0 2px;
+  border-radius: 5px;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  color: var(--text-muted);
+  vertical-align: baseline;
+}
+/* Combo keys (Shift+Enter) — tighten gap around the `+` separator. */
+.launcher-hint kbd + kbd { margin-left: 1px; }
 .launcher-settings-btn {
   display: inline-flex; align-items: center; justify-content: center;
   width: 26px; height: 26px; border-radius: var(--r-1);
@@ -3459,3 +3474,56 @@ body[data-mode="overlay"] .launcher-card.anim .launcher-dropdown:not([hidden]) {
   border-radius: 3px;
 }
 .chat-shot-pill .chat-pill-x:hover { opacity: 1; background: color-mix(in oklch, white 10%, transparent); }
+
+/* ─── Screenshot attachment chips in sent user bubble ─── */
+.chat-msg-user.has-shots {
+  /* When the bubble has only screenshots (no text), tighten padding so the
+     chip block sits cleanly inside the rounded pill. */
+  padding: 8px 10px;
+}
+.chat-msg-shots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.chat-msg-user-text:empty { display: none; }
+.chat-msg-user.has-shots .chat-msg-user-text { margin-top: 2px; }
+.chat-msg-user.has-shots .chat-msg-shots:last-child { margin-bottom: 0; }
+
+.chat-msg-shot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px 3px 4px;
+  border-radius: var(--r-pill, 10px);
+  background: color-mix(in oklch, #78b4ff 16%, transparent);
+  border: 1px solid color-mix(in oklch, #78b4ff 32%, transparent);
+  color: var(--text, #e4e4e7);
+  font-size: 12px;
+  line-height: 1.2;
+  max-width: 100%;
+}
+.chat-msg-shot .chat-msg-shot-thumb {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex-shrink: 0;
+  display: block;
+  background: color-mix(in oklch, black 30%, transparent);
+}
+.chat-msg-shot .chat-msg-shot-thumb-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: inherit;
+  opacity: 0.85;
+}
+.chat-msg-shot .chat-msg-shot-label {
+  font-family: inherit;
+  opacity: 0.92;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

@@ -15,23 +15,33 @@
   function resize() {
     const w = window.innerWidth;
     const h = window.innerHeight;
-    canvas.width = w;
-    canvas.height = h;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    // Draw using CSS-pixel coordinates; the backing store carries device pixels.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     if (state && state.img) {
       redraw();
     }
   }
 
+  function cssWidth() { return canvas.width / (window.devicePixelRatio || 1); }
+  function cssHeight() { return canvas.height / (window.devicePixelRatio || 1); }
+
   function drawFrame() {
     if (!state || !state.img) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(state.img, 0, 0, canvas.width, canvas.height);
+    const cw = cssWidth(), ch = cssHeight();
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.drawImage(state.img, 0, 0, cw, ch);
   }
 
   function redraw() {
     if (!state || !state.img) return;
 
     drawFrame();
+    const cw = cssWidth(), ch = cssHeight();
 
     if (dragging) {
       const rx = Math.min(startX, curX);
@@ -41,7 +51,7 @@
 
       // Dim overlay over whole canvas
       ctx.fillStyle = 'rgba(0,0,0,0.4)';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillRect(0, 0, cw, ch);
 
       // Clear selection rectangle to show preview through it
       ctx.clearRect(rx, ry, rw, rh);
@@ -51,7 +61,7 @@
       ctx.beginPath();
       ctx.rect(rx, ry, rw, rh);
       ctx.clip();
-      ctx.drawImage(state.img, 0, 0, canvas.width, canvas.height);
+      ctx.drawImage(state.img, 0, 0, cw, ch);
       ctx.restore();
 
       // Stroke selection border
@@ -68,8 +78,8 @@
       let hy = curY + 12;
       const hudW = hud.offsetWidth;
       const hudH = hud.offsetHeight;
-      if (hx + hudW > canvas.width) hx = curX - hudW - 8;
-      if (hy + hudH > canvas.height) hy = curY - hudH - 8;
+      if (hx + hudW > cw) hx = curX - hudW - 8;
+      if (hy + hudH > ch) hy = curY - hudH - 8;
       if (hx < 0) hx = 4;
       if (hy < 0) hy = 4;
       hud.style.left = hx + 'px';
@@ -77,7 +87,7 @@
     } else {
       // Not dragging — show dim overlay
       ctx.fillStyle = 'rgba(0,0,0,0.4)';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillRect(0, 0, cw, ch);
       hud.style.display = 'none';
     }
   }

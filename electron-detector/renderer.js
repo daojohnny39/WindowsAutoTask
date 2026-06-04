@@ -1337,7 +1337,33 @@ function renderUserContent(content) {
 
 function renderTurn(m, i) {
   if (m.role === 'user') {
-    return `<div class="chat-msg chat-msg-user">${renderUserContent(m.content)}</div>`;
+    const shots = Array.isArray(m.screenshots) ? m.screenshots : [];
+    let shotsBlock = '';
+    if (shots.length) {
+      const chips = shots.map(s => {
+        const w = Number.isFinite(s.w) ? s.w : 0;
+        const h = Number.isFinite(s.h) ? s.h : 0;
+        const dims = (w && h) ? (w + '\xd7' + h) : '';
+        const src = s.thumbDataUrl || '';
+        const imgEl = src
+          ? `<img class="chat-msg-shot-thumb" src="${escapeHtml(src)}" alt="">`
+          : `<span class="chat-msg-shot-thumb chat-msg-shot-thumb-fallback">${SHOT_GLYPH_SVG}</span>`;
+        return `<span class="chat-msg-shot" title="Screenshot${dims ? ' ' + dims : ''}">`
+          + imgEl
+          + `<span class="chat-msg-shot-label">Screenshot${dims ? ' ' + dims : ''}</span>`
+          + `</span>`;
+      }).join('');
+      shotsBlock = `<div class="chat-msg-shots">${chips}</div>`;
+    }
+    // When the bubble carries screenshots and the model-side fallback text
+    // ("Screenshot attached.") was auto-inserted, skip rendering the redundant
+    // line — the chip already labels the attachment.
+    const rawC = m.content || '';
+    const showText = rawC.length > 0 && !(shots.length && rawC === 'Screenshot attached.');
+    const textBlock = showText
+      ? `<div class="chat-msg-user-text">${renderUserContent(rawC)}</div>`
+      : '';
+    return `<div class="chat-msg chat-msg-user${shots.length ? ' has-shots' : ''}">${shotsBlock}${textBlock}</div>`;
   }
   if (m.role === 'assistant') {
     let reasoning = '';
@@ -2480,6 +2506,7 @@ async function sendChatMessage(forcedText, forcedApps, forcedAttachments) {
   // Extract file attachments, image attachments, + /app references before clearing the input
   let fileAttachments = [];
   let imageAttachments = [];
+  let shotMeta = []; // { thumbDataUrl, w, h } per screenshot — kept for in-bubble preview
   let appRefs = [];
   if (forcedText === undefined) {
     const filePills = chatInput.querySelectorAll('.chat-file-pill');
@@ -2491,6 +2518,9 @@ async function sendChatMessage(forcedText, forcedApps, forcedAttachments) {
       if (!id || seenShot.has(id)) return;
       seenShot.add(id);
       imageAttachments.push({ type: 'image', id });
+      const w = parseInt(p.dataset.shotW || '0', 10) || 0;
+      const h = parseInt(p.dataset.shotH || '0', 10) || 0;
+      shotMeta.push({ thumbDataUrl: p.dataset.shotThumb || '', w, h });
     });
     const appPills = chatInput.querySelectorAll('.chat-app-pill');
     const seenApp = new Set();
@@ -2536,9 +2566,14 @@ async function sendChatMessage(forcedText, forcedApps, forcedAttachments) {
       imageAttachments.push({ type: 'image', id: a.id });
       if (pending) pending.delete(a.id);
       turnSet.add(a.id);
+      // Launcher path: forcedAttachments carries thumb/dims via lScrapeShotAttachments
+      const w = Number.isFinite(a.w) ? a.w : (parseInt(a.w || '0', 10) || 0);
+      const h = Number.isFinite(a.h) ? a.h : (parseInt(a.h || '0', 10) || 0);
+      shotMeta.push({ thumbDataUrl: a.thumbDataUrl || '', w, h });
     }
   }
-  addChatMessage('user', text);
+  const userExtras = shotMeta.length ? { screenshots: shotMeta } : {};
+  addChatMessage('user', text, userExtras);
   lastUserMessage = text;
 
   // Fresh turn — drop any leftover strip from a previous turn that wasn't
@@ -3219,6 +3254,11 @@ function buildScreenshotPill({ id, thumbDataUrl, w, h, ownerId }) {
   pill.dataset.attachmentId = id;
   pill.dataset.shotId = id;
   pill.dataset.ownerId = ownerId;
+  // Stash full thumb + dims so sendChatMessage can carry them into the
+  // user-message store (renders a visible attachment block in the bubble).
+  if (thumbDataUrl) pill.dataset.shotThumb = thumbDataUrl;
+  if (Number.isFinite(w)) pill.dataset.shotW = String(w);
+  if (Number.isFinite(h)) pill.dataset.shotH = String(h);
 
   const img = document.createElement('img');
   img.className = 'chat-shot-thumb';
@@ -5507,7 +5547,9 @@ refreshApps();
       const id = p.dataset.shotId;
       if (!id || seen.has(id)) return;
       seen.add(id);
-      out.push({ type: 'image', id });
+      const w = parseInt(p.dataset.shotW || '0', 10) || 0;
+      const h = parseInt(p.dataset.shotH || '0', 10) || 0;
+      out.push({ type: 'image', id, thumbDataUrl: p.dataset.shotThumb || '', w, h });
     });
     return out;
   }
@@ -5677,8 +5719,11 @@ refreshApps();
   }
 
   function completeGhost() {
-    if (lGhost.textContent) { lInput.value = lGhost.textContent; lGhost.textContent = ''; refreshSuggestions(); return true; }
-    if (items[activeIdx]) { lInput.value = items[activeIdx].name; lGhost.textContent = ''; refreshSuggestions(); return true; }
+    const caretToEnd = () => {
+      try { lInput.focus(); const n = lInput.value.length; lInput.setSelectionRange(n, n); } catch {}
+    };
+    if (lGhost.textContent) { lInput.value = lGhost.textContent; lGhost.textContent = ''; refreshSuggestions(); caretToEnd(); return true; }
+    if (items[activeIdx]) { lInput.value = items[activeIdx].name; lGhost.textContent = ''; refreshSuggestions(); caretToEnd(); return true; }
     return false;
   }
 
@@ -5688,14 +5733,56 @@ refreshApps();
     lModeChip.dataset.mode = mode;
     launcherCard.dataset.mode = mode;
   }
+  // Hint builder — wrap keyboard keys in <kbd> so they read as real keys.
+  // Pass strings as text, objects {k:'Enter'} as kbd pills, or arrays for combos
+  // like ['Shift','Enter'] which render as `<kbd>Shift</kbd>+<kbd>Enter</kbd>`.
+  const K = (...keys) => ({ k: keys });
+  function setHintParts(target, parts) {
+    target.replaceChildren();
+    for (const p of parts) {
+      if (p == null || p === '') continue;
+      if (typeof p === 'string' || typeof p === 'number') {
+        target.appendChild(document.createTextNode(String(p)));
+        continue;
+      }
+      if (p && Array.isArray(p.k)) {
+        p.k.forEach((key, i) => {
+          if (i > 0) target.appendChild(document.createTextNode('+'));
+          const el = document.createElement('kbd');
+          el.textContent = key;
+          target.appendChild(el);
+        });
+      }
+    }
+  }
   function setHint() {
     if (view === 'chat') {
-      lHint.textContent = 'Enter to send · Shift+Enter for newline · Esc to close · Hold Esc to clear chat';
+      setHintParts(lHint, [
+        K('Enter'), ' to send · ',
+        K('Shift', 'Enter'), ' for newline · ',
+        K('Esc'), ' to close · Hold ', K('Esc'), ' to clear chat',
+      ]);
       return;
     }
-    if (stage === 'app') lHint.textContent = '↑↓ navigate · Tab to pick an app · Enter to chat with GPT-5.5 · Esc to close';
-    else if (mode === 'automation') lHint.textContent = `Run an automation on ${selApp ? selApp.name : ''} · Enter to run · Tab to fill · Hold Tab to delete`;
-    else lHint.textContent = `Ask ${selApp ? selApp.name : 'the app'} to do something · Enter to send`;
+    if (stage === 'app') {
+      setHintParts(lHint, [
+        K('↑'), K('↓'), ' navigate · ',
+        K('Tab'), ' to pick an app · ',
+        K('Enter'), ' to chat with GPT-5.5 · ',
+        K('Esc'), ' to close',
+      ]);
+    } else if (mode === 'automation') {
+      setHintParts(lHint, [
+        `Run an automation on ${selApp ? selApp.name : ''} · `,
+        K('Enter'), ' to run · ',
+        K('Tab'), ' to edit · Hold ', K('Tab'), ' to delete',
+      ]);
+    } else {
+      setHintParts(lHint, [
+        `Ask ${selApp ? selApp.name : 'the app'} to do something · `,
+        K('Enter'), ' to send',
+      ]);
+    }
   }
 
   function enterLauncher(nextMode, opts) {
@@ -5878,7 +5965,7 @@ refreshApps();
     let entry = items[activeIdx]
       || autos.find(a => (a.name || '').toLowerCase() === ql || (a.slug || '').toLowerCase() === ql)
       || filterAutos(q.trim())[0];
-    if (!entry) { lHint.textContent = 'No matching automation. ↑↓ to pick from the list.'; return; }
+    if (!entry) { setHintParts(lHint, ['No matching automation. ', K('↑'), K('↓'), ' to pick from the list.']); return; }
     const meta = resolveAppMeta(selApp.exe, selApp.name);
     if (meta.type === 'electron' && !meta.port) {
       lHint.textContent = '⚠ This app needs CDP enabled — turn it on in Settings.';
@@ -6023,7 +6110,7 @@ refreshApps();
         tabHoldTarget = target;
         tabHoldStart = performance.now();
         tabDeleteFired = false;
-        tabPrevHint = lHint ? lHint.textContent : '';
+        tabPrevHint = true;
         if (lHint) lHint.textContent = `Hold to delete "${target.name}" · release to cancel`;
         const tick = () => {
           if (!tabHoldStart) return;
@@ -6047,7 +6134,7 @@ refreshApps();
             try { autos = await window.automation.list(selApp.exe) || []; } catch { autos = []; }
             refreshSuggestions();
             setHint();
-            tabPrevHint = '';
+            tabPrevHint = false;
           } catch (err) {
             if (lHint) lHint.textContent = `Delete failed: ${err && err.message ? err.message : err}`;
           } finally {
@@ -6062,7 +6149,7 @@ refreshApps();
       if (mode === 'automation' && completeGhost()) { e.preventDefault(); return; }
     }
     if (e.key === 'Escape') {
-      if (tabHoldStart || tabHoldTimer) { cancelTabHold(); if (lHint && tabPrevHint) { lHint.textContent = tabPrevHint; tabPrevHint = ''; } }
+      if (tabHoldStart || tabHoldTimer) { cancelTabHold(); if (lHint && tabPrevHint) { setHint(); tabPrevHint = false; } }
       if (stage === 'task') { e.preventDefault(); popApp(); return; }
       if (allowOverlayClose) { e.preventDefault(); window.overlay.dismiss(); }
       return;
@@ -6255,7 +6342,7 @@ refreshApps();
   let tabDeleteFired = false;
   let tabHoldTarget = null;
   let tabSuppressUntilKeyup = false;
-  let tabPrevHint = '';
+  let tabPrevHint = false;
   function cancelTabHold() {
     if (tabHoldTimer) { clearTimeout(tabHoldTimer); tabHoldTimer = null; }
     if (tabHoldRaf) { cancelAnimationFrame(tabHoldRaf); tabHoldRaf = null; }
@@ -6269,7 +6356,7 @@ refreshApps();
     if (!tabHoldStart) return;
     const armed = !tabDeleteFired;
     cancelTabHold();
-    if (lHint && tabPrevHint) { lHint.textContent = tabPrevHint; tabPrevHint = ''; }
+    if (lHint && tabPrevHint) { setHint(); tabPrevHint = false; }
     tabDeleteFired = false;
     if (armed) completeGhost();
   });

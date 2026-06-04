@@ -4790,8 +4790,13 @@ const fileAttachments = new Map(); // id → {canonicalPath, name, size, ext}
 const imageAttachments = new Map(); // id -> {ownerId, mime, width, height, byteLength, buffer, createdAt}
 const MAX_SCREENSHOT_BYTES = 4 * 1024 * 1024;
 const MAX_PROXY_IMAGE_BYTES = 3 * 1024 * 1024;
-const MAX_SCREENSHOT_LONGEST_SIDE = 2048;
-const SCREENSHOT_JPEG_QUALITY = 85;
+const SCREENSHOT_JPEG_HIGH_QUALITY = 92;
+const SCREENSHOT_JPEG_MID_QUALITY = 85;
+const SCREENSHOT_JPEG_LOW_QUALITY = 75;
+const SNIPPER_PREVIEW_JPEG_QUALITY = 92;
+const SNIPPER_PREVIEW_JPEG_FALLBACK_QUALITY = 80;
+const MAX_SNIPPER_PREVIEW_BYTES = 6 * 1024 * 1024;
+const MIN_SCREENSHOT_LONGEST_SIDE = 256;
 const SCREENSHOT_BLANK_SAMPLE_COUNT = 64;
 const SCREENSHOT_BLANK_CHANNEL_THRESHOLD = 8;
 const SCREENSHOT_CAPTURE_TIMEOUT_MS = 60_000;
@@ -6535,9 +6540,7 @@ async function runChatSend(event, payload) {
       const entry = imageAttachments.get(iid);
       if (!entry) throw new Error('Screenshot attachment not found: ' + iid);
       if (entry.ownerId !== expectedOwner) throw new Error('Screenshot attachment does not belong to this chat');
-      if (allowProxyImg && entry.byteLength > MAX_PROXY_IMAGE_BYTES) {
-        throw new Error('Screenshot too large for codex-proxy path (' + entry.byteLength + ' B > ' + MAX_PROXY_IMAGE_BYTES + ' B cap). Re-snip a smaller region or set OPENAI_API_KEY for the direct path.');
-      }
+      if (allowProxyImg) recompressEntryForProxy(entry, MAX_PROXY_IMAGE_BYTES);
       ownedImages.push({ id: iid, entry });
     }
     // Convert last user message content to multimodal
@@ -6867,9 +6870,7 @@ async function runDirectChat(event, payload) {
       const entry = imageAttachments.get(iid);
       if (!entry) throw new Error('Screenshot attachment not found: ' + iid);
       if (entry.ownerId !== expectedOwner) throw new Error('Screenshot attachment does not belong to this chat');
-      if (allowProxyImg && entry.byteLength > MAX_PROXY_IMAGE_BYTES) {
-        throw new Error('Screenshot too large for codex-proxy path (' + entry.byteLength + ' B > ' + MAX_PROXY_IMAGE_BYTES + ' B cap). Re-snip a smaller region or set OPENAI_API_KEY for the direct path.');
-      }
+      if (allowProxyImg) recompressEntryForProxy(entry, MAX_PROXY_IMAGE_BYTES);
       ownedImages.push({ id: iid, entry });
     }
     // Convert last user message content to multimodal
@@ -7206,7 +7207,7 @@ async function runScreenshotCaptureSession(session) {
   }
 
   // 9. Compression cascade
-  const { buffer, mime, width, height } = compressScreenshot(finalImage);
+  const { buffer, mime, width, height } = compressScreenshot(finalImage, MAX_SCREENSHOT_BYTES);
 
   // 10. Store
   const id = crypto.randomUUID();
@@ -7297,13 +7298,22 @@ async function spawnSnipperForDisplay(session, m, virtualBounds) {
   win.on('focus', () => { try { win.setAlwaysOnTop(true, 'screen-saver'); } catch {} });
   win.setMenuBarVisibility(false);
 
-  // Build low-res preview (cap to display's CSS-pixel size to limit IPC weight)
-  const previewMax = 1280;
-  const scale = Math.min(1, previewMax / Math.max(m.bitmapWidth, m.bitmapHeight));
-  const previewImg = scale < 1
-    ? m.nativeImage.resize({ width: Math.round(m.bitmapWidth * scale), height: Math.round(m.bitmapHeight * scale), quality: 'good' })
-    : m.nativeImage;
-  const previewDataUrl = 'data:image/jpeg;base64,' + previewImg.toJPEG(70).toString('base64');
+  // Full-resolution preview at native bitmap size. Visual-only — does not affect
+  // the final-image compression path. Step quality down if a noisy/high-DPI
+  // monitor produces a JPEG larger than the IPC payload guard.
+  let previewBuf = m.nativeImage.toJPEG(SNIPPER_PREVIEW_JPEG_QUALITY);
+  if (previewBuf.byteLength > MAX_SNIPPER_PREVIEW_BYTES) {
+    previewBuf = m.nativeImage.toJPEG(SNIPPER_PREVIEW_JPEG_FALLBACK_QUALITY);
+  }
+  if (previewBuf.byteLength > MAX_SNIPPER_PREVIEW_BYTES) {
+    // Last resort: scale to fit budget. Bytes ~ proportional to pixel count.
+    const ratioLinear = Math.sqrt(MAX_SNIPPER_PREVIEW_BYTES / previewBuf.byteLength) * 0.9;
+    const w = Math.max(1, Math.round(m.bitmapWidth * ratioLinear));
+    const h = Math.max(1, Math.round(m.bitmapHeight * ratioLinear));
+    previewBuf = m.nativeImage.resize({ width: w, height: h, quality: 'better' })
+      .toJPEG(SNIPPER_PREVIEW_JPEG_FALLBACK_QUALITY);
+  }
+  const previewDataUrl = 'data:image/jpeg;base64,' + previewBuf.toString('base64');
 
   await win.loadFile(path.join(__dirname, 'snipper.html'));
   win.webContents.send('screenshot:snipper-init', {
@@ -7402,37 +7412,80 @@ function isBlankCapture(img) {
   return allAlphaZero || maxChannel < SCREENSHOT_BLANK_CHANNEL_THRESHOLD;
 }
 
-function compressScreenshot(img) {
+function compressScreenshot(img, maxBytes) {
+  if (!(maxBytes > 0)) throw new Error('compressScreenshot: maxBytes must be > 0');
   const sz = img.getSize();
   let current = img;
   let width = sz.width, height = sz.height;
 
-  // 1. PNG
+  // 1. PNG — small / flat regions exit here losslessly.
   let buffer = current.toPNG();
-  if (buffer.byteLength <= MAX_SCREENSHOT_BYTES) return { buffer, mime: 'image/png', width, height };
+  if (buffer.byteLength <= maxBytes) return { buffer, mime: 'image/png', width, height };
 
-  // 2. JPEG 85
-  buffer = current.toJPEG(SCREENSHOT_JPEG_QUALITY);
-  if (buffer.byteLength <= MAX_SCREENSHOT_BYTES) return { buffer, mime: 'image/jpeg', width, height };
+  // 2. JPEG high quality (q=92).
+  buffer = current.toJPEG(SCREENSHOT_JPEG_HIGH_QUALITY);
+  if (buffer.byteLength <= maxBytes) return { buffer, mime: 'image/jpeg', width, height };
 
-  // 3. Resize longest side to 2048
-  const longest = Math.max(width, height);
-  if (longest > MAX_SCREENSHOT_LONGEST_SIDE) {
-    const ratio = MAX_SCREENSHOT_LONGEST_SIDE / longest;
-    width = Math.max(1, Math.round(width * ratio));
-    height = Math.max(1, Math.round(height * ratio));
-    current = current.resize({ width, height, quality: 'better' });
+  // 3. JPEG mid quality (q=85).
+  let lastJpegBytes = current.toJPEG(SCREENSHOT_JPEG_MID_QUALITY);
+  if (lastJpegBytes.byteLength <= maxBytes) {
+    return { buffer: lastJpegBytes, mime: 'image/jpeg', width, height };
   }
 
-  // 4. Retry PNG
-  buffer = current.toPNG();
-  if (buffer.byteLength <= MAX_SCREENSHOT_BYTES) return { buffer, mime: 'image/png', width, height };
+  // 4. Pixel-aware downscale based on q=85 size, scale only when bigger than budget.
+  function downscaleByJpegSize(jpegBytes) {
+    const currentLongest = Math.max(width, height);
+    if (currentLongest <= MIN_SCREENSHOT_LONGEST_SIDE) return false;
+    // Bytes ~ proportional to pixel count -> linear dim ~ sqrt(budget/bytes).
+    const ratioLinear = Math.sqrt(maxBytes / jpegBytes.byteLength) * 0.9;
+    if (!(ratioLinear > 0)) return false;
+    let targetLongest = Math.floor(currentLongest * ratioLinear);
+    targetLongest = Math.min(currentLongest, Math.max(MIN_SCREENSHOT_LONGEST_SIDE, targetLongest));
+    if (targetLongest >= currentLongest) return false;
+    const k = targetLongest / currentLongest;
+    width = Math.max(1, Math.round(width * k));
+    height = Math.max(1, Math.round(height * k));
+    current = current.resize({ width, height, quality: 'better' });
+    return true;
+  }
 
-  // 5. Retry JPEG 85
-  buffer = current.toJPEG(SCREENSHOT_JPEG_QUALITY);
-  if (buffer.byteLength <= MAX_SCREENSHOT_BYTES) return { buffer, mime: 'image/jpeg', width, height };
+  if (downscaleByJpegSize(lastJpegBytes)) {
+    // 5. JPEG q=85 at new size.
+    buffer = current.toJPEG(SCREENSHOT_JPEG_MID_QUALITY);
+    if (buffer.byteLength <= maxBytes) return { buffer, mime: 'image/jpeg', width, height };
+    lastJpegBytes = buffer;
+  }
 
-  throw new Error('Screenshot too large after compression');
+  // 6. JPEG q=75 at current (possibly resized) size.
+  buffer = current.toJPEG(SCREENSHOT_JPEG_LOW_QUALITY);
+  if (buffer.byteLength <= maxBytes) return { buffer, mime: 'image/jpeg', width, height };
+  lastJpegBytes = buffer;
+
+  // 7. Last-chance retry: downscale again from q=75 bytes, retry q=75.
+  if (downscaleByJpegSize(lastJpegBytes)) {
+    buffer = current.toJPEG(SCREENSHOT_JPEG_LOW_QUALITY);
+    if (buffer.byteLength <= maxBytes) return { buffer, mime: 'image/jpeg', width, height };
+  }
+
+  throw new Error('Screenshot too large after compression (' + buffer.byteLength + ' B > ' + maxBytes + ' B budget at ' + width + 'x' + height + ')');
+}
+
+// Proxy path caps payload at MAX_PROXY_IMAGE_BYTES. If a stored attachment is
+// over that cap, decode and re-run the compression cascade with the smaller
+// budget. Mutates `entry` in place only on success so a failed recompress
+// leaves the original direct-path buffer intact.
+function recompressEntryForProxy(entry, maxBytes) {
+  if (entry.byteLength <= maxBytes) return;
+  const decoded = nativeImage.createFromBuffer(entry.buffer);
+  if (!decoded || decoded.isEmpty()) {
+    throw new Error('Screenshot too large for codex-proxy path (' + entry.byteLength + ' B > ' + maxBytes + ' B cap) and stored buffer could not be decoded for recompression.');
+  }
+  const next = compressScreenshot(decoded, maxBytes);
+  entry.buffer = next.buffer;
+  entry.mime = next.mime;
+  entry.width = next.width;
+  entry.height = next.height;
+  entry.byteLength = next.buffer.byteLength;
 }
 
 function redactImageContentForLog(content) {
