@@ -85,6 +85,8 @@ contextBridge.exposeInMainWorld('overlay', {
   maxHeight: () => ipcRenderer.invoke('overlay:max-height'),
   // Suppress blur-dismiss while a footer drag is in progress.
   setDragging: (active) => ipcRenderer.send('overlay:set-dragging', { active: !!active }),
+  // Session-only pin: keep the overlay open on blur until unpinned (resets each summon).
+  setPinned: (pinned) => ipcRenderer.send('overlay:set-pinned', { pinned: !!pinned }),
   dismiss: () => ipcRenderer.invoke('overlay:dismiss'),
   // Renderer acks the close animation finished → main hides the BrowserWindow.
   finishHide: () => ipcRenderer.send('overlay:hide-finished'),
@@ -128,6 +130,11 @@ contextBridge.exposeInMainWorld('automation', {
   addStep: (payload) => ipcRenderer.invoke('automation:add-step', payload),
   rename: (payload) => ipcRenderer.invoke('automation:rename', payload),
   remove: (payload) => ipcRenderer.invoke('automation:delete', payload),
+  groupSteps: (payload) => ipcRenderer.invoke('automation:group-steps', payload),
+  generateGroupPrompt: (payload) => ipcRenderer.invoke('automation:generate-group-prompt', payload),
+  loadDynamic: (payload) => ipcRenderer.invoke('automation:load-dynamic', payload),
+  saveDynamic: (payload) => ipcRenderer.invoke('automation:save-dynamic', payload),
+  cancelGroup: (jobId) => ipcRenderer.invoke('automation:cancel-group', jobId),
   run: (payload) => ipcRenderer.invoke('automation:run', payload),
   stop: (runId) => ipcRenderer.send('automation:stop', { runId }),
   onCodexProgress: (cb) => {
@@ -149,5 +156,17 @@ contextBridge.exposeInMainWorld('automation', {
     const handler = (_e, data) => cb(data);
     ipcRenderer.on('automation:run-done', handler);
     return () => ipcRenderer.removeListener('automation:run-done', handler);
+  },
+  dynamicRun: {
+    start: (p) => ipcRenderer.invoke('automation:dynamic-run-start', p),
+    submitInput: (p) => ipcRenderer.invoke('automation:dynamic-run-inputs', p),
+    execute: (p) => ipcRenderer.invoke('automation:dynamic-run-execute', p),
+    retry: (p) => ipcRenderer.invoke('automation:dynamic-run-retry', p),
+    stop: (p) => ipcRenderer.invoke('automation:dynamic-run-stop', p),
+    onEvent: (cb) => {
+      const handler = (_e, data) => cb(data);
+      ipcRenderer.on('automation:dynamic-run-event', handler);
+      return () => ipcRenderer.removeListener('automation:dynamic-run-event', handler);
+    },
   },
 });

@@ -48,6 +48,9 @@
         <button class="launcher-close-btn" id="launcher-close-btn" type="button" title="Close overlay" hidden>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
         </button>
+        <button class="launcher-pin-btn" id="launcher-pin-btn" type="button" title="Pin overlay (stay open)" aria-pressed="false">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"></line><path d="M5 17h14l-1.5-2.5V9l1-1V3H6.5v5l1 1v5.5L5 17z"></path></svg>
+        </button>
         <button class="launcher-settings-btn" id="launcher-settings-btn" type="button" title="Settings">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
         </button>
@@ -173,6 +176,14 @@
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6M14 11v6"></path></svg>
         Reset chat
       </button>
+    </div>
+    <div id="dynamic-run-host" class="dynamic-run-host" hidden>
+      <div class="dynamic-run-header">
+        <span class="dynamic-run-name"></span>
+        <span class="dynamic-run-phase"></span>
+        <button class="dynamic-run-stop" type="button">Stop</button>
+      </div>
+      <div class="dynamic-run-list"></div>
     </div>
     <div class="chat-scroll" id="chat-scroll">
       <div class="chat-messages" id="chat-messages">
@@ -323,23 +334,39 @@
               <div class="auto-modal-section-label">Name</div>
               <input type="text" class="auto-modal-input" id="auto-review-name" placeholder="Automation name">
             </div>
-            <div class="auto-modal-section">
-              <div class="auto-modal-section-label">Steps (<span id="auto-review-count">0</span>) · click a step to change it, ✕ to remove, or add one below</div>
-              <div class="auto-modal-steps" id="auto-review-steps"></div>
+            <div class="auto-modal-tabs" role="tablist">
+              <button class="auto-modal-tab is-active" data-tab="static" role="tab" type="button">Static</button>
+              <button class="auto-modal-tab" data-tab="dynamic" role="tab" type="button">Dynamic</button>
             </div>
-            <div class="auto-modal-error" id="auto-review-error"></div>
+            <div class="auto-modal-tab-pane" data-pane="static">
+              <div class="auto-modal-section">
+                <div class="auto-modal-section-label">Steps (<span id="auto-review-count">0</span>) · click a step to change it, ✕ to remove, or add one below</div>
+                <div class="auto-modal-steps" id="auto-review-steps"></div>
+              </div>
+              <div class="auto-modal-error" id="auto-review-error"></div>
 
-            <button class="auto-modal-link" id="auto-review-toggle-json" type="button">&#9656; Show technical view (JSON)</button>
-            <div class="auto-modal-json-wrap" id="auto-review-json-wrap" hidden>
-              <textarea class="auto-modal-recipe auto-modal-json" id="auto-review-json" spellcheck="false"></textarea>
-              <div class="auto-modal-error" id="auto-review-json-error"></div>
-              <div class="auto-modal-json-foot">
-                <button class="ghost-btn" id="auto-review-json-save">Apply JSON changes</button>
+              <button class="auto-modal-link" id="auto-review-toggle-json" type="button">&#9656; Show technical view (JSON)</button>
+              <div class="auto-modal-json-wrap" id="auto-review-json-wrap" hidden>
+                <textarea class="auto-modal-recipe auto-modal-json" id="auto-review-json" spellcheck="false"></textarea>
+                <div class="auto-modal-error" id="auto-review-json-error"></div>
+                <div class="auto-modal-json-foot">
+                  <button class="ghost-btn" id="auto-review-json-save">Apply JSON changes</button>
+                </div>
+              </div>
+            </div>
+            <div class="auto-modal-tab-pane" data-pane="dynamic" hidden>
+              <div class="auto-modal-dyn-hint">Click a step card to mark it dynamic. At runtime, GPT will handle these steps live with your input.</div>
+              <div class="auto-modal-dyn-loading" hidden><span class="spinner"></span> Grouping steps…</div>
+              <div class="auto-modal-error auto-modal-dyn-error" hidden></div>
+              <div class="auto-modal-dyn-groups" id="auto-review-dyn-groups"></div>
+              <div class="auto-modal-dyn-retry" hidden>
+                <button class="ghost-btn" id="auto-review-dyn-retry-btn" type="button">Regenerate grouping</button>
               </div>
             </div>
           </div>
           <div class="auto-modal-foot">
             <button class="ghost-btn" id="auto-review-discard">Discard</button>
+            <button class="ghost-btn" id="auto-review-save-new" hidden>Save as new</button>
             <button class="ghost-btn primary" id="auto-review-save">Save automation</button>
           </div>
         </div>

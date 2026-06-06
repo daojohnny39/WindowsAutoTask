@@ -64,6 +64,25 @@ function execFile(cmd, args, opts, cb) {
   return tryOnce();
 }
 
+function abortableSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) return reject(new DOMException('aborted', 'AbortError'));
+    const t = setTimeout(resolve, ms);
+    const onAbort = () => { clearTimeout(t); reject(new DOMException('aborted', 'AbortError')); };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function mergeAbortSignals(...signals) {
+  const c = new AbortController();
+  for (const s of signals) {
+    if (!s) continue;
+    if (s.aborted) { c.abort(); break; }
+    s.addEventListener('abort', () => c.abort(), { once: true });
+  }
+  return c.signal;
+}
+
 const STATE_PATH = path.join(__dirname, '..', 'cdp-state.json');
 const PS_SCRIPT_PATH = path.join(__dirname, '..', 'Start-ElectronDebug.ps1');
 const TASK_NAME = 'ElectronCDP-Persistent';
@@ -378,6 +397,7 @@ let settingsWindow = null;   // decorated management window (app mgmt, auth, hot
 let overlayWindow = null;    // frameless transparent quick-entry overlay (primary surface)
 let overlayDragging = false; // true while the user drags the overlay by its footer (suppress blur-dismiss)
 let overlayClosing = false;  // true while a hide is in flight; suppress duplicate hides + blur loops
+let overlayPinned = false;   // session-only: true keeps the overlay open on blur (resets every summon, never persisted)
 let overlayCloseTimer = null; // fallback timer in case the renderer never acks the hide request
 let overlayFadeTween = null;  // setInterval handle for the BrowserWindow opacity fade tween
 let tray = null;
@@ -697,8 +717,9 @@ function createOverlayWindow() {
     // the renderer's transition with a duplicate fade).
     if (overlayClosing) return;
     // Respect config: when allowOverlayClose=false the user must dismiss via
-    // the launcher X button or the global hotkey.
-    if (appConfig.allowOverlayClose === false) return;
+    // the launcher X button (the global hotkey never hides a visible overlay).
+    // Likewise, when pinned the overlay stays open on blur until unpinned.
+    if (appConfig.allowOverlayClose === false || overlayPinned) return;
     if (overlayWindow && !overlayWindow.webContents.isDevToolsFocused()) hideOverlay();
   });
   overlayWindow.on('close', (e) => {
@@ -849,6 +870,7 @@ function showOverlay(mode /* 'chat' | 'automation' */) {
   if (overlayCloseTimer) { clearTimeout(overlayCloseTimer); overlayCloseTimer = null; }
   cancelOverlayFade();
   overlayClosing = false;
+  overlayPinned = false;       // session-only: every summon defaults unpinned
   const width = appConfig.overlay.width;
   const height = appConfig.overlay.collapsedHeight;
   const pos = overlayTargetPos(width, height);
@@ -3234,6 +3256,119 @@ function cdpEvalRaw(port, jsExpr) {
   });
 }
 
+// Best-effort signed-in-user probe for the active app in a dynamic run.
+// Discord: reuses buildMessagesExpr(1) — the same DOM scrape that powers
+// cdp_get_messages — and parses {currentUser, currentUserId}. All other
+// app kinds return {ok:true, kind:'none'} so the synthetic message renders
+// the neutral fallback identity block. Caller wraps in try/catch; we ALSO
+// race against a 1500ms timeout so a wedged CDP socket never blocks the
+// dynamic turn. Result is cached on record._identityCache[appKey(exe)] so
+// multi-group runs only pay the round-trip once.
+async function probeActiveAppIdentity(record) {
+  if (!record) return null;
+  try {
+    if (record.abort && record.abort.signal && record.abort.signal.aborted) {
+      return { ok: false, kind: 'unknown', error: 'aborted' };
+    }
+  } catch {}
+  const cache = record._identityCache || (record._identityCache = {});
+  const exe = record.exe || '';
+  const key = exe ? appKey(exe) : 'unknown';
+  if (cache[key]) return cache[key];
+  const meta = record.meta || {};
+  const prefix = String(key).split('_')[0];
+  let result;
+  try {
+    if (prefix === 'discord' && meta && meta.type === 'electron' && meta.port) {
+      let timerHandle = null;
+      const raw = await Promise.race([
+        cdpEvalRaw(meta.port, buildMessagesExpr(1)),
+        new Promise((_res, rej) => {
+          timerHandle = setTimeout(() => rej(new Error('probe_timeout')), 1500);
+        }),
+      ]).finally(() => { if (timerHandle) clearTimeout(timerHandle); });
+      let sanitized = String(raw).replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ');
+      // Mirror cdp_get_messages defensive unwrap: PowerShell fallback path can
+      // return a JSON-encoded string wrapping the real JSON payload.
+      if (sanitized.length > 1 && sanitized.startsWith('"') && sanitized.endsWith('"')) {
+        try { sanitized = JSON.parse(sanitized); } catch {}
+      }
+      let parsed = null;
+      try { parsed = JSON.parse(sanitized); } catch {}
+      if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed); } catch {} }
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('probe_parse_failed');
+      }
+      result = {
+        ok: true,
+        kind: 'discord',
+        currentUser: String((parsed && parsed.currentUser) || ''),
+        currentUserId: String((parsed && parsed.currentUserId) || ''),
+      };
+    } else {
+      result = { ok: true, kind: 'none' };
+    }
+  } catch (e) {
+    result = { ok: false, kind: prefix || 'unknown', error: String((e && e.message) || e) };
+  }
+  // Cache only deterministic outcomes: successful probes (any kind), and the
+  // 'none' no-op for non-Discord apps. Transient failures (timeout, CDP socket
+  // hiccup, parse error) are NOT cached so subsequent groups in the same run
+  // can re-probe once the app is fully rendered.
+  const cacheable = result && (
+    (result.ok && (result.kind === 'none' || result.currentUser || result.currentUserId))
+  );
+  if (cacheable) cache[key] = result;
+  return result;
+}
+
+// Fail-closed CDP probe for the channel currently open in Discord. Reads the
+// message composer's aria-label ("Message #<channel>") and returns the channel
+// name ONLY when exactly one visible composer matches the strict pattern.
+// Anything ambiguous — search panel covering the composer, a DM (aria-label is
+// "Message @user", no '#'), a thread/forum state with multiple composers, or no
+// composer — returns { ok:false } so the caller omits the data rather than
+// guessing wrong. A wrong channel is worse than an absent one.
+const ACTIVE_CHANNEL_EXPR = `(function(){try{var els=Array.from(document.querySelectorAll('[role="textbox"][aria-label^="Message #"]'));els=els.filter(function(e){return e.offsetParent!==null;});if(els.length!==1)return JSON.stringify({ok:false});var al=els[0].getAttribute('aria-label')||'';var m=al.match(/^Message #(.+)$/);if(!m)return JSON.stringify({ok:false});var ch=(m[1]||'').replace(/[\\u0000-\\u001F\\u007F-\\u009F]+/g,' ').trim();if(!ch||ch.indexOf('#')!==-1)return JSON.stringify({ok:false});return JSON.stringify({ok:true,channel:ch});}catch(e){return JSON.stringify({ok:false});}})()`;
+
+// Probe the active Discord channel for the CURRENT group. Mirrors
+// probeActiveAppIdentity's defensive shape (1500ms race, swallow all errors,
+// never throw out to abort the run). Deliberately NOT cached: the active
+// channel changes whenever a group navigates, so a cross-group cache would
+// recreate the stale-ground-truth bug this probe exists to defend against.
+async function probeActiveChannel(record) {
+  if (!record) return { ok: false };
+  try {
+    if (record.abort && record.abort.signal && record.abort.signal.aborted) return { ok: false };
+  } catch {}
+  const meta = record.meta || {};
+  const exe = record.exe || '';
+  const key = exe ? appKey(exe) : 'unknown';
+  const prefix = String(key).split('_')[0];
+  if (prefix !== 'discord' || !meta || meta.type !== 'electron' || !meta.port) return { ok: false };
+  try {
+    let timerHandle = null;
+    const raw = await Promise.race([
+      cdpEvalRaw(meta.port, ACTIVE_CHANNEL_EXPR),
+      new Promise((_res, rej) => { timerHandle = setTimeout(() => rej(new Error('probe_timeout')), 1500); }),
+    ]).finally(() => { if (timerHandle) clearTimeout(timerHandle); });
+    let sanitized = String(raw).replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ');
+    if (sanitized.length > 1 && sanitized.startsWith('"') && sanitized.endsWith('"')) {
+      try { sanitized = JSON.parse(sanitized); } catch {}
+    }
+    let parsed = null;
+    try { parsed = JSON.parse(sanitized); } catch {}
+    if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed); } catch {} }
+    if (parsed && parsed.ok === true && parsed.channel) {
+      return { ok: true, channel: String(parsed.channel) };
+    }
+    return { ok: false };
+  } catch (e) {
+    debugLog('[active-channel] probe failed: ' + ((e && e.message) || e));
+    return { ok: false };
+  }
+}
+
 function cdpEvalRawPS(port, jsExpr) {
   return new Promise((resolve, reject) => {
     const script = buildCdpExprScript(port, jsExpr);
@@ -4002,6 +4137,18 @@ server, so use the search bar whenever the task is:
    the current server. Refs from the snapshot stay valid for
    \`cdp_paste\` (the search bar element is the same node before and
    after focus).
+   **Where \`<channel>\` comes from:** Discord search is server-wide, so
+   \`in:<channel>\` is what scopes results to a channel — getting it
+   wrong silently searches (and jumps you into) the wrong channel.
+   Substitute \`<channel>\` with the channel you are ACTUALLY in right
+   now — read it from the live composer placeholder (\`"Message
+   #<channel>"\`) or, in an automation run, the **Active channel** line
+   in the run context. **NEVER** copy the channel from the automation
+   title, the group label, or a prior-step summary — those are human
+   descriptions and are often stale (a title may say \`#example-channel\`
+   while the run actually navigated to \`#example-channel-b\`). If the
+   active channel disagrees with a channel named in the task text, trust
+   the active channel.
 4. \`cdp_press_key("Enter")\` — submits the search and opens the
    results panel. Wait briefly for results to load.
 5. \`cdp_get_search_results(limit?)\` — **REQUIRED** to enumerate
@@ -4974,7 +5121,9 @@ ${rows}
 \`cdp_*\` tools drive Electron (cdp) apps; \`uia_*\` tools drive Win32 (uia) apps. A tool that doesn't match the active app's backend returns an error — select the matching app first. Complete all work in one app before switching. Never echo a raw \`[app:...]\` token back to the user; refer to each app by name.`;
 }
 
-async function executeTool(name, args, meta, refMapHolder) {
+async function executeTool(name, args, meta, refMapHolder, ctx = {}) {
+  const signal = ctx && ctx.signal;
+  if (signal && signal.aborted) return { error: 'aborted', hint: 'Run was aborted.' };
   const refMap = refMapHolder.current;
   const lookup = (ref) => {
     const r = refMap[ref];
@@ -5045,7 +5194,7 @@ async function executeTool(name, args, meta, refMapHolder) {
       const deadline = Date.now() + 6000;
       let last = null;
       while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 300));
+        try { await abortableSleep(300, signal); } catch (_) { return { error: 'aborted' }; }
         try {
           const readRawRaw = await cdpEvalRaw(meta.port, readExpr);
           let readRaw = readRawRaw;
@@ -5143,7 +5292,7 @@ async function executeTool(name, args, meta, refMapHolder) {
       // avoid bogus matches on background processes.
       const pollForNewTarget = async (deadline) => {
         while (Date.now() < deadline) {
-          await new Promise(r => setTimeout(r, 250));
+          try { await abortableSleep(250, signal); } catch (_) { return null; }
           const cur = await fetchCdpTargets(meta.port);
           const fresh = cur.find(p => !beforeIds.has(p.id)
             && !isTabBarUrl(p.url)
@@ -5164,7 +5313,7 @@ async function executeTool(name, args, meta, refMapHolder) {
           const cur = await fetchCdpTargets(meta.port);
           const t = cur.find(p => p.id === targetId);
           if (t && t.webSocketDebuggerUrl) return t;
-          await new Promise(r => setTimeout(r, 200));
+          try { await abortableSleep(200, signal); } catch (_) { return null; }
         }
         return null;
       };
@@ -5394,12 +5543,12 @@ async function executeTool(name, args, meta, refMapHolder) {
           const parsed = JSON.parse(ss);
           if (parsed && parsed.ok) break;
         } catch (_) {}
-        await new Promise(r => setTimeout(r, 250));
+        try { await abortableSleep(250, signal); } catch (_) { return { error: 'aborted' }; }
       }
       const navDeadline = Date.now() + 12000;
       let lastRead = null;
       while (Date.now() < navDeadline) {
-        await new Promise(r => setTimeout(r, 300));
+        try { await abortableSleep(300, signal); } catch (_) { return { error: 'aborted' }; }
         try {
           const rawRead = await cdpEvalRaw(meta.port, readExpr);
           let s = rawRead;
@@ -6032,8 +6181,11 @@ ipcMain.handle('chat:pick-file', async (event) => {
   return { files, skipped, canceled: false };
 });
 
-function sendResponsesRequest({ useDirectApi, token, accountId, body }) {
+function sendResponsesRequest({ useDirectApi, token, accountId, body, signal }) {
   return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      return reject(new DOMException('aborted', 'AbortError'));
+    }
     const bodyStr = JSON.stringify(body);
     const bodyBuf = Buffer.from(bodyStr, 'utf-8');
     const headers = {
@@ -6050,12 +6202,22 @@ function sendResponsesRequest({ useDirectApi, token, accountId, body }) {
       headers,
     }, (res) => {
       try { req.setTimeout(0); } catch {}
+      if (signal) signal.removeEventListener('abort', onAbort);
       resolve({ req, res });
     });
     req.setTimeout(60_000, () => {
       try { req.destroy(new Error('Initial response timeout (60s) — server did not start streaming')); } catch {}
     });
-    req.on('error', (err) => reject(new Error(`Network error: ${err.message}`)));
+    const onAbort = () => {
+      try { req.destroy(new DOMException('aborted', 'AbortError')); } catch {}
+      reject(new DOMException('aborted', 'AbortError'));
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    req.on('error', (err) => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (err && err.name === 'AbortError') return reject(err);
+      reject(new Error(`Network error: ${err.message}`));
+    });
     req.write(bodyBuf);
     req.end();
   });
@@ -6075,7 +6237,9 @@ function isTransientNetworkError(msg) {
 
 async function sendResponsesRequestWithRetry(opts, { retries = 3, baseDelayMs = 1000, onRetry } = {}) {
   let lastErr;
+  const signal = opts && opts.signal;
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
     try {
       const { req, res } = await sendResponsesRequest(opts);
       const status = res.statusCode;
@@ -6088,12 +6252,13 @@ async function sendResponsesRequestWithRetry(opts, { retries = 3, baseDelayMs = 
         if (typeof onRetry === 'function') {
           try { onRetry({ status, attempt: attempt + 1, total: retries + 1, delayMs: delay }); } catch {}
         }
-        await new Promise(r => setTimeout(r, delay));
+        await abortableSleep(delay, signal);
         continue;
       }
       return { req, res };
     } catch (err) {
       lastErr = err;
+      if (err && err.name === 'AbortError') throw err;
       const transient = isTransientNetworkError(err.message);
       if (transient && attempt < retries) {
         const delay = baseDelayMs * Math.pow(2, attempt);
@@ -6101,7 +6266,7 @@ async function sendResponsesRequestWithRetry(opts, { retries = 3, baseDelayMs = 
         if (typeof onRetry === 'function') {
           try { onRetry({ status: 0, attempt: attempt + 1, total: retries + 1, delayMs: delay, err: err.message }); } catch {}
         }
-        await new Promise(r => setTimeout(r, delay));
+        await abortableSleep(delay, signal);
         continue;
       }
       throw err;
@@ -6111,8 +6276,17 @@ async function sendResponsesRequestWithRetry(opts, { retries = 3, baseDelayMs = 
   throw new Error('Exhausted retries');
 }
 
-async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, partial, reasoningSink }) {
+async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, partial, reasoningSink, signal }) {
   return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      try { req.destroy(); } catch {}
+      return reject(new DOMException('aborted', 'AbortError'));
+    }
+    const onAbort = () => {
+      try { req.destroy(); } catch {}
+      reject(new DOMException('aborted', 'AbortError'));
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     if (res.statusCode === 401 || res.statusCode === 403) {
       let body = '';
       res.on('data', d => body += d);
@@ -6330,7 +6504,14 @@ async function streamOneRound({ req, res, meta, sender, maxIdleMs, maxTotalMs, p
       reject(new Error('Stream aborted before response.'));
     });
 
-    activeChats.set(meta.exe, req);
+    const prior = activeChats.get(meta.exe);
+    if (prior && prior.fetchController) {
+      prior.req = req;
+      const origDestroy = prior.destroy;
+      prior.destroy = () => { try { req.destroy(); } catch {} try { origDestroy && origDestroy(); } catch {} };
+    } else {
+      activeChats.set(meta.exe, req);
+    }
   });
 }
 
@@ -6376,22 +6557,44 @@ function synthesiseDoneReply(trail) {
   return 'ChatGPT stopped without sending a reply. Try regenerating.';
 }
 
-async function runChatSend(event, payload) {
+async function runChatSend(event, payload, opts = {}) {
   const { token, accountId, apiKey } = getCodexAuth();
   if (!token) throw new Error('Not logged in. Click "Login with ChatGPT" first.');
   const useDirectApi = !!apiKey;
 
+  const sender = (opts && opts.sender) || (event && event.sender);
+  if (!sender) throw new Error('chat:send requires a sender (event.sender or opts.sender)');
+  const signal = opts && opts.signal;
+
   const meta = payload && payload.meta;
   const messages = (payload && payload.messages) || [];
-  if (!meta || !meta.exe || !meta.name) {
+  if (!meta || (!meta.exe && !opts.syntheticExe) || !meta.name) {
     throw new Error('chat:send requires payload.meta with { exe, name, type, pid, port }');
   }
+  if (opts.syntheticExe && !meta.exe) meta.exe = opts.syntheticExe;
   const exe = meta.exe;
   // turnId stamps every chat:* event so the renderer can drop late events from
   // a Stop+Reset'd stream that would otherwise contaminate the next turn's bubble.
-  const turnId = (payload && typeof payload.turnId === 'number') ? payload.turnId : null;
+  const turnId = (opts && opts.syntheticTurnId != null)
+    ? opts.syntheticTurnId
+    : ((payload && typeof payload.turnId === 'number') ? payload.turnId : null);
   meta.turnId = turnId;
   chatAbortFlags.delete(exe);
+
+  // Early registration: store the abort controller / signal BEFORE the first
+  // HTTP attempt so chat:stop / dynamic-run-stop can abort the initial connect
+  // and retry-backoff windows. Replaced inside streamOneRound once a real req
+  // exists. The destroy() in chat:stop is a no-op on a plain object, but the
+  // signal path covers the connect phase regardless.
+  const fetchController = new AbortController();
+  const combinedSignal = signal
+    ? mergeAbortSignals(signal, fetchController.signal)
+    : fetchController.signal;
+  activeChats.set(exe, {
+    destroy: () => { try { fetchController.abort(); } catch {} },
+    fetchController,
+    signal: combinedSignal,
+  });
 
   // Transcript logging (toggled in config.json). Start a new per-session file
   // on a fresh conversation; otherwise append to the running session's file.
@@ -6458,6 +6661,7 @@ async function runChatSend(event, payload) {
     scopeGuard,
     multiApp ? referencedAppsSection(appRegistry, meta.name) : null,
     agentBody,
+    (opts && opts.syntheticContext) ? `## Automation run context\n\n${opts.syntheticContext}` : null,
     `## Tool usage\n\n${toolGuide}`,
     multiApp ? `## Acting across apps\n\n${MULTI_APP_TOOL_GUIDE}` : null,
     tabRefGuide,
@@ -6573,6 +6777,7 @@ async function runChatSend(event, payload) {
 
   try {
     for (let round = 0; round < MAX_ROUNDS; round++) {
+      if (combinedSignal && combinedSignal.aborted) throw new DOMException('aborted', 'AbortError');
       if (chatAbortFlags.get(exe)) break;
       roundsUsed = round + 1;
       const body = {
@@ -6587,7 +6792,7 @@ async function runChatSend(event, payload) {
 
       const notifyRetry = ({ status, attempt, total, delayMs }) => {
         try {
-          event.sender.send('chat:thinking', {
+          sender.send('chat:thinking', {
             exe: meta.exe,
             turnId,
             delta: `\n[retry ${attempt}/${total} after HTTP ${status || 'network error'} — waiting ${Math.round(delayMs / 1000)}s]`,
@@ -6596,11 +6801,11 @@ async function runChatSend(event, payload) {
         } catch {}
       };
       const { req, res } = await sendResponsesRequestWithRetry(
-        { useDirectApi, token, accountId, body },
+        { useDirectApi, token, accountId, body, signal: combinedSignal },
         { retries: 3, baseDelayMs: 1000, onRetry: notifyRetry },
       );
       mainPartial.text = '';
-      const { textContent, toolCalls } = await streamOneRound({ req, res, meta, sender: event.sender, partial: mainPartial, reasoningSink });
+      const { textContent, toolCalls } = await streamOneRound({ req, res, meta, sender, partial: mainPartial, reasoningSink, signal: combinedSignal });
       fullContent += textContent;
       mainPartial.text = '';
       lastRoundToolCount = toolCalls.length;
@@ -6635,16 +6840,16 @@ async function runChatSend(event, payload) {
           }
         }
         const startLabel = humanLabelFromRefInfo(refInfo);
-        event.sender.send('chat:tool', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, label: startLabel });
+        sender.send('chat:tool', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, label: startLabel });
 
         // Clarification: suspend the loop, render a question card in the renderer,
         // and resume this same turn once the user clicks a choice or types an answer.
         if (tc.name === 'ask_user') {
-          const opts = Array.isArray(parsedArgs.options)
+          const askOpts = Array.isArray(parsedArgs.options)
             ? parsedArgs.options.slice(0, 4).map(o => String(o).replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 120)).filter(Boolean)
             : [];
           const question = String(parsedArgs.question || '').replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim().slice(0, 1000);
-          event.sender.send('chat:ask', { exe, turnId, callId: tc.call_id, question, options: opts });
+          sender.send('chat:ask', { exe, turnId, callId: tc.call_id, question, options: askOpts });
           const ans = await Promise.race([
             waitForUserAnswer(exe),
             new Promise((r) => setTimeout(() => r({ timedOut: true }), 10 * 60_000)), // zombie guard
@@ -6654,7 +6859,7 @@ async function runChatSend(event, payload) {
           if (ans.aborted || chatAbortFlags.get(exe)) askResult = { aborted: true };
           else if (ans.timedOut) askResult = { error: 'no_answer', hint: 'User did not answer in time. Proceed with a safe default or stop and explain what you need.' };
           else askResult = { answer: ans.answer };
-          event.sender.send('chat:tool-result', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, result: askResult, label: null, errorRaw: askResult.error || null });
+          sender.send('chat:tool-result', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, result: askResult, label: null, errorRaw: askResult.error || null });
           turnTrail.push({ name: tc.name, args: parsedArgs, result: askResult, refInfo: null, callId: tc.call_id, label: null });
           input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
           input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(askResult) });
@@ -6671,14 +6876,14 @@ async function runChatSend(event, payload) {
             if (multiApp && tb !== 'any' && tb !== ab) {
               result = { error: 'wrong_backend', hint: `Active app "${activeMeta.name}" is a ${ab} app, but ${tc.name} is a ${tb} tool. Call select_app to switch to a ${tb} app, or use ${ab}_* tools.` };
             } else {
-              result = await executeTool(tc.name, parsedArgs, activeMeta, activeHolder);
+              result = await executeTool(tc.name, parsedArgs, activeMeta, activeHolder, { signal: combinedSignal });
             }
           }
         } catch (err) {
           result = { error: String(err.message || err) };
         }
         const errorRaw = (result && result.error) ? String(result.error) : null;
-        event.sender.send('chat:tool-result', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, result, label: startLabel, errorRaw });
+        sender.send('chat:tool-result', { exe, turnId, callId: tc.call_id, name: tc.name, args: parsedArgs, result, label: startLabel, errorRaw });
         turnTrail.push({ name: tc.name, args: parsedArgs, result, refInfo, callId: tc.call_id, label: startLabel });
         input.push({ type: 'function_call', call_id: tc.call_id, name: tc.name, arguments: tc.args || '{}' });
         input.push({ type: 'function_call_output', call_id: tc.call_id, output: JSON.stringify(result) });
@@ -6703,11 +6908,11 @@ async function runChatSend(event, payload) {
             instructions,
           };
           const { req: fReq, res: fRes } = await sendResponsesRequestWithRetry(
-            { useDirectApi, token, accountId, body: forceBody },
+            { useDirectApi, token, accountId, body: forceBody, signal: combinedSignal },
             { retries: 1, baseDelayMs: 800 },
           );
           forcePartial.text = '';
-          const { textContent: forced } = await streamOneRound({ req: fReq, res: fRes, meta, sender: event.sender, maxIdleMs: 15_000, maxTotalMs: 25_000, partial: forcePartial });
+          const { textContent: forced } = await streamOneRound({ req: fReq, res: fRes, meta, sender, maxIdleMs: 15_000, maxTotalMs: 25_000, partial: forcePartial, signal: combinedSignal });
           fullContent += forced;
           forcePartial.text = '';
         } catch (err) {
@@ -6722,7 +6927,7 @@ async function runChatSend(event, payload) {
         if (!fullContent.trim()) {
           const synth = synthesiseDoneReply(turnTrail);
           fullContent = synth;
-          try { event.sender.send('chat:chunk', { delta: synth, exe, turnId }); } catch {}
+          try { sender.send('chat:chunk', { delta: synth, exe, turnId }); } catch {}
         }
       }
     }
@@ -6761,7 +6966,7 @@ async function runChatSend(event, payload) {
         backend: snap.backend,
       }, debugLog);
     }
-    event.sender.send('chat:done', { exe, turnId, error: errorReason, trail: turnTrail, content: fullContent });
+    sender.send('chat:done', { exe, turnId, error: errorReason, trail: turnTrail, content: fullContent });
   }
   return { content: fullContent, error: errorReason, trail: turnTrail, roundsUsed };
 }
@@ -7523,6 +7728,26 @@ ipcMain.handle('chat:reset-direct', () => {
 // ── Automations: per-app JSON recipes generated by Codex ──
 
 const automationProcs = new Map();
+// Separate discriminator map for grouping jobs (Dynamic Script feature) so the
+// renderer can cancel a grouping run without colliding with create/edit/add
+// jobs tracked in `automationProcs`. Both maps key on the same jobId; the
+// actual kill handle lives in `automationProcs` (written by runRecipeGenerator).
+const groupingJobs = new Map();
+
+// Module-level cache for `automation:list` isDynamic computation. Keyed by
+// `<exe>::<id>::<stepsHash>` so a step mutation (which changes the hash)
+// transparently misses cache. Busted by save-dynamic / update (when steps
+// change) / delete.
+const _isDynamicCache = new Map();
+function _isDynamicCacheKey(exe, id, hash) {
+  return String(exe) + '::' + String(id) + '::' + String(hash || '');
+}
+function _bustIsDynamicCache(exe, id) {
+  const prefix = String(exe) + '::' + String(id) + '::';
+  for (const k of _isDynamicCache.keys()) {
+    if (k.startsWith(prefix)) _isDynamicCache.delete(k);
+  }
+}
 
 function slugify(s) {
   return String(s || '')
@@ -7557,6 +7782,186 @@ function loadAutomations(exe) {
 function writeAutomationIndex(exe, list) {
   const idxPath = path.join(automationsAppDir(exe), 'index.json');
   fs.writeFileSync(idxPath, JSON.stringify(list, null, 2), 'utf8');
+}
+
+// ── Dynamic Script sidecar helpers ─────────────────────────────────────────
+// Sidecar `<id>.dynamic.json` lives next to index.json and carries the Codex-
+// generated step grouping plus per-group dynamic toggles. Hash of canonical
+// steps[] is stored so we can detect a stale grouping after step mutations
+// and drop the sidecar automatically.
+function dynamicPath(exe, id) {
+  return path.join(automationsAppDir(exe), id + '.dynamic.json');
+}
+
+function stepsHash(steps) {
+  return crypto.createHash('sha1').update(JSON.stringify(steps)).digest('hex');
+}
+
+function buildGroupingPrompt(stepLabels) {
+  const instructions = [
+    'You group consecutive automation steps that work toward the same sub-goal.',
+    '',
+    'Return a JSON array of objects { "label": string, "stepIndices": [int, ...] }.',
+    'Rules:',
+    '- Every step index from 0 to N-1 appears in EXACTLY ONE group.',
+    '- stepIndices in a group are strictly consecutive ascending integers.',
+    '- Groups themselves are ordered ascending.',
+    '- A group MAY contain a single step (singleton).',
+    '- "label" is a short imperative phrase covering what the whole group accomplishes.',
+    '- Output ONLY the JSON array. No prose, no markdown fence.',
+    '',
+    'CRITICAL — one variable per group:',
+    '- A "variable" is a named entity a user might swap at runtime (a server name, channel name, file, person, search query, app window, etc.).',
+    '- Each group must contain steps that all target the SAME single variable entity.',
+    '- If consecutive steps target DIFFERENT named entities, they MUST be in SEPARATE groups — even when they share a verb pattern like find→open or focus→type.',
+    '- Different KINDS of entity (server vs channel, folder vs file, app vs window, recipient vs subject) are always different variables. Split them.',
+    '- Different INSTANCES of the same kind in one workflow (e.g. two different channels, two different files) are also different variables. Split them.',
+    '- A "find X" step plus an "open/click/select X" step that target the SAME X belong together (one variable).',
+    '- Prefer MORE smaller groups over fewer compound ones when in doubt — a compound label like "Open the target channel" that hides two named entities (server AND channel) is always wrong.',
+    '',
+    'EXAMPLE — given these step labels:',
+    '  0: Find the example-community server in the sidebar',
+    '  1: Open the example-community server',
+    '  2: Find the #example-channel channel',
+    '  3: Open the #example-channel channel',
+    '  4: Focus the search box',
+    '  5: Search for example-user images in the channel',
+    'CORRECT grouping (server, channel, query are three distinct variables):',
+    '  [{"label":"Open the server","stepIndices":[0,1]},',
+    '   {"label":"Open the channel","stepIndices":[2,3]},',
+    '   {"label":"Search the channel","stepIndices":[4,5]}]',
+    'WRONG — merging 0..3 into one "Open the target channel" group hides two variables (server name AND channel name) behind one runtime slot. Never do this.',
+  ].join('\n');
+  const lines = stepLabels.map((lbl, i) => `Step ${i}: ${lbl}`);
+  const input = ['INPUT:', ...lines].join('\n');
+  return { instructions, input };
+}
+
+function _isPromptStale(g) {
+  if (!g || g.dynamic !== true) return false;
+  if (typeof g.prompt !== 'string') return false;
+  const trimmed = g.prompt.trim();
+  if (!trimmed) return false;
+  if (g.prompt.length > 40) return true;
+  if (g.prompt.split(/\s+/).length > 6) return true;
+  return false;
+}
+
+function buildGroupPromptPrompt(groupLabel, stepLabelsInGroup, appName, variableHint) {
+  const instructions = [
+    `You write a short slot-fill question (max 40 chars, must end with "?") that asks the user to supply the variable token in a sub-task label.`,
+    `Context: an AI agent will complete a sub-task in the app "${appName}".`,
+    `Rules:`,
+    `- Identify the most likely VARIABLE token in the group label (proper noun, specific name, count, etc.).`,
+    `- Replace it with an interrogative ("Which", "What", "Who", "How many", etc.).`,
+    `- Keep verbs and structure from the label; drop articles ("the", "a").`,
+    `- If sub-steps refine the noun (e.g. "message" in label but steps mention "image"), prefer the refined noun.`,
+    `- If the user provides a variableHint below, treat that as authoritative for which token is variable.`,
+    `- Output ONE short question. No quotes, no markdown, no prefix, no trailing period.`,
+    `- Examples: "Open the example-community server" -> "Which server?"  |  "Show example-user's latest message" (steps mention images) -> "Show who's latest image?"`,
+  ].join('\n');
+  const numbered = (Array.isArray(stepLabelsInGroup) ? stepLabelsInGroup : [])
+    .map((lbl, i) => `${i + 1}. ${lbl}`)
+    .join('\n');
+  const hintLine = (typeof variableHint === 'string' && variableHint.trim())
+    ? `\nvariableHint (which token to ask about): ${variableHint.trim()}`
+    : '';
+  const input = `Group label: ${groupLabel}\nSteps in this group:\n${numbered}${hintLine}\nReturn ONLY the short question.`;
+  return { instructions, input };
+}
+
+async function generateGroupPrompt({ groupLabel, stepLabels, appName, backend, variableHint }, sender, jobId) {
+  const prompt = buildGroupPromptPrompt(groupLabel, stepLabels, appName, variableHint);
+  const { text } = await runRecipeGenerator(prompt, sender, jobId);
+  let out = String(text || '').trim();
+  // Strip a single pair of surrounding quotes (straight or curly) the model
+  // sometimes wraps despite being told not to.
+  if (out.length >= 2) {
+    const first = out[0];
+    const last = out[out.length - 1];
+    const pairs = [['"', '"'], ["'", "'"], ['“', '”'], ['‘', '’'], ['`', '`']];
+    for (const [a, b] of pairs) {
+      if (first === a && last === b) { out = out.slice(1, -1).trim(); break; }
+    }
+  }
+  if (!out) throw new Error('empty prompt');
+  out = out.replace(/[.!]+$/, '').trim();
+  if (out.length > 40) {
+    const qIdx = out.indexOf('?');
+    if (qIdx > 0 && qIdx < 40) {
+      out = out.slice(0, qIdx + 1);
+    } else {
+      out = out.slice(0, 39).replace(/\s+\S*$/, '').trim();
+      if (!out.endsWith('?')) out += '?';
+    }
+  }
+  if (!out.endsWith('?')) out += '?';
+  if (out.length < 5) throw new Error('generated prompt too short');
+  return out;
+}
+
+function validateGrouping(groups, stepCount) {
+  if (!Array.isArray(groups)) throw new Error('grouping is not an array');
+  const covered = new Array(stepCount).fill(false);
+  let prevFirst = -1;
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i];
+    if (!g || typeof g !== 'object' || Array.isArray(g)) {
+      throw new Error(`group ${i} is not an object`);
+    }
+    if (typeof g.label !== 'string' || !g.label.trim()) {
+      throw new Error(`group ${i} missing label`);
+    }
+    if (!Array.isArray(g.stepIndices) || g.stepIndices.length === 0) {
+      throw new Error(`group ${i} stepIndices must be a non-empty array`);
+    }
+    for (let k = 0; k < g.stepIndices.length; k++) {
+      const idx = g.stepIndices[k];
+      if (!Number.isInteger(idx)) {
+        throw new Error(`group ${i} stepIndices[${k}] is not an integer`);
+      }
+      if (idx < 0 || idx >= stepCount) {
+        throw new Error(`group ${i} stepIndices[${k}] (${idx}) out of range [0,${stepCount})`);
+      }
+      if (k > 0 && idx !== g.stepIndices[k - 1] + 1) {
+        throw new Error(`group ${i} stepIndices not strictly consecutive at position ${k}`);
+      }
+      if (covered[idx]) {
+        throw new Error(`step ${idx} appears in more than one group`);
+      }
+      covered[idx] = true;
+    }
+    const first = g.stepIndices[0];
+    if (first <= prevFirst) {
+      throw new Error(`group ${i} first index (${first}) not greater than previous group's first index (${prevFirst})`);
+    }
+    prevFirst = first;
+    if (g.dynamic === true) {
+      if (typeof g.prompt !== 'string' || !g.prompt.trim()) {
+        throw new Error(`group ${i} ("${g.label}") is dynamic but has no runtime prompt — regenerate the prompt before saving.`);
+      }
+      if (g.variableHint !== undefined && g.variableHint !== null) {
+        if (typeof g.variableHint !== 'string') {
+          throw new Error(`group ${i} variableHint must be a string or null`);
+        }
+        if (g.variableHint.length > 80) {
+          throw new Error(`group ${i} variableHint exceeds 80 chars`);
+        }
+      } else {
+        g.variableHint = null;
+      }
+    } else {
+      if (g.prompt === undefined) g.prompt = null;
+      if (g.variableHint === undefined) g.variableHint = null;
+    }
+  }
+  for (let i = 0; i < stepCount; i++) {
+    if (!covered[i]) throw new Error(`step ${i} not covered by any group`);
+  }
+}
+
+function invalidateSidecar(exe, id) {
+  try { fs.rmSync(dynamicPath(exe, id), { force: true }); } catch {}
 }
 
 // Post-process: realign each recipe `cdp_click ref:"$<cap>.f<N>"` so N matches
@@ -8387,9 +8792,210 @@ ipcMain.handle('automation:cancel-create', (_event, jobId) => {
   return { ok: true };
 });
 
-ipcMain.handle('automation:list', (_event, exe) => {
+// ── Dynamic Script grouping IPC ────────────────────────────────────────────
+ipcMain.handle('automation:group-steps', async (event, payload) => {
+  const exe = payload && payload.exe;
+  const stepLabels = payload && payload.stepLabels;
+  const steps = payload && payload.steps;
+  if (!exe) throw new Error('automation:group-steps requires exe');
+  if (!Array.isArray(stepLabels) || stepLabels.length === 0) {
+    throw new Error('automation:group-steps requires non-empty stepLabels');
+  }
+  if (!Array.isArray(steps) || steps.length !== stepLabels.length) {
+    throw new Error('automation:group-steps requires steps[] matching stepLabels length');
+  }
+  for (let i = 0; i < stepLabels.length; i++) {
+    if (typeof stepLabels[i] !== 'string') {
+      throw new Error(`stepLabels[${i}] is not a string`);
+    }
+  }
+
+  const prompt = buildGroupingPrompt(stepLabels);
+  const jobId = uniqueId();
+  groupingJobs.set(jobId, true);
+  debugLog(`[automation:group-steps] job=${jobId} steps=${stepLabels.length}`);
+  event.sender.send('automation:codex-progress', { jobId, status: 'grouping…' });
+
+  try {
+    const { text } = await runRecipeGenerator(prompt, event.sender, jobId);
+    const jsonText = extractJsonArray(text);
+    if (!jsonText) {
+      throw new Error(`ChatGPT output did not contain a JSON array.\n\nFirst 500 chars:\n${text.slice(0, 500)}`);
+    }
+    let arr;
+    try { arr = JSON.parse(jsonText); }
+    catch (e) { throw new Error(`Failed to parse JSON: ${e.message}\n\n${jsonText.slice(0, 400)}`); }
+    validateGrouping(arr, stepLabels.length);
+    const groups = arr.map((g, i) => ({
+      gid: 'g' + (i + 1),
+      label: g.label,
+      stepIndices: g.stepIndices.slice(),
+    }));
+    const hash = stepsHash(steps);
+    return { groups, jobId, stepsHash: hash };
+  } finally {
+    groupingJobs.delete(jobId);
+  }
+});
+
+ipcMain.handle('automation:generate-group-prompt', async (event, payload) => {
+  const exe = payload && payload.exe;
+  const groupLabel = payload && payload.groupLabel;
+  const stepLabels = payload && payload.stepLabels;
+  const appName = payload && payload.appName;
+  const backend = payload && payload.backend;
+  const variableHint = payload && payload.variableHint;
+  if (!exe) throw new Error('automation:generate-group-prompt requires exe');
+  if (typeof groupLabel !== 'string' || !groupLabel.trim()) {
+    throw new Error('automation:generate-group-prompt requires groupLabel');
+  }
+  if (!Array.isArray(stepLabels) || stepLabels.length === 0) {
+    throw new Error('automation:generate-group-prompt requires non-empty stepLabels');
+  }
+  for (let i = 0; i < stepLabels.length; i++) {
+    if (typeof stepLabels[i] !== 'string') {
+      throw new Error(`stepLabels[${i}] is not a string`);
+    }
+  }
+  if (typeof appName !== 'string' || !appName.trim()) {
+    throw new Error('automation:generate-group-prompt requires appName');
+  }
+  if (variableHint !== undefined && variableHint !== null) {
+    if (typeof variableHint !== 'string') {
+      throw new Error('automation:generate-group-prompt variableHint must be a string');
+    }
+    if (variableHint.length > 80) {
+      throw new Error('automation:generate-group-prompt variableHint exceeds 80 chars');
+    }
+  }
+
+  const jobId = uniqueId();
+  groupingJobs.set(jobId, true);
+  debugLog(`[automation:generate-group-prompt] job=${jobId} group="${groupLabel}" steps=${stepLabels.length}`);
+  event.sender.send('automation:codex-progress', { jobId, status: 'writing question…' });
+
+  try {
+    const prompt = await generateGroupPrompt(
+      { groupLabel, stepLabels, appName, backend, variableHint },
+      event.sender,
+      jobId,
+    );
+    return { prompt, jobId };
+  } finally {
+    groupingJobs.delete(jobId);
+  }
+});
+
+ipcMain.handle('automation:load-dynamic', (_event, payload) => {
+  const { exe, id } = payload || {};
+  if (!exe || !id) throw new Error('automation:load-dynamic requires { exe, id }');
+  const list = loadAutomations(exe);
+  const entry = list.find(a => a.id === id);
+  if (!entry) throw new Error('automation not found');
+  const p = dynamicPath(exe, id);
+  if (!fs.existsSync(p)) return null;
+  let sidecar;
+  try { sidecar = JSON.parse(fs.readFileSync(p, 'utf8')); }
+  catch (e) {
+    invalidateSidecar(exe, id);
+    return { stale: true };
+  }
+  const current = stepsHash(entry.steps);
+  if (current !== sidecar.stepsHash) {
+    invalidateSidecar(exe, id);
+    return { stale: true };
+  }
+  if (Array.isArray(sidecar.groups)) {
+    const isV2 = sidecar.promptSchemaVersion === 2;
+    for (const g of sidecar.groups) {
+      if (!g || typeof g !== 'object') continue;
+      if (g.prompt === undefined) g.prompt = null;
+      if (g.variableHint === undefined) g.variableHint = null;
+      g.isStaleFormat = isV2 ? false : _isPromptStale(g);
+    }
+  }
+  return { sidecar };
+});
+
+ipcMain.handle('automation:save-dynamic', (_event, payload) => {
+  const { exe, id, groups, stepsHash: hash } = payload || {};
+  if (!exe || !id) throw new Error('automation:save-dynamic requires { exe, id }');
+  if (!Array.isArray(groups)) throw new Error('automation:save-dynamic requires groups[]');
+  if (typeof hash !== 'string' || !hash) throw new Error('automation:save-dynamic requires stepsHash');
+  const list = loadAutomations(exe);
+  const entry = list.find(a => a.id === id);
+  if (!entry) throw new Error('automation not found');
+  const current = stepsHash(entry.steps);
+  if (current !== hash) {
+    throw new Error('stepsHash mismatch — steps changed since grouping; regenerate the dynamic view before saving.');
+  }
+  const ALLOWED_GROUP_FIELDS = ['gid', 'label', 'stepIndices', 'dynamic', 'prompt', 'variableHint'];
+  const sanitized = groups.map(g => {
+    const clean = {};
+    if (g && typeof g === 'object') {
+      for (const k of ALLOWED_GROUP_FIELDS) if (k in g) clean[k] = g[k];
+    }
+    return clean;
+  });
+  validateGrouping(sanitized, entry.steps.length);
+  const sidecar = {
+    id,
+    stepsHash: hash,
+    groupedAt: new Date().toISOString(),
+    promptSchemaVersion: 2,
+    groups: sanitized,
+  };
+  const finalPath = dynamicPath(exe, id);
+  const tmpPath = finalPath + '.tmp';
+  fs.writeFileSync(tmpPath, JSON.stringify(sidecar, null, 2), 'utf8');
+  fs.renameSync(tmpPath, finalPath);
+  _bustIsDynamicCache(exe, id);
+  return { ok: true };
+});
+
+ipcMain.handle('automation:cancel-group', (_event, jobId) => {
+  const handle = automationProcs.get(jobId);
+  if (handle && typeof handle.kill === 'function') {
+    try { handle.kill(); } catch {}
+    automationProcs.delete(jobId);
+  }
+  groupingJobs.delete(jobId);
+  return { ok: true };
+});
+
+ipcMain.handle('automation:list', async (_event, exe) => {
   if (!exe) return [];
-  return loadAutomations(exe);
+  const list = loadAutomations(exe);
+  if (list.length === 0) return list;
+  const fsp = fs.promises;
+  // Compute isDynamic per entry in parallel. Each entry pays at most one
+  // sidecar read on cache miss; subsequent calls hit the module-level cache
+  // until save-dynamic / update (with steps) / delete busts it.
+  const flags = await Promise.all(list.map(async (entry) => {
+    try {
+      const hash = stepsHash(entry.steps);
+      const cacheKey = _isDynamicCacheKey(exe, entry.id, hash);
+      if (_isDynamicCache.has(cacheKey)) return _isDynamicCache.get(cacheKey);
+      const p = dynamicPath(exe, entry.id);
+      let raw;
+      try { raw = await fsp.readFile(p, 'utf8'); }
+      catch { _isDynamicCache.set(cacheKey, false); return false; }
+      let sidecar;
+      try { sidecar = JSON.parse(raw); }
+      catch { _isDynamicCache.set(cacheKey, false); return false; }
+      if (!sidecar || sidecar.stepsHash !== hash) {
+        _isDynamicCache.set(cacheKey, false);
+        return false;
+      }
+      const groups = Array.isArray(sidecar.groups) ? sidecar.groups : [];
+      const isDyn = groups.some(g => g && g.dynamic === true);
+      _isDynamicCache.set(cacheKey, isDyn);
+      return isDyn;
+    } catch {
+      return false;
+    }
+  }));
+  return list.map((entry, i) => Object.assign({}, entry, { isDynamic: !!flags[i] }));
 });
 
 ipcMain.handle('automation:save', (_event, payload) => {
@@ -8423,6 +9029,8 @@ ipcMain.handle('automation:delete', (_event, payload) => {
   if (!exe || !id) throw new Error('automation:delete requires { exe, id }');
   const list = loadAutomations(exe).filter(a => a.id !== id);
   writeAutomationIndex(exe, list);
+  invalidateSidecar(exe, id);
+  _bustIsDynamicCache(exe, id);
   return { ok: true };
 });
 
@@ -8453,6 +9061,11 @@ ipcMain.handle('automation:update', (_event, payload) => {
   entry.steps = steps;
   if (name !== undefined) entry.name = String(name || 'Untitled').slice(0, 120);
   writeAutomationIndex(exe, list);
+  // Steps mutated → any saved grouping references the wrong indices. Drop it.
+  if (payload && payload.steps !== undefined) {
+    invalidateSidecar(exe, id);
+    _bustIsDynamicCache(exe, id);
+  }
   return entry;
 });
 
@@ -8603,10 +9216,11 @@ function isTransientStepResult(tool, result) {
   return false;
 }
 
-const stepSleep = (ms) => new Promise(r => setTimeout(r, ms));
+const stepSleep = (ms, signal) => abortableSleep(ms, signal);
 
 async function executeAutomationStep(step, ctx) {
   const { meta, captures, refMapHolder } = ctx;
+  const signal = ctx && ctx.signal;
   const args = resolveStepArgs(step.args || {}, captures);
   // Recipe runtime fires steps back-to-back, faster than Discord settles after a
   // jump. `$centered` resolved via a live DOM probe at react-time then snapped
@@ -8640,7 +9254,8 @@ async function executeAutomationStep(step, ctx) {
   // return whatever we got so the runner surfaces the real error.
   let result;
   for (let attempt = 0; ; attempt++) {
-    result = await executeTool(step.tool, args, meta, refMapHolder);
+    if (signal && signal.aborted) { result = { error: 'aborted' }; break; }
+    result = await executeTool(step.tool, args, meta, refMapHolder, { signal });
     if (!isTransientStepResult(step.tool, result)) break;
     if (attempt >= STEP_RETRY_DELAYS_MS.length) break; // budget exhausted
     const waitMs = STEP_RETRY_DELAYS_MS[attempt];
@@ -8649,7 +9264,7 @@ async function executeAutomationStep(step, ctx) {
     if (typeof ctx.onStepRetry === 'function') {
       try { ctx.onStepRetry({ attempt: attempt + 1, waitMs, tool: step.tool }); } catch {}
     }
-    await stepSleep(waitMs);
+    try { await stepSleep(waitMs, signal); } catch (_) { result = { error: 'aborted' }; break; }
   }
 
   // Track the id that the most recent jump-style step actually landed on, so a
@@ -8719,6 +9334,96 @@ async function executeAutomationStep(step, ctx) {
   return result;
 }
 
+// Run one static step (or a forEach expansion of one step). Pure executor —
+// emits NO IPC events; the caller owns all emission so this helper can be
+// reused both by the static-run IPC handler (full emission set) and by the
+// dynamic-run executor (its own cursor channel).
+//
+// `record` carries per-run shared state (meta, refMapHolder, captures,
+// stopped flag, currentStepIndex). `ctx` provides optional callbacks the
+// caller uses to surface mid-step progress (retry, forEach iteration) on
+// whatever channel it owns.
+//
+// Returns one of:
+//   { ok: true,  result }                                — step succeeded.
+//   { ok: true,  result, scrollSkipped: true }           — cdp_scroll: nothing to scroll.
+//   { ok: true,  result, forEach: { count, last } }      — forEach completed.
+//   { ok: false, error, result?, forEachIter? }          — step failed (forEachIter set when failure
+//                                                          happened inside forEach: { done, total, id }).
+//   { ok: false, error: 'stopped' }                      — record.stopped flipped to true.
+//   { ok: false, error: 'aborted' }                      — signal.aborted.
+async function runStaticStep(record, step, ctx = {}) {
+  const signal = ctx.signal;
+  if (signal && signal.aborted) return { ok: false, error: 'aborted' };
+  if (record.stopped) return { ok: false, error: 'stopped' };
+
+  // Mirror executeAutomationStep retry hook through ctx.onStepRetry, plus a
+  // forEach-iter hook so the caller can drive its own progress display. The
+  // record.execCtx is what executeAutomationStep receives — it must carry
+  // signal so the inner retry sleeps abort cleanly.
+  const execCtx = record.execCtx;
+  execCtx.onStepRetry = ctx.onStepRetry || null;
+  execCtx.signal = signal;
+
+  // forEach: resolve captured list, iterate the inner tool once per id.
+  if (step.forEach) {
+    const cap = record.captures[step.forEach.from];
+    if (!cap || !Array.isArray(cap.items)) {
+      return { ok: false, error: `forEach.from "${step.forEach.from}" is not a captured message/search list — add a cdp_get_messages (or cdp_get_search_results) step with "capture":"${step.forEach.from}" before this step.` };
+    }
+    let ids;
+    try { ids = selectCaptureIds(cap, step.forEach); }
+    catch (err) {
+      return { ok: false, error: err && err.message ? err.message : String(err) };
+    }
+    if (ids.length === 0) {
+      return { ok: false, error: `forEach selected 0 ${step.forEach.where || 'item'}s from "${step.forEach.from}" — nothing to act on. The live list has none matching the filter.` };
+    }
+    let done = 0;
+    let lastResult = null;
+    for (const id of ids) {
+      if (record.stopped) return { ok: false, error: 'stopped' };
+      if (signal && signal.aborted) return { ok: false, error: 'aborted' };
+      const concrete = { tool: step.tool, args: Object.assign({}, step.args, { message_id: id }) };
+      let r;
+      try {
+        r = await executeAutomationStep(concrete, execCtx);
+      } catch (err) {
+        const msg = `iteration ${done + 1}/${ids.length} (message ${id}): ${err && err.message ? err.message : String(err)}`;
+        return { ok: false, error: msg, forEachIter: { done, total: ids.length, id } };
+      }
+      if (r && r.error) {
+        const msg = `iteration ${done + 1}/${ids.length} (message ${id}): ${r.error}`;
+        return { ok: false, error: msg, result: r, forEachIter: { done, total: ids.length, id } };
+      }
+      done++;
+      lastResult = r;
+      if (typeof ctx.onForEachProgress === 'function') {
+        try { ctx.onForEachProgress({ attempt: done, total: ids.length, tool: step.tool }); } catch {}
+      }
+    }
+    if (record.stopped) return { ok: false, error: 'stopped' };
+    return { ok: true, result: { ok: true, count: done, last: lastResult }, forEach: { count: done, last: lastResult } };
+  }
+
+  let result;
+  try {
+    result = await executeAutomationStep(step, execCtx);
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    return { ok: false, error: msg };
+  }
+  if (result && result.error) {
+    // Non-fatal: a generic cdp_scroll on a page that fits the viewport.
+    if (step.tool === 'cdp_scroll' && result.error === 'scroll_container_not_found') {
+      debugLog(`[automation] ${step.tool}: nothing scrollable — content fits viewport, skipping (non-fatal)`);
+      return { ok: true, result: { ok: true, skipped: true, note: 'nothing to scroll — content fits the viewport' }, scrollSkipped: true };
+    }
+    return { ok: false, error: result.error, result };
+  }
+  return { ok: true, result };
+}
+
 ipcMain.handle('automation:run', async (event, payload) => {
   const { exe, id } = payload || {};
   if (!exe || !id) throw new Error('automation:run requires { exe, id }');
@@ -8732,7 +9437,7 @@ ipcMain.handle('automation:run', async (event, payload) => {
 
   const refMapHolder = { current: {} };
   const captures = {};
-  const ctx = { meta, captures, refMapHolder };
+  const execCtx = { meta, captures, refMapHolder };
   const sender = event.sender;
 
   const runId = uniqueId();
@@ -8740,16 +9445,15 @@ ipcMain.handle('automation:run', async (event, payload) => {
 
   // Surface waiting-for-UI retries (see executeAutomationStep) on the current
   // step's row so a slow navigation reads as "waiting…", not a stall.
-  ctx.currentStepIndex = 0;
-  ctx.onStepRetry = ({ attempt, waitMs, tool }) => {
-    sender.send('automation:run-step', { runId, i: ctx.currentStepIndex, name: tool, status: 'retry', attempt, waitMs });
-  };
+  execCtx.currentStepIndex = 0;
 
   let stopped = false;
   const stopHandler = (_e, payload2) => {
     if (payload2 && payload2.runId === runId) stopped = true;
   };
   ipcMain.on('automation:stop', stopHandler);
+
+  const record = { meta, captures, refMapHolder, execCtx, get stopped() { return stopped; } };
 
   try {
     // Build an initial snapshot so refMapHolder isn't empty for any tool that needs it
@@ -8759,93 +9463,33 @@ ipcMain.handle('automation:run', async (event, payload) => {
 
     for (let i = 0; i < entry.steps.length; i++) {
       if (stopped) { sender.send('automation:run-step', { runId, i, name: entry.steps[i].tool, status: 'stopped' }); break; }
-      ctx.currentStepIndex = i;
+      execCtx.currentStepIndex = i;
       const step = entry.steps[i];
 
-      // forEach step: resolve a captured message/search list to N live ids and
-      // run the inner tool once per id. Keeps "react to the last 10 pictures" a
-      // single saved step whose targets are re-resolved fresh on every replay,
-      // instead of N steps frozen to recording-time message ids.
-      if (step.forEach) {
-        sender.send('automation:run-step', { runId, i, name: step.tool, args: step.args, status: 'start' });
-        const cap = captures[step.forEach.from];
-        if (!cap || !Array.isArray(cap.items)) {
-          const msg = `forEach.from "${step.forEach.from}" is not a captured message/search list — add a cdp_get_messages (or cdp_get_search_results) step with "capture":"${step.forEach.from}" before this step.`;
-          sender.send('automation:run-step', { runId, i, name: step.tool, status: 'error', error: msg });
-          sender.send('automation:run-done', { runId, ok: false, error: `Step ${i + 1} (${step.tool}): ${msg}` });
-          return { ok: false, error: msg, stepIndex: i };
-        }
-        let ids;
-        try { ids = selectCaptureIds(cap, step.forEach); }
-        catch (err) {
-          const msg = err && err.message ? err.message : String(err);
-          sender.send('automation:run-step', { runId, i, name: step.tool, status: 'error', error: msg });
-          sender.send('automation:run-done', { runId, ok: false, error: `Step ${i + 1} (${step.tool}): ${msg}` });
-          return { ok: false, error: msg, stepIndex: i };
-        }
-        if (ids.length === 0) {
-          const msg = `forEach selected 0 ${step.forEach.where || 'item'}s from "${step.forEach.from}" — nothing to act on. The live list has none matching the filter.`;
-          sender.send('automation:run-step', { runId, i, name: step.tool, status: 'error', error: msg });
-          sender.send('automation:run-done', { runId, ok: false, error: `Step ${i + 1} (${step.tool}): ${msg}` });
-          return { ok: false, error: msg, stepIndex: i };
-        }
-        let done = 0;
-        let lastResult = null;
-        for (const id of ids) {
-          if (stopped) break;
-          const concrete = { tool: step.tool, args: Object.assign({}, step.args, { message_id: id }) };
-          let r;
-          try {
-            r = await executeAutomationStep(concrete, ctx);
-          } catch (err) {
-            const msg = `iteration ${done + 1}/${ids.length} (message ${id}): ${err && err.message ? err.message : String(err)}`;
-            sender.send('automation:run-step', { runId, i, name: step.tool, status: 'error', error: msg });
-            sender.send('automation:run-done', { runId, ok: false, error: `Step ${i + 1} (${step.tool}): ${msg}` });
-            return { ok: false, error: msg, stepIndex: i };
-          }
-          if (r && r.error) {
-            const msg = `iteration ${done + 1}/${ids.length} (message ${id}): ${r.error}`;
-            sender.send('automation:run-step', { runId, i, name: step.tool, status: 'error', error: msg, result: r });
-            sender.send('automation:run-done', { runId, ok: false, error: `Step ${i + 1} (${step.tool}): ${msg}` });
-            return { ok: false, error: r.error, stepIndex: i, result: r };
-          }
-          done++;
-          lastResult = r;
-          // Drive the row's progress text (e.g. "3/10") via the retry channel.
-          sender.send('automation:run-step', { runId, i, name: step.tool, status: 'retry', attempt: done, total: ids.length, forEach: true });
-        }
-        if (stopped) { sender.send('automation:run-step', { runId, i, name: step.tool, status: 'stopped' }); break; }
-        sender.send('automation:run-step', { runId, i, name: step.tool, status: 'ok', result: { ok: true, count: done, last: lastResult } });
+      sender.send('automation:run-step', { runId, i, name: step.tool, args: step.args, status: 'start' });
+
+      const outcome = await runStaticStep(record, step, {
+        onStepRetry: ({ attempt, waitMs, tool }) => {
+          sender.send('automation:run-step', { runId, i, name: tool, status: 'retry', attempt, waitMs });
+        },
+        onForEachProgress: ({ attempt, total, tool }) => {
+          sender.send('automation:run-step', { runId, i, name: tool, status: 'retry', attempt, total, forEach: true });
+        },
+      });
+
+      if (outcome.ok) {
+        sender.send('automation:run-step', { runId, i, name: step.tool, status: 'ok', result: outcome.result });
         continue;
       }
-
-      sender.send('automation:run-step', { runId, i, name: step.tool, args: step.args, status: 'start' });
-      let result;
-      try {
-        result = await executeAutomationStep(step, ctx);
-      } catch (err) {
-        const msg = err && err.message ? err.message : String(err);
-        sender.send('automation:run-step', { runId, i, name: step.tool, status: 'error', error: msg });
-        sender.send('automation:run-done', { runId, ok: false, error: `Step ${i + 1} (${step.tool}): ${msg}` });
-        return { ok: false, error: msg, stepIndex: i };
+      if (outcome.error === 'stopped') {
+        sender.send('automation:run-step', { runId, i, name: step.tool, status: 'stopped' });
+        break;
       }
-      if (result && result.error) {
-        // A generic cdp_scroll that finds no scroller (even after the load-timing
-        // retries above) just means the page's content already fits the viewport —
-        // there is nothing to scroll. Scrolling is a means to reveal/load content,
-        // not a goal in itself, so this must NOT abort the whole automation. Skip
-        // it and continue. (cdp_scroll_messages stays fatal: a missing Discord
-        // message list means the channel never opened — a real failure.)
-        if (step.tool === 'cdp_scroll' && result.error === 'scroll_container_not_found') {
-          debugLog(`[automation] step ${i + 1} cdp_scroll: nothing scrollable — content fits viewport, skipping (non-fatal)`);
-          sender.send('automation:run-step', { runId, i, name: step.tool, status: 'ok', result: { ok: true, skipped: true, note: 'nothing to scroll — content fits the viewport' } });
-          continue;
-        }
-        sender.send('automation:run-step', { runId, i, name: step.tool, status: 'error', error: result.error, result });
-        sender.send('automation:run-done', { runId, ok: false, error: `Step ${i + 1} (${step.tool}): ${result.error}` });
-        return { ok: false, error: result.error, stepIndex: i, result };
-      }
-      sender.send('automation:run-step', { runId, i, name: step.tool, status: 'ok', result });
+      // Failure path
+      const errMsg = outcome.error;
+      sender.send('automation:run-step', { runId, i, name: step.tool, status: 'error', error: errMsg, result: outcome.result });
+      sender.send('automation:run-done', { runId, ok: false, error: `Step ${i + 1} (${step.tool}): ${errMsg}` });
+      return { ok: false, error: errMsg, stepIndex: i, result: outcome.result };
     }
     if (stopped) {
       sender.send('automation:run-done', { runId, ok: false, error: 'stopped by user' });
@@ -8856,6 +9500,589 @@ ipcMain.handle('automation:run', async (event, payload) => {
   } finally {
     ipcMain.removeListener('automation:stop', stopHandler);
   }
+});
+
+// ── Dynamic-run executor ──
+//
+// Drives a "dynamic" automation: a two-phase walk where Phase 1 collects
+// user input per dynamic group via the per-app chat composer, then Phase 2
+// executes — static entries via runStaticStep, dynamic entries via a
+// synthetic chat turn through runChatSend. Halt-on-failure with a retry
+// IPC; abort/stop tears down both the Phase 1 waiter and any in-flight
+// HTTP / tool sleep via record.abort.
+
+const dynamicRuns = new Map();
+
+// Identity fallback string — explicitly defuses the cross-turn "from:<name>"
+// inheritance bug (model carrying a stale recipe filter into a new user's
+// query). Used when the probe couldn't determine the signed-in user, or when
+// the probe succeeded but the values came back blank (locked screen, voice
+// call, panel not rendered). See SPEC.md "blank currentUser recovery".
+const IDENTITY_FALLBACK_BLOCK =
+  "Identity: unknown — resolve me/my/I/mine from prior captures (look for currentUserId on captured messages) or honestly tell the user you cannot read their identity. Do NOT inherit any 'from:<name>' filter from earlier turns or recipes; drop the filter and use captured authorId/currentUserId instead. (could not determine signed-in user)";
+
+const RESUME_RULES_BLOCK = [
+  '- The steps above have ALREADY RUN. Do NOT re-navigate, re-focus the app, re-open the search bar, or re-issue any search query that already ran.',
+  '- If you need data from a prior step, reference the capture by name (e.g. $results) — do NOT re-fetch.',
+  '- If the previously-submitted search filter contained `from:<someone>` and this group\'s user input refers to a DIFFERENT person (e.g. "me", "my", "I"), DO clear the search bar and re-submit a corrected query — resume does not force you to keep a wrong filter.',
+  '- Do NOT carry over any `from:<name>` author filter from a prior automation, recipe, or snapshot. Use the identity above; if identity is unknown, drop the filter entirely.',
+  '- For any `in:<channel>` search filter, use the Active channel above (the channel actually open) — NOT a channel name copied from the automation title, the group label, or a prior-step summary, which may be stale.',
+].join('\n');
+
+// Always-present (every group, first and resumed). The automation title / group
+// label / prior-step summaries are human descriptions and routinely name a
+// channel or user that is NOT where the run actually is — see the example-community
+// "#example-channel vs #example-channel-b" incident in SPEC.md. Treat them as
+// labels, never as navigation/filter source-of-truth.
+const GROUND_TRUTH_BLOCK =
+  'The `[Automation title: …]` label, the `[Group: …]` label, and the prior-step summaries are human descriptions and may be STALE or generic. Do NOT extract server, channel, or user names from them to drive navigation or to build a search filter (e.g. a Discord `in:<channel>` or `from:<user>` filter). Ground truth = the dynamic group inputs + the Active channel above + the live snapshot.';
+
+// Render the "## Active channel" section body. Known → the channel name plus a
+// directive to use it as the in: filter. Unknown → an instruction (NOT a data
+// value), so the model reads the live composer instead of falling back to the
+// title. fail-closed: probeActiveChannel only reports ok when it is certain.
+function activeChannelSection(activeChannel) {
+  if (activeChannel && activeChannel.ok && activeChannel.channel) {
+    const ch = sanitizeForPrompt(activeChannel.channel, 100);
+    return `#${ch} — the channel open at the START of this group. Use THIS as any \`in:<channel>\` search filter; if you navigate to a different channel during this group, re-read the live composer ("Message #<channel>") before searching. Do NOT take the channel from the automation title, group label, or prior steps.`;
+  }
+  return 'Unknown. Before using an `in:<channel>` search filter, read the live composer placeholder ("Message #<channel>") to confirm which channel is open. Do NOT take the channel from the automation title, group label, or prior steps.';
+}
+
+// Sanitize a string for safe embedding in the synthetic prompt: strip control
+// chars and trim to `max` chars (default 120) with an ellipsis tail.
+function sanitizeForPrompt(s, max) {
+  const cap = typeof max === 'number' && max > 0 ? max : 120;
+  let v = String(s == null ? '' : s).replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').trim();
+  if (v.length > cap) v = v.slice(0, cap - 1) + '…';
+  return v;
+}
+
+// Walk the already-executed prefix of record.plan.entries and emit a flat
+// summary the model can use to "resume" mid-automation: which static steps
+// already ran, which dynamic groups already collected input, plus a flat
+// key=value list of named captures. NEVER throws — defensive per-entry
+// try/catch so a malformed group degrades silently to an empty section.
+function summarizePriorContext(record, beforeEntryIdx, steps, groups) {
+  const out = { stepsBlock: '', capturesBlock: '' };
+  if (!record || !record.plan || !Array.isArray(record.plan.entries)) return out;
+  const limit = Math.max(0, Math.min(beforeEntryIdx | 0, record.plan.entries.length));
+
+  // ── Prior-steps block ──
+  // Two-tier cap: at most MAX_ENTRIES groups, AND at most MAX_STEPS_BYTES total
+  // joined-byte length. The byte cap defends against step-heavy recipes where a
+  // single group can carry 20+ inlined step descriptions.
+  const stepLines = [];
+  const MAX_ENTRIES = 30;
+  const MAX_STEPS_BYTES = 4096;
+  let droppedEarlier = 0;
+  let startIdx = 0;
+  if (limit > MAX_ENTRIES) { droppedEarlier = limit - MAX_ENTRIES; startIdx = limit - MAX_ENTRIES; }
+  let stepsUsed = 0;
+  let stepsTruncated = false;
+  const pushStepLine = (line) => {
+    if (stepsTruncated) return false;
+    if (stepsUsed + line.length + 1 > MAX_STEPS_BYTES) { stepsTruncated = true; return false; }
+    stepLines.push(line);
+    stepsUsed += line.length + 1;
+    return true;
+  };
+  if (droppedEarlier > 0) pushStepLine(`… (+${droppedEarlier} earlier)`);
+  for (let i = startIdx; i < limit && !stepsTruncated; i++) {
+    try {
+      const entry = record.plan.entries[i];
+      if (!entry) continue;
+      const group = (Array.isArray(groups) ? groups.find(g => g && g.gid === entry.gid) : null);
+      const gid = entry.gid || '?';
+      const label = sanitizeForPrompt((group && group.label) || entry.label || gid, 120);
+      const isDynamic = !!(group && group.dynamic === true) || !!entry.dynamic;
+      if (isDynamic) {
+        const said = sanitizeForPrompt((record.inputs && record.inputs[gid]) || '', 80);
+        pushStepLine(`Group ${gid} [${label}] (dynamic, user said: "${said}")`);
+      } else {
+        if (!pushStepLine(`Group ${gid} [${label}] (static):`)) break;
+        const idxList = (group && Array.isArray(group.stepIndices)) ? group.stepIndices
+                       : (Array.isArray(entry.stepIndices) ? entry.stepIndices : []);
+        for (const si of idxList) {
+          if (stepsTruncated) break;
+          try {
+            const step = Array.isArray(steps) ? steps[si] : null;
+            if (!step) continue;
+            const desc = sanitizeForPrompt(step.description || step.tool || '(step)', 120);
+            pushStepLine(`  - ${desc}`);
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+  if (stepsTruncated) stepLines.push('… (step lines truncated for length)');
+  out.stepsBlock = stepLines.join('\n');
+
+  // ── Captures block (flat key=value, 2 KB cap) ──
+  const capLines = [];
+  const CAP_BYTES = 2048;
+  let used = 0;
+  let truncatedCount = 0;
+  const captures = (record && record.captures) || {};
+  const capEntries = Object.entries(captures);
+  for (let i = 0; i < capEntries.length; i++) {
+    try {
+      const [name, cap] = capEntries[i];
+      if (!cap || typeof cap !== 'object') continue;
+      const safeName = sanitizeForPrompt(name, 60);
+      const items = Array.isArray(cap.items) ? cap.items : null;
+      const qStr = cap.query == null ? '' : sanitizeForPrompt(cap.query, 40);
+      let line = '';
+      if (cap.kind === 'messages') {
+        line = `${safeName}=messages(count=${items ? items.length : 0}, currentUserId=${sanitizeForPrompt(cap.currentUserId || '?', 40)})`;
+      } else if (cap.kind === 'search') {
+        line = `${safeName}=search(count=${items ? items.length : 0}, query=${qStr})`;
+      } else if (cap.kind === 'pins') {
+        line = `${safeName}=pins(count=${items ? items.length : 0})`;
+      } else if (cap.kind === 'tasklist') {
+        line = `${safeName}=tasks(count=${items ? items.length : 0})`;
+      } else if (cap.refMap && typeof cap.refMap === 'object') {
+        line = `${safeName}=refs(count=${Object.keys(cap.refMap).length}, query=${qStr})`;
+      } else {
+        const cnt = typeof cap.count === 'number' ? cap.count : (items ? items.length : 0);
+        line = `${safeName}=capture(count=${cnt}${qStr ? `, query=${qStr}` : ''})`;
+      }
+      if (used + line.length + 1 > CAP_BYTES) { truncatedCount = capEntries.length - i; break; }
+      capLines.push(line);
+      used += line.length + 1;
+    } catch {}
+  }
+  if (truncatedCount > 0) capLines.push(`…(${truncatedCount} more captures truncated)`);
+  out.capturesBlock = capLines.join('\n');
+  return out;
+}
+
+function buildDynamicSyntheticMessage(automationName, groupLabel, userInput, identity, prior, activeChannel) {
+  const automation = (automationName || 'unnamed');
+  const label = String(groupLabel || '');
+  const input = (userInput == null || userInput === '') ? '(no input)' : String(userInput);
+
+  let identityBlock;
+  if (identity && identity.ok && (identity.currentUser || identity.currentUserId)) {
+    const u = identity.currentUser || '(unknown name)';
+    const id = identity.currentUserId || '(unknown)';
+    identityBlock = `You are signed in as ${u} (id ${id}). Resolve me/my/I/mine to this user.`;
+  } else {
+    identityBlock = IDENTITY_FALLBACK_BLOCK;
+  }
+
+  const priorSafe = prior || { stepsBlock: '', capturesBlock: '' };
+  const hasSteps = !!(priorSafe.stepsBlock && priorSafe.stepsBlock.length);
+  const stepsBlock = hasSteps ? priorSafe.stepsBlock : '(no prior steps in this run)';
+  const capturesBlock = (priorSafe.capturesBlock && priorSafe.capturesBlock.length)
+    ? priorSafe.capturesBlock : '(no captures available)';
+
+  const sections = [
+    `[Automation title: ${automation}] [Group: ${label}]`,
+    `## Signed-in user (for this app)\n\n${identityBlock}`,
+    `## Active channel\n\n${activeChannelSection(activeChannel)}`,
+    `## Ground truth (labels are not navigation source)\n\n${GROUND_TRUTH_BLOCK}`,
+    `## Prior steps executed in this automation run\n\n${stepsBlock}`,
+    `## Captures available\n\n${capturesBlock}`,
+    hasSteps ? `## Resume rules\n\n${RESUME_RULES_BLOCK}` : null,
+    `## User input for this group\n\n${input}`,
+    `Complete this group using the available tools, then stop.`,
+  ];
+  return sections.filter(Boolean).join('\n\n');
+}
+
+// Render the same content (identity + prior + resume-rules) as the system-prompt
+// "## Automation run context" block. Survives across tool rounds and the
+// force-reply round because runChatSend reuses one `instructions` string.
+function buildSyntheticContextBlock(identity, prior, activeChannel) {
+  let identityBlock;
+  if (identity && identity.ok && (identity.currentUser || identity.currentUserId)) {
+    const u = identity.currentUser || '(unknown name)';
+    const id = identity.currentUserId || '(unknown)';
+    identityBlock = `You are signed in as ${u} (id ${id}). Resolve me/my/I/mine to this user.`;
+  } else {
+    identityBlock = IDENTITY_FALLBACK_BLOCK;
+  }
+  const priorSafe = prior || { stepsBlock: '', capturesBlock: '' };
+  const hasSteps = !!(priorSafe.stepsBlock && priorSafe.stepsBlock.length);
+  const stepsBlock = hasSteps ? priorSafe.stepsBlock : '(no prior steps in this run)';
+  const capturesBlock = (priorSafe.capturesBlock && priorSafe.capturesBlock.length)
+    ? priorSafe.capturesBlock : '(no captures available)';
+  const sections = [
+    `### Signed-in user\n\n${identityBlock}`,
+    `### Active channel (at start of this group)\n\n${activeChannelSection(activeChannel)}`,
+    `### Ground truth (labels are not navigation source)\n\n${GROUND_TRUTH_BLOCK}`,
+    `### Prior steps executed in this run\n\n${stepsBlock}`,
+    `### Captures available\n\n${capturesBlock}`,
+    hasSteps ? `### Resume rules\n\n${RESUME_RULES_BLOCK}` : null,
+  ];
+  return sections.filter(Boolean).join('\n\n');
+}
+
+function mintDynamicRunId() {
+  return 'drun_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+function mintSyntheticTurnId() {
+  return 'syn_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+function emitDynamicRunEvent(record, payload) {
+  const sender = record && record.sender;
+  if (!sender || sender.isDestroyed()) return;
+  try { sender.send('automation:dynamic-run-event', Object.assign({ runId: record.id }, payload)); } catch {}
+}
+
+async function runDynamicGroupTurn(record, gid, entryIdx, groupLabel, steps, groups) {
+  const syntheticTurnId = mintSyntheticTurnId();
+  record.syntheticTurnId = syntheticTurnId;
+  emitDynamicRunEvent(record, { type: 'cursor', entryIdx, state: 'running' });
+
+  // Best-effort context prelude. ANY throw here degrades to the legacy
+  // one-line synthetic message — a context-build bug must NEVER abort a
+  // dynamic run. The probe + summary already swallow internal errors;
+  // this outer try/catch is defense-in-depth.
+  let message;
+  let syntheticContext = null;
+  try {
+    let identity = null;
+    try { identity = await probeActiveAppIdentity(record); }
+    catch (e) { debugLog('[dynamic-run] identity probe threw: ' + ((e && e.message) || e)); }
+    let prior = { stepsBlock: '', capturesBlock: '' };
+    try { prior = summarizePriorContext(record, entryIdx, steps, groups); }
+    catch (e) { debugLog('[dynamic-run] prior context build threw: ' + ((e && e.message) || e)); }
+    // Re-probe every group (never cached): the active channel changes whenever a
+    // prior group navigated, and the synthetic prompt must reflect where the run
+    // actually is — not a channel name copied from the (possibly stale) title.
+    let activeChannel = { ok: false };
+    try { activeChannel = await probeActiveChannel(record); }
+    catch (e) { debugLog('[dynamic-run] active channel probe threw: ' + ((e && e.message) || e)); }
+    message = buildDynamicSyntheticMessage(record.automationName, groupLabel, record.inputs[gid], identity, prior, activeChannel);
+    syntheticContext = buildSyntheticContextBlock(identity, prior, activeChannel);
+  } catch (e) {
+    debugLog('[dynamic-run] synthetic prelude failed, falling back: ' + ((e && e.message) || e));
+    // Legacy one-line shape — preserves run continuity if anything above blows up.
+    const automation = record.automationName || 'unnamed';
+    const input = record.inputs[gid] || '(no input)';
+    message = `[Automation title: ${automation}] [Group: ${groupLabel}]\nUser input: ${input}\nComplete this group using the available tools, then stop.`;
+    syntheticContext = null;
+  }
+
+  emitDynamicRunEvent(record, { type: 'group-start', gid, entryIdx, syntheticTurnId, message });
+  const syntheticPayload = {
+    meta: record.meta,
+    messages: [{ role: 'user', content: message }],
+    turnId: syntheticTurnId,
+  };
+  try {
+    const r = await runChatSend(null, syntheticPayload, {
+      signal: record.abort.signal,
+      syntheticTurnId,
+      syntheticExe: record.exe,
+      sender: record.sender,
+      syntheticContext,
+    });
+    if (r && r.error) {
+      emitDynamicRunEvent(record, { type: 'group-end', gid, entryIdx, ok: false, error: String(r.error), turnId: syntheticTurnId });
+      return { ok: false, error: String(r.error) };
+    }
+    emitDynamicRunEvent(record, { type: 'group-end', gid, entryIdx, ok: true, turnId: syntheticTurnId });
+    return { ok: true };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    emitDynamicRunEvent(record, { type: 'group-end', gid, entryIdx, ok: false, error: msg, turnId: syntheticTurnId });
+    return { ok: false, error: msg };
+  } finally {
+    record.syntheticTurnId = null;
+  }
+}
+
+async function runDynamicPhase1(record, steps, groups) {
+  emitDynamicRunEvent(record, { type: 'phase', phase: 'collect' });
+  for (let i = 0; i < record.plan.entries.length; i++) {
+    if (record.abort.signal.aborted) {
+      emitDynamicRunEvent(record, { type: 'done', ok: false, error: 'cancelled' });
+      record.phase = 'done';
+      setTimeout(() => dynamicRuns.delete(record.id), 1000);
+      return;
+    }
+    record.activeEntryIdx = i;
+    const entry = record.plan.entries[i];
+    const group = groups.find(g => g.gid === entry.gid);
+    if (!group || group.dynamic !== true) {
+      emitDynamicRunEvent(record, { type: 'cursor', entryIdx: i, state: 'skipped' });
+      continue;
+    }
+    record.awaitingGid = group.gid;
+    emitDynamicRunEvent(record, { type: 'cursor', entryIdx: i, state: 'awaiting-input' });
+    emitDynamicRunEvent(record, { type: 'prompt-user', gid: group.gid, prompt: record.prompts[group.gid], entryIdx: i });
+    record.awaitInput = new Promise((res, rej) => {
+      record.resolveInput = res;
+      record.rejectInput = rej;
+    });
+    const abortPromise = new Promise((_res, rej) => {
+      const onAbort = () => rej(new DOMException('aborted', 'AbortError'));
+      if (record.abort.signal.aborted) { onAbort(); return; }
+      record.abort.signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      await Promise.race([record.awaitInput, abortPromise]);
+    } catch (e) {
+      emitDynamicRunEvent(record, { type: 'done', ok: false, error: 'cancelled' });
+      record.phase = 'done';
+      record.awaitingGid = null;
+      record.awaitInput = null;
+      record.resolveInput = null;
+      record.rejectInput = null;
+      setTimeout(() => dynamicRuns.delete(record.id), 1000);
+      return;
+    }
+    record.awaitingGid = null;
+    record.awaitInput = null;
+    record.resolveInput = null;
+    record.rejectInput = null;
+    emitDynamicRunEvent(record, { type: 'cursor', entryIdx: i, state: 'done' });
+  }
+  record.phase = 'collect-done';
+  emitDynamicRunEvent(record, { type: 'phase', phase: 'execute' });
+}
+
+async function runDynamicPhase2(record, steps, groups) {
+  for (let i = record.executeIdx; i < record.plan.entries.length; i++) {
+    if (record.abort.signal.aborted) {
+      emitDynamicRunEvent(record, { type: 'done', ok: false, error: 'cancelled' });
+      record.phase = 'done';
+      setTimeout(() => dynamicRuns.delete(record.id), 1000);
+      return;
+    }
+    record.activeEntryIdx = i;
+    const entry = record.plan.entries[i];
+    const group = groups.find(g => g.gid === entry.gid);
+    if (!group) {
+      emitDynamicRunEvent(record, { type: 'cursor', entryIdx: i, state: 'failed' });
+      emitDynamicRunEvent(record, { type: 'phase', phase: 'halted' });
+      record.phase = 'halted';
+      record.failedGid = null;
+      record.executeIdx = i;
+      emitDynamicRunEvent(record, { type: 'done', ok: false, error: 'group not found' });
+      return;
+    }
+    if (group.dynamic !== true) {
+      emitDynamicRunEvent(record, { type: 'cursor', entryIdx: i, state: 'running' });
+      let failed = null;
+      for (const stepIndex of group.stepIndices) {
+        if (record.abort.signal.aborted) {
+          emitDynamicRunEvent(record, { type: 'done', ok: false, error: 'cancelled' });
+          record.phase = 'done';
+          setTimeout(() => dynamicRuns.delete(record.id), 1000);
+          return;
+        }
+        const step = steps[stepIndex];
+        record.execCtx.currentStepIndex = stepIndex;
+        const r = await runStaticStep(record, step, {
+          exe: record.exe,
+          sender: record.sender,
+          signal: record.abort.signal,
+          retryConfig: undefined,
+        });
+        if (!r.ok) { failed = r; break; }
+      }
+      if (failed) {
+        emitDynamicRunEvent(record, { type: 'cursor', entryIdx: i, state: 'failed' });
+        emitDynamicRunEvent(record, { type: 'phase', phase: 'halted' });
+        record.phase = 'halted';
+        record.failedGid = null;
+        record.executeIdx = i;
+        emitDynamicRunEvent(record, { type: 'done', ok: false, error: failed.error });
+        return;
+      }
+      emitDynamicRunEvent(record, { type: 'cursor', entryIdx: i, state: 'done' });
+      continue;
+    }
+    record.executeIdx = i;
+    const r = await runDynamicGroupTurn(record, group.gid, i, group.label, steps, groups);
+    if (r.ok) {
+      emitDynamicRunEvent(record, { type: 'cursor', entryIdx: i, state: 'done' });
+      continue;
+    }
+    emitDynamicRunEvent(record, { type: 'cursor', entryIdx: i, state: 'failed' });
+    emitDynamicRunEvent(record, { type: 'phase', phase: 'halted' });
+    record.phase = 'halted';
+    record.failedGid = group.gid;
+    return;
+  }
+  emitDynamicRunEvent(record, { type: 'done', ok: true });
+  record.phase = 'done';
+  setTimeout(() => dynamicRuns.delete(record.id), 5000);
+}
+
+ipcMain.handle('automation:dynamic-run-start', async (event, payload) => {
+  const { exe, id } = payload || {};
+  if (!exe || !id) throw new Error('automation:dynamic-run-start requires { exe, id }');
+  const list = loadAutomations(exe);
+  const entry = list.find(a => a.id === id);
+  if (!entry) throw new Error('automation not found');
+  const steps = Array.isArray(entry.steps) ? entry.steps : [];
+  const p = dynamicPath(exe, id);
+  if (!fs.existsSync(p)) throw new Error('no dynamic sidecar — open the Dynamic tab and save grouping first');
+  let sidecar;
+  try { sidecar = JSON.parse(fs.readFileSync(p, 'utf8')); }
+  catch (e) { throw new Error('dynamic sidecar parse failed: ' + (e && e.message || e)); }
+  const currentHash = stepsHash(steps);
+  if (!sidecar || sidecar.stepsHash !== currentHash) {
+    throw new Error('dynamic sidecar is stale (steps changed) — regroup before running');
+  }
+  const groups = Array.isArray(sidecar.groups) ? sidecar.groups : [];
+  if (groups.length === 0) throw new Error('dynamic sidecar has no groups');
+  for (const g of groups) {
+    if (g && g.dynamic === true) {
+      if (typeof g.prompt !== 'string' || !g.prompt.trim()) {
+        throw new Error(`group "${g.label}" is dynamic but has no runtime prompt — regenerate prompts first`);
+      }
+    }
+  }
+  if (sidecar.promptSchemaVersion !== 2) {
+    for (const g of groups) {
+      if (_isPromptStale(g)) {
+        throw new Error('STALE_PROMPTS: Regenerate runtime prompts before running this automation. Open the Dynamic tab and click "Regenerate prompts".');
+      }
+    }
+  }
+  const payloadMeta = payload && payload.meta && typeof payload.meta === 'object' ? payload.meta : null;
+  const meta = (payloadMeta && payloadMeta.exe)
+    ? Object.assign({}, payloadMeta, { exe })
+    : resolveInjectMeta(appKey(exe));
+  if (!meta) throw new Error(`cannot resolve live meta for ${exe} — open the app first`);
+
+  const entries = groups.map(g => ({
+    kind: 'group',
+    gid: g.gid,
+    label: g.label,
+    dynamic: g.dynamic === true,
+    stepIndices: Array.isArray(g.stepIndices) ? g.stepIndices.slice() : [],
+  }));
+  const prompts = {};
+  for (const g of groups) {
+    if (g && g.dynamic === true) prompts[g.gid] = g.prompt;
+  }
+
+  const runId = mintDynamicRunId();
+  const refMapHolder = { current: {} };
+  const captures = {};
+  const execCtx = { meta, captures, refMapHolder, currentStepIndex: 0 };
+  const record = {
+    exe,
+    id: runId,
+    automationId: id,
+    automationName: entry.name || 'unnamed',
+    meta,
+    plan: { entries },
+    prompts,
+    inputs: {},
+    phase: 'collect',
+    abort: new AbortController(),
+    activeEntryIdx: -1,
+    awaitingGid: null,
+    failedGid: null,
+    syntheticTurnId: null,
+    sender: event.sender,
+    executeIdx: 0,
+    awaitInput: null,
+    resolveInput: null,
+    rejectInput: null,
+    refMapHolder,
+    captures,
+    execCtx,
+    get stopped() { return record.abort.signal.aborted; },
+    // groups + steps held closure-side via the walker; stash for retry resume:
+    _groups: groups,
+    _steps: steps,
+  };
+  dynamicRuns.set(runId, record);
+
+  setImmediate(() => {
+    runDynamicPhase1(record, steps, groups).catch(err => {
+      debugLog(`[dynamic-run] phase1 crashed: ${err && err.message || err}`);
+      emitDynamicRunEvent(record, { type: 'done', ok: false, error: String((err && err.message) || err) });
+      record.phase = 'done';
+      setTimeout(() => dynamicRuns.delete(runId), 1000);
+    });
+  });
+
+  return { runId, plan: { entries }, prompts };
+});
+
+ipcMain.handle('automation:dynamic-run-inputs', (_event, payload) => {
+  const { runId, expectedGid, input } = payload || {};
+  const record = dynamicRuns.get(runId);
+  if (!record) return { ok: true, accepted: false, reason: 'no-run' };
+  if (record.phase !== 'collect') return { ok: true, accepted: false, reason: 'wrong-phase' };
+  if (record.awaitingGid !== expectedGid) return { ok: true, accepted: false, reason: 'wrong-gid' };
+  if (typeof record.resolveInput !== 'function') return { ok: true, accepted: false, reason: 'desync' };
+  record.inputs[expectedGid] = String(input == null ? '' : input);
+  const resolve = record.resolveInput;
+  record.resolveInput = null;
+  record.rejectInput = null;
+  try { resolve(); } catch {}
+  return { ok: true, accepted: true };
+});
+
+ipcMain.handle('automation:dynamic-run-execute', (_event, payload) => {
+  const { runId } = payload || {};
+  const record = dynamicRuns.get(runId);
+  if (!record) throw new Error('dynamic-run-execute: no such run');
+  if (record.phase === 'execute') return { ok: true };
+  if (record.phase !== 'collect-done') throw new Error(`dynamic-run-execute: wrong phase (${record.phase})`);
+  record.phase = 'execute';
+  record.executeIdx = 0;
+  setImmediate(() => {
+    runDynamicPhase2(record, record._steps, record._groups).catch(err => {
+      debugLog(`[dynamic-run] phase2 crashed: ${err && err.message || err}`);
+      emitDynamicRunEvent(record, { type: 'done', ok: false, error: String((err && err.message) || err) });
+      record.phase = 'done';
+      setTimeout(() => dynamicRuns.delete(record.id), 1000);
+    });
+  });
+  return { ok: true };
+});
+
+ipcMain.handle('automation:dynamic-run-retry', (_event, payload) => {
+  const { runId, gid } = payload || {};
+  const record = dynamicRuns.get(runId);
+  if (!record) throw new Error('dynamic-run-retry: no such run');
+  if (record.phase !== 'halted') throw new Error(`dynamic-run-retry: wrong phase (${record.phase})`);
+  if (record.failedGid !== gid) throw new Error('dynamic-run-retry: gid mismatch');
+  const entryIdx = record.plan.entries.findIndex(e => e.gid === gid);
+  if (entryIdx < 0) throw new Error('dynamic-run-retry: entry not found for gid');
+  record.phase = 'execute';
+  record.failedGid = null;
+  record.executeIdx = entryIdx;
+  setImmediate(() => {
+    runDynamicPhase2(record, record._steps, record._groups).catch(err => {
+      debugLog(`[dynamic-run] phase2 retry crashed: ${err && err.message || err}`);
+      emitDynamicRunEvent(record, { type: 'done', ok: false, error: String((err && err.message) || err) });
+      record.phase = 'done';
+      setTimeout(() => dynamicRuns.delete(record.id), 1000);
+    });
+  });
+  return { ok: true };
+});
+
+ipcMain.handle('automation:dynamic-run-stop', (_event, payload) => {
+  const { runId } = payload || {};
+  const record = dynamicRuns.get(runId);
+  if (!record) return { ok: true };
+  try { record.abort.abort(); } catch {}
+  if (typeof record.rejectInput === 'function') {
+    const rej = record.rejectInput;
+    record.rejectInput = null;
+    record.resolveInput = null;
+    try { rej(new DOMException('aborted', 'AbortError')); } catch {}
+  }
+  emitDynamicRunEvent(record, { type: 'done', ok: false, error: 'cancelled' });
+  record.phase = 'done';
+  setTimeout(() => dynamicRuns.delete(runId), 1000);
+  return { ok: true };
 });
 
 // ── Headless inject entrypoint (loop convergence harness) ──
@@ -9330,6 +10557,14 @@ ipcMain.on('overlay:set-dragging', (event, { active } = {}) => {
   overlayDragging = !!active;
   // A finished drag is a deliberate placement — persist it.
   if (!overlayDragging) saveOverlayPos();
+});
+
+// Session-only pin: when pinned the overlay won't auto-close on blur. Never
+// persisted to config — resets to unpinned on every summon (see showOverlay).
+ipcMain.on('overlay:set-pinned', (event, { pinned } = {}) => {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  if (event.sender !== overlayWindow.webContents) return;
+  overlayPinned = !!pinned;
 });
 
 ipcMain.handle('overlay:dismiss', () => { hideOverlay(); return true; });

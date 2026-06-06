@@ -449,7 +449,7 @@ function renderWorkspace() {
         renderWorkspace();
         return;
       }
-      if (exe && name) openChat(name, exe);
+      if (exe && name) withDynamicRunGuard(() => openChat(name, exe));
     });
   });
 }
@@ -924,11 +924,19 @@ let lastUserMessage    = '';
 let lastRenderedCount  = 0;        // last msg count rendered; used to flag fresh bubbles
 let chatStreamEl       = null;     // ref to currently-streaming assistant bubble
 
+// Dynamic-script run state. Single active run at a time (one per renderer).
+// Shape: { runId, exe, id, plan, prompts, inputs, phase, activeEntryIdx,
+//          awaitingGid, failedGid, syntheticTurnId, syntheticShown: Set<gid>,
+//          uiHost, listEl, entryEls: Map<entryIdx, HTMLElement>, _onceDone: [] }
+let dynamicRun = null;
+
 // Empty-state source of truth. Composer-only mode kicks in when the thread is
 // empty AND no stream is mid-flight. Used by sizing + CSS class toggling.
 function chatIsEmpty() {
   const msgs = (chatStore && chatCurrentExe && chatStore[chatCurrentExe]) || [];
-  return msgs.length === 0 && !chatStreamContent;
+  const host = dynRunHost();
+  const dynamicRunVisible = host && !host.hidden;
+  return msgs.length === 0 && !chatStreamContent && !dynamicRunVisible;
 }
 
 function updateChatEmptyClass() {
@@ -1030,7 +1038,7 @@ async function openDirectChat() {
   try { sessionStorage.setItem('autobot.overlay.exe', DIRECT_CHAT_ID); } catch {}
 }
 
-chatBackBtn.addEventListener('click', () => { closeAutoPanel(); switchPage('workspace'); });
+chatBackBtn.addEventListener('click', () => { withDynamicRunGuard(() => { closeAutoPanel(); switchPage('workspace'); }); });
 
 // ── Window picker (multi-window apps, e.g. several Chrome windows) ──
 // Surfaces above the composer ONLY when the open chat is scoped to an Electron
@@ -1366,6 +1374,9 @@ function renderTurn(m, i) {
     return `<div class="chat-msg chat-msg-user${shots.length ? ' has-shots' : ''}">${shotsBlock}${textBlock}</div>`;
   }
   if (m.role === 'assistant') {
+    if (m.dynamicPrompt) {
+      return `<div class="chat-msg chat-msg-assistant dynamic-prompt" data-i="${i}">${escapeHtml(m.content || '')}</div>`;
+    }
     let reasoning = '';
     if (m.reasoning) {
       const s = Math.max(1, Math.round((m.reasoningMs || 0) / 1000));
@@ -1415,7 +1426,8 @@ function renderTurn(m, i) {
       ${msgBlock}`;
   }
   if (m.role === 'system') {
-    return `<div class="chat-msg chat-msg-system">${escapeHtml(m.content)}</div>`;
+    const extra = m.dynamicSynthetic ? ' dynamic-prompt' : '';
+    return `<div class="chat-msg chat-msg-system${extra}">${escapeHtml(m.content)}</div>`;
   }
   return '';
 }
@@ -2433,6 +2445,15 @@ window.chat.onDone((data) => {
     if (liveStream) liveStream.classList.remove('streaming');
   } catch {}
   chatStreamEl = null;
+  // Synthetic dynamic-run turn: endDynamicSyntheticTurn (fired by the
+  // dynamic-run-event group-end) owns persistence + retry markers, so skip
+  // the chatStore push paths here. State teardown still happens via that
+  // helper. Leaves chatStreamContent intact so the success path can flush it.
+  if (typeof data.turnId === 'string' && data.turnId.indexOf('syn_') === 0) {
+    destroyLiveActivity();
+    setChatBusy(false);
+    return;
+  }
 
   const targetExe = chatStreamExe;
   const elapsedMs = reasoningStartMs ? (Date.now() - reasoningStartMs) : 0;
@@ -2490,6 +2511,430 @@ window.chat.onDone((data) => {
     }
   }
 });
+
+// ── Dynamic-script run host ────────────────────────────────────────────────
+// Per-app chat panel hosts the run UI for `isDynamic` automations. The state
+// machine here is the renderer side of the contract in §4.3/§5.2-§5.6 of
+// .claude/plans/dynamic-script-execution.md. Backend drives via the single
+// `automation:dynamic-run-event` channel; this module mutates `dynamicRun`
+// and routes streamed chat events into the per-app chat scroll.
+
+function dynRunHost() {
+  return document.getElementById('dynamic-run-host');
+}
+
+const pendingDynamicRunEvents = new Map();
+let dynamicRunEventHandler = null;
+
+function queueDynamicRunEvent(data) {
+  if (!data || !data.runId) return;
+  const key = String(data.runId);
+  const list = pendingDynamicRunEvents.get(key) || [];
+  list.push(data);
+  if (list.length > 100) list.shift();
+  pendingDynamicRunEvents.set(key, list);
+}
+
+function drainDynamicRunEvents(runId) {
+  const key = String(runId || '');
+  if (!key) return;
+  const list = pendingDynamicRunEvents.get(key);
+  if (!list || !list.length) return;
+  pendingDynamicRunEvents.delete(key);
+  if (typeof dynamicRunEventHandler !== 'function') return;
+  for (const data of list) dynamicRunEventHandler(data);
+}
+
+function dynRunUpdatePhaseLabel(label) {
+  const host = dynRunHost();
+  if (!host) return;
+  const el = host.querySelector('.dynamic-run-phase');
+  if (el) el.textContent = label || '';
+}
+
+function dynRunHide(delayMs = 0) {
+  const host = dynRunHost();
+  if (!host) return;
+  const apply = () => {
+    host.hidden = true;
+    host.removeAttribute('data-phase');
+    const listEl = host.querySelector('.dynamic-run-list');
+    if (listEl) listEl.innerHTML = '';
+    const nameEl = host.querySelector('.dynamic-run-name');
+    if (nameEl) nameEl.textContent = '';
+    dynRunUpdatePhaseLabel('');
+    updateChatEmptyClass();
+    try {
+      if (typeof window.__overlaySizeForChat === 'function') {
+        requestAnimationFrame(() => window.__overlaySizeForChat({ immediate: true }));
+      }
+    } catch {}
+  };
+  if (delayMs > 0) setTimeout(apply, delayMs);
+  else apply();
+}
+
+function setEntryState(entryIdx, state) {
+  if (!dynamicRun) return;
+  const el = dynamicRun.entryEls.get(entryIdx);
+  if (el) el.dataset.state = state;
+}
+
+function clearDynamicAwait(reason) {
+  if (!dynamicRun) return;
+  dynamicRun.awaitingGid = null;
+  try { chatInput.setAttribute('data-placeholder', 'Send a message…'); } catch {}
+  if (reason) console.debug('[dynamic-run] clearDynamicAwait:', reason);
+}
+
+function appendUserBubble(text) {
+  // Render exactly like a normal chat user message so the transcript reads naturally.
+  addChatMessage('user', text);
+}
+
+function showComposerHint(msg) {
+  // Reuse the existing chat-hint line below the composer for a one-shot warning.
+  const hint = document.querySelector('.chat-hint');
+  const launcherHint = document.getElementById('launcher-hint');
+  if (hint) {
+    const prev = hint.textContent;
+    hint.textContent = msg;
+    setTimeout(() => { try { hint.textContent = prev; } catch {} }, 3000);
+  }
+  if (launcherHint) {
+    const prev = launcherHint.textContent;
+    launcherHint.textContent = msg;
+    setTimeout(() => { try { launcherHint.textContent = prev; } catch {} }, 4000);
+  }
+}
+
+// Build a chat-stream placeholder so chat:chunk / chat:done events for the
+// synthetic turn flow into the same #chat-stream-msg the normal chat path uses.
+// Mirrors the placeholder lifecycle in sendChatMessage + chat:onChunk.
+function beginDynamicSyntheticTurn(gid, syntheticTurnId, message) {
+  if (!dynamicRun) return;
+  if (!dynamicRun.syntheticShown.has(gid)) {
+    if (!chatStore[dynamicRun.exe]) chatStore[dynamicRun.exe] = [];
+    chatStore[dynamicRun.exe].push({ role: 'system', content: message, dynamicSynthetic: true });
+    renderChat();
+    dynamicRun.syntheticShown.add(gid);
+  }
+  chatStreamExe = dynamicRun.exe;
+  currentTurnId = syntheticTurnId;
+  chatStreamContent = '';
+  // Pre-create the live assistant placeholder so the first chunk has a home.
+  let streamMsg = document.getElementById('chat-stream-msg');
+  if (!streamMsg) {
+    streamMsg = document.createElement('div');
+    streamMsg.id = 'chat-stream-msg';
+    streamMsg.className = 'chat-msg chat-msg-assistant streaming';
+    chatMessagesEl.appendChild(streamMsg);
+    chatStreamEl = streamMsg;
+  }
+  dynamicRun.syntheticTurnId = syntheticTurnId;
+}
+
+function endDynamicSyntheticTurn(gid, ok) {
+  if (!dynamicRun) return;
+  if (ok) {
+    // Flush placeholder to chatStore as a persisted assistant message — mirrors
+    // the chat:done success path. Don't double-render: chatStreamContent already
+    // holds the full text, and renderChat() will replace the placeholder.
+    const finalContent = chatStreamContent || '';
+    if (finalContent) {
+      if (!chatStore[dynamicRun.exe]) chatStore[dynamicRun.exe] = [];
+      chatStore[dynamicRun.exe].push({
+        role: 'assistant',
+        content: finalContent,
+        reasoning: null,
+        reasoningMs: 0,
+        trail: [],
+        userMsg: '',
+        sources: [],
+      });
+    }
+    const live = document.getElementById('chat-stream-msg');
+    if (live) live.remove();
+    chatStreamContent = '';
+    chatStreamExe = null;
+    currentTurnId = 0;
+    renderChat();
+  } else {
+    // Failed attempt: discard, don't persist. Drop placeholder entirely so
+    // a retry starts clean (no duplicate synthetic bubble — that lives in syntheticShown).
+    const live = document.getElementById('chat-stream-msg');
+    if (live) live.remove();
+    chatStreamContent = '';
+    chatStreamExe = null;
+    currentTurnId = 0;
+    // Inline failure marker next to the group entry (muted, reuses prompt-bubble style).
+    if (!chatStore[dynamicRun.exe]) chatStore[dynamicRun.exe] = [];
+    chatStore[dynamicRun.exe].push({
+      role: 'system',
+      content: 'Group failed. Click Retry to try again.',
+      dynamicSynthetic: true,
+    });
+    renderChat();
+  }
+  dynamicRun.syntheticTurnId = null;
+}
+
+async function startDynamicRun(entry) {
+  // Clear any stale run state so a prior failed/orphaned run doesn't block
+  // retry. dynamicRun is only set on the success path below; any early-return
+  // failure leaves the previous value in place, which the phase listener and
+  // submit guard treat as "still running".
+  dynamicRun = null;
+  const exe = entry.exe;
+  if (!exe) { console.warn('[dynamic-run] entry missing exe'); return; }
+  // Ensure the per-app chat panel is open before we render the host inside it.
+  if (chatCurrentExe !== exe) {
+    try { await openChat(entry.name || exe, exe); }
+    catch (err) { console.warn('[dynamic-run] openChat failed', err); return; }
+  }
+  // One paint so #dynamic-run-host (inside the chat panel container) is laid out.
+  await new Promise(resolve => requestAnimationFrame(() => resolve()));
+
+  let r;
+  try { r = await window.automation.dynamicRun.start({ exe, id: entry.id, meta: entry.meta || null }); }
+  catch (err) {
+    console.warn('[dynamic-run] start failed', err);
+    const msg = (err && err.message) ? String(err.message) : String(err);
+    if (msg.startsWith('STALE_PROMPTS:')) {
+      showComposerHint(msg.slice('STALE_PROMPTS:'.length).trim());
+    } else {
+      showComposerHint('Dynamic run failed to start: ' + msg);
+    }
+    return;
+  }
+  if (!r || !r.runId) {
+    showComposerHint('Dynamic run failed to start.');
+    return;
+  }
+
+  const host = dynRunHost();
+  if (!host) { console.warn('[dynamic-run] host element missing'); return; }
+  const listEl = host.querySelector('.dynamic-run-list');
+  const nameEl = host.querySelector('.dynamic-run-name');
+  const stopBtn = host.querySelector('.dynamic-run-stop');
+  if (!listEl || !nameEl || !stopBtn) { console.warn('[dynamic-run] host children missing'); return; }
+
+  dynamicRun = {
+    runId: r.runId,
+    exe,
+    id: entry.id,
+    plan: r.plan || { entries: [] },
+    prompts: r.prompts || {},
+    inputs: {},
+    phase: 'collect',
+    activeEntryIdx: -1,
+    awaitingGid: null,
+    failedGid: null,
+    syntheticTurnId: null,
+    syntheticShown: new Set(),
+    uiHost: host,
+    listEl,
+    entryEls: new Map(),
+    _onceDone: [],
+  };
+
+  nameEl.textContent = entry.name || '';
+  dynRunUpdatePhaseLabel('');
+  listEl.innerHTML = '';
+
+  const entries = Array.isArray(dynamicRun.plan.entries) ? dynamicRun.plan.entries : [];
+  const steps = Array.isArray(entry.steps) ? entry.steps : [];
+  entries.forEach((it, i) => {
+    const row = document.createElement('div');
+    row.className = 'dynamic-run-entry';
+    if (it && it.kind === 'group') row.classList.add('is-group');
+    row.dataset.entryIdx = String(i);
+    row.dataset.state = 'pending';
+
+    const head = document.createElement('div');
+    head.className = 'dynamic-run-entry-head';
+    const idxEl = document.createElement('span');
+    idxEl.className = 'dynamic-run-entry-idx';
+    idxEl.textContent = String(i + 1);
+    const labelEl = document.createElement('span');
+    labelEl.className = 'dynamic-run-entry-label';
+    labelEl.textContent = (it && it.label) || (it && it.kind === 'step' ? 'Step' : 'Group');
+    head.appendChild(idxEl);
+    head.appendChild(labelEl);
+
+    if (it && it.kind === 'group' && it.dynamic === true) {
+      const retryBtn = document.createElement('button');
+      retryBtn.type = 'button';
+      retryBtn.className = 'dynamic-run-entry-retry';
+      retryBtn.dataset.gid = it.gid || '';
+      retryBtn.textContent = 'Retry';
+      retryBtn.addEventListener('click', async () => {
+        if (!dynamicRun) return;
+        try { await window.automation.dynamicRun.retry({ runId: dynamicRun.runId, gid: retryBtn.dataset.gid }); }
+        catch (err) { console.warn('[dynamic-run] retry failed', err); }
+      });
+      head.appendChild(retryBtn);
+    }
+    row.appendChild(head);
+
+    if (it && it.kind === 'group' && Array.isArray(it.stepIndices) && it.stepIndices.length) {
+      const ul = document.createElement('ul');
+      ul.className = 'dynamic-run-entry-steps';
+      it.stepIndices.forEach((si) => {
+        const li = document.createElement('li');
+        const s = steps[si];
+        li.textContent = s ? stepText(s, steps) : `Step ${si + 1}`;
+        ul.appendChild(li);
+      });
+      row.appendChild(ul);
+    }
+
+    listEl.appendChild(row);
+    dynamicRun.entryEls.set(i, row);
+  });
+
+  host.hidden = false;
+  updateChatEmptyClass();
+
+  // Single-shot stop wiring per run — replace listener so a re-rendered run
+  // does not stack click handlers.
+  const newStopBtn = stopBtn.cloneNode(true);
+  stopBtn.parentNode.replaceChild(newStopBtn, stopBtn);
+  newStopBtn.addEventListener('click', async () => {
+    if (!dynamicRun) return;
+    try { await window.automation.dynamicRun.stop({ runId: dynamicRun.runId }); }
+    catch (err) { console.warn('[dynamic-run] stop failed', err); }
+  });
+
+  drainDynamicRunEvents(r.runId);
+  try {
+    if (typeof window.__overlaySizeForChat === 'function') {
+      requestAnimationFrame(() => window.__overlaySizeForChat({ immediate: true }));
+    }
+  } catch {}
+}
+
+// Single global listener — registered once during renderer init. The init
+// guard is the truthy check on a one-time flag; without it a fast double-load
+// (DevTools reload in unusual contexts) could stack listeners.
+if (!window.__dynamicRunListenerWired && window.automation && window.automation.dynamicRun && typeof window.automation.dynamicRun.onEvent === 'function') {
+  window.__dynamicRunListenerWired = true;
+  dynamicRunEventHandler = (data) => {
+    if (!data) return;
+    if (!dynamicRun) {
+      queueDynamicRunEvent(data);
+      return;
+    }
+    if (data.runId !== dynamicRun.runId) return;
+    const host = dynamicRun.uiHost;
+    switch (data.type) {
+      case 'phase': {
+        if (data.phase === 'collect') {
+          if (host) host.dataset.phase = 'collect';
+          dynRunUpdatePhaseLabel('Collect');
+          dynamicRun.phase = 'collect';
+        } else if (data.phase === 'execute') {
+          if (host) host.dataset.phase = 'execute';
+          dynRunUpdatePhaseLabel('Execute');
+          dynamicRun.phase = 'execute';
+          for (const el of dynamicRun.entryEls.values()) el.dataset.state = 'pending';
+          // Backend ends Phase 1 by emitting phase:'execute' and parks in
+          // 'collect-done'. Phase 2 won't start until we call execute().
+          const runIdAtTransition = dynamicRun.runId;
+          window.automation.dynamicRun.execute({ runId: runIdAtTransition })
+            .catch(err => {
+              console.warn('[dynamic-run] execute failed', err);
+              try { showComposerHint('Dynamic run execute failed: ' + (err && err.message ? err.message : String(err))); } catch {}
+              dynamicRun = null;
+            });
+        } else if (data.phase === 'halted') {
+          if (host) host.dataset.phase = 'halted';
+          dynRunUpdatePhaseLabel('Halted');
+          dynamicRun.phase = 'halted';
+          clearDynamicAwait('phase:halted');
+        } else if (data.phase === 'done') {
+          dynamicRun.phase = 'done';
+        }
+        break;
+      }
+      case 'cursor': {
+        if (typeof data.entryIdx === 'number') {
+          setEntryState(data.entryIdx, data.state || 'pending');
+          dynamicRun.activeEntryIdx = data.entryIdx;
+        }
+        break;
+      }
+      case 'prompt-user': {
+        const promptText = data.prompt || '';
+        if (!chatStore[dynamicRun.exe]) chatStore[dynamicRun.exe] = [];
+        chatStore[dynamicRun.exe].push({
+          role: 'assistant',
+          content: promptText,
+          dynamicPrompt: true,
+        });
+        renderChat();
+        try { chatInput.focus(); } catch {}
+        let entryLabel = '';
+        const e = dynamicRun.entryEls.get(data.entryIdx);
+        if (e) {
+          const labelEl = e.querySelector('.dynamic-run-entry-label');
+          if (labelEl) entryLabel = labelEl.textContent || '';
+        }
+        try { chatInput.setAttribute('data-placeholder', 'Reply for: ' + entryLabel); } catch {}
+        dynamicRun.awaitingGid = data.gid || null;
+        break;
+      }
+      case 'group-start': {
+        beginDynamicSyntheticTurn(data.gid, data.syntheticTurnId, data.message || '');
+        break;
+      }
+      case 'group-end': {
+        endDynamicSyntheticTurn(data.gid, !!data.ok);
+        if (!data.ok) {
+          dynamicRun.failedGid = data.gid || null;
+        }
+        break;
+      }
+      case 'done': {
+        const ok = !!data.ok;
+        if (host) host.dataset.phase = ok ? 'done' : 'halted-cancelled';
+        dynRunUpdatePhaseLabel(ok ? 'Done' : 'Halted');
+        clearDynamicAwait('done');
+        const callbacks = dynamicRun._onceDone.slice();
+        dynamicRun._onceDone.length = 0;
+        for (const cb of callbacks) { try { cb('done'); } catch {} }
+        const ranId = dynamicRun.runId;
+        setTimeout(() => {
+          // If another run started in the meantime, do not blow it away.
+          if (dynamicRun && dynamicRun.runId === ranId) {
+            dynRunHide(0);
+            dynamicRun = null;
+          }
+        }, 1000);
+        break;
+      }
+    }
+  };
+  window.automation.dynamicRun.onEvent(dynamicRunEventHandler);
+}
+
+// Wrap user-visible chat entrypoints so a switch/close stops any active run
+// before the new state takes over (§5.6).
+async function withDynamicRunGuard(action) {
+  if (dynamicRun && dynamicRun.exe === chatCurrentExe && dynamicRun.phase !== 'done') {
+    const donePromise = new Promise(resolve => {
+      const t = setTimeout(() => resolve('timeout'), 2000);
+      const cb = () => { clearTimeout(t); resolve('done'); };
+      if (!dynamicRun._onceDone) dynamicRun._onceDone = [];
+      dynamicRun._onceDone.push(cb);
+    });
+    try { await window.automation.dynamicRun.stop({ runId: dynamicRun.runId }); }
+    catch (err) { console.warn('[dynamic-run] stop failed in guard', err); }
+    await donePromise;
+    clearDynamicAwait('stopped');
+  }
+  return action();
+}
 
 async function sendChatMessage(forcedText, forcedApps, forcedAttachments) {
   const rawText = forcedText !== undefined ? forcedText : serializeChatInput().trim();
@@ -2692,6 +3137,35 @@ chatInput.addEventListener('keydown', (e) => {
     }
     // Esc: no special handling — global hold-Esc still aborts the turn, which
     // fires onDone → closeClarify() cleanup.
+  }
+  // Dynamic-run Collect phase: a Codex-authored question is pending. The next
+  // Enter (no Shift) submits the typed text as the answer for that gid. Runs
+  // BEFORE slash palette / /app / /tab / /screenshot / files / chatBusy gate so
+  // leading '/' is treated as literal answer text, never a slash command.
+  if (dynamicRun && dynamicRun.awaitingGid && e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    const text = serializeChatInput().trim();
+    if (!text) return;
+    appendUserBubble(text);
+    clearChatInput();
+    const gid = dynamicRun.awaitingGid;
+    dynamicRun.awaitingGid = null;
+    (async () => {
+      let r;
+      try { r = await window.automation.dynamicRun.submitInput({ runId: dynamicRun.runId, expectedGid: gid, input: text }); }
+      catch (err) {
+        showComposerHint('Input rejected: ' + (err && err.message ? err.message : 'error'));
+        clearDynamicAwait('submit-error');
+        return;
+      }
+      if (!r || !r.accepted) {
+        showComposerHint('Input rejected: ' + (r && r.reason ? r.reason : 'desync'));
+      }
+      // Defensive: even on accepted=false the awaitingGid is cleared above.
+      // If the run continued, the next prompt-user event will re-arm it.
+      clearDynamicAwait('after-submit');
+    })();
+    return;
   }
   // Slash palette open: arrow keys navigate, Tab/Enter commits highlighted cmd,
   // Esc closes. Letters fall through to contenteditable so the filter shrinks
@@ -3759,6 +4233,19 @@ const autoReviewJsonSave = document.getElementById('auto-review-json-save');
 const autoReviewError    = document.getElementById('auto-review-error');
 const autoReviewDiscard  = document.getElementById('auto-review-discard');
 const autoReviewSave     = document.getElementById('auto-review-save');
+const autoReviewSaveNew  = document.getElementById('auto-review-save-new');
+
+const autoReviewTabsEl     = document.querySelector('#auto-review-form .auto-modal-tabs');
+const autoReviewTabs       = document.querySelectorAll('#auto-review-form .auto-modal-tab');
+const autoReviewPaneStatic = document.querySelector('#auto-review-form [data-pane="static"]');
+const autoReviewPaneDynamic= document.querySelector('#auto-review-form [data-pane="dynamic"]');
+const autoReviewDynHint    = document.querySelector('#auto-review-form .auto-modal-dyn-hint');
+const autoReviewDynLoading = document.querySelector('#auto-review-form .auto-modal-dyn-loading');
+const autoReviewDynError   = document.querySelector('#auto-review-form .auto-modal-dyn-error');
+const autoReviewDynGroups  = document.getElementById('auto-review-dyn-groups');
+const autoReviewDynRetry   = document.querySelector('#auto-review-form .auto-modal-dyn-retry');
+const autoReviewDynRetryBtn= document.getElementById('auto-review-dyn-retry-btn');
+let __autoReviewSaveStaticLabel = null;
 
 const autoRunModal       = document.getElementById('auto-run-modal');
 const autoRunTitle       = document.getElementById('auto-run-title');
@@ -3825,6 +4312,13 @@ function closeAutoPanel() {
     try { window.automation.cancelCreate(activeCodexJob); } catch {}
     activeCodexJob = null;
   }
+  // Cancel in-flight grouping if leaving with Dynamic tab loading.
+  if (reviewState && reviewState.dynamic && reviewState.dynamic.status === 'loading') {
+    reviewState.dynamic.aborted = true;
+    if (reviewState.dynamic.jobId) {
+      try { window.automation.cancelGroup(reviewState.dynamic.jobId); } catch {}
+    }
+  }
   autoPanel.hidden = true;
   delete autoPanel.dataset.state;
   pageChatEl.classList.remove('auto-panel-open');
@@ -3857,9 +4351,22 @@ function openReviewModal() {
   showAutoModal(autoReviewModal);
 }
 function closeReviewModal() {
+  const wasLauncher = !!(reviewState && reviewState.fromLauncher);
+  if (reviewState && reviewState.dynamic && reviewState.dynamic.status === 'loading') {
+    reviewState.dynamic.aborted = true;
+    if (reviewState.dynamic.jobId) {
+      try { window.automation.cancelGroup(reviewState.dynamic.jobId); } catch {}
+    }
+  }
   hideAutoModal(autoReviewModal);
   reviewState = null;
   resetReviewJsonView();
+  if (autoReviewSaveNew) autoReviewSaveNew.hidden = true;
+  // Launcher editor: shrink the overlay back to launcher size, refresh the
+  // automation list, and return focus to the launcher input.
+  if (wasLauncher && typeof window.__launcherAfterEditorClose === 'function') {
+    window.__launcherAfterEditorClose();
+  }
 }
 function isReviewModalOpen() { return autoReviewModal.classList.contains('show'); }
 
@@ -4081,6 +4588,7 @@ function openStepEditor(idx) {
       });
       if (stepEditToken !== myToken || !reviewState) return; // editor was abandoned
       reviewState.steps = res.steps;
+      invalidateDynamic();
       try { await persistReviewSteps(); } catch (e) { /* surfaced below */ throw e; }
       renderReviewSteps();
     } catch (err) {
@@ -4110,6 +4618,7 @@ async function removeStep(idx) {
   if (!confirm(`Remove this step?\n\n${idx + 1}. ${label}`)) return;
   const prev = steps;
   reviewState.steps = steps.slice(0, idx).concat(steps.slice(idx + 1));
+  invalidateDynamic();
   try {
     await persistReviewSteps();
   } catch (err) {
@@ -4173,6 +4682,7 @@ function openAddStepEditor() {
       });
       if (stepEditToken !== myToken || !reviewState) return; // editor was abandoned
       reviewState.steps = res.steps;
+      invalidateDynamic();
       try { await persistReviewSteps(); } catch (e) { /* surfaced below */ throw e; }
       renderReviewSteps();
     } catch (err) {
@@ -4237,6 +4747,11 @@ autoProgressCancel.addEventListener('click', () => { closeAutoPanel(); });
 
 window.automation.onCodexProgress((data) => {
   if (data && data.jobId && !activeCodexJob) activeCodexJob = data.jobId;
+  // Capture grouping jobId so a mid-flight tab-switch / close can cancel.
+  if (data && data.jobId && reviewState && reviewState.dynamic
+      && reviewState.dynamic.status === 'loading' && !reviewState.dynamic.jobId) {
+    reviewState.dynamic.jobId = data.jobId;
+  }
   if (data && data.bytes !== undefined) {
     autoProgressText.textContent = `Receiving response… ${data.bytes} bytes`;
   } else if (data && data.status) {
@@ -4252,32 +4767,531 @@ function resetReviewJsonView() {
   autoReviewJsonError.classList.remove('visible');
 }
 
+// Force the Static tab visually + state. Used on (re)open of review surface.
+function resetReviewTabsToStatic() {
+  if (autoReviewTabs && autoReviewTabs.forEach) {
+    autoReviewTabs.forEach(b => b.classList.toggle('is-active', b.dataset.tab === 'static'));
+  }
+  if (autoReviewPaneStatic) autoReviewPaneStatic.hidden = false;
+  if (autoReviewPaneDynamic) autoReviewPaneDynamic.hidden = true;
+  if (autoReviewDynLoading) autoReviewDynLoading.hidden = true;
+  if (autoReviewDynError) { autoReviewDynError.hidden = true; autoReviewDynError.textContent = ''; autoReviewDynError.classList.remove('visible'); }
+  if (autoReviewDynRetry) autoReviewDynRetry.hidden = true;
+  if (autoReviewDynGroups) autoReviewDynGroups.innerHTML = '';
+  if (__autoReviewSaveStaticLabel == null && autoReviewSave) __autoReviewSaveStaticLabel = autoReviewSave.textContent;
+  if (autoReviewSave && __autoReviewSaveStaticLabel != null) autoReviewSave.textContent = __autoReviewSaveStaticLabel;
+  if (reviewState && reviewState.dynamic) reviewState.dynamic.activeTab = 'static';
+}
+
+// Hide tabs entirely (error / empty-steps cases). Force static pane visible.
+function setReviewTabsVisible(visible) {
+  if (autoReviewTabsEl) autoReviewTabsEl.hidden = !visible;
+  if (!visible) {
+    if (autoReviewPaneStatic) autoReviewPaneStatic.hidden = false;
+    if (autoReviewPaneDynamic) autoReviewPaneDynamic.hidden = true;
+  }
+}
+
+function renderDynamicGroups() {
+  if (!autoReviewDynGroups || !reviewState || !reviewState.dynamic) return;
+  const steps = reviewState.steps || [];
+  const groups = reviewState.dynamic.groups || [];
+  if (groups.length === 0) { autoReviewDynGroups.innerHTML = ''; return; }
+  const needsRegen = groups.some(g => g.dynamic === true && (
+    !g.prompt || !String(g.prompt).trim() || g.isStaleFormat === true
+  ));
+  const anyStale = groups.some(g => g.dynamic === true && g.isStaleFormat === true);
+  const bannerText = anyStale
+    ? 'These runtime prompts use the old long-form style. Regenerate to switch to short slot-fill prompts.'
+    : 'This automation predates runtime prompts. Regenerate to enable dynamic execution.';
+  const bannerHtml = needsRegen
+    ? `<div class="auto-modal-dyn-regen-banner">
+        <span class="auto-modal-dyn-regen-text">${escapeHtml(bannerText)}</span>
+        <button type="button" class="auto-modal-dyn-regen-btn">Regenerate prompts</button>
+        <span class="auto-modal-dyn-regen-spinner" hidden>Regenerating…</span>
+        <span class="auto-modal-dyn-regen-error" hidden></span>
+      </div>`
+    : '';
+  const html = groups.map((g, i) => {
+    const cls = g.dynamic ? 'auto-modal-dyn-group is-dynamic' : 'auto-modal-dyn-group';
+    const lis = (g.stepIndices || []).map(idx => `<li>${escapeHtml(stepText(steps[idx], steps))}</li>`).join('');
+    const hasPrompt = g.dynamic && g.prompt && String(g.prompt).trim();
+    const promptHtml = hasPrompt
+      ? `<div class="auto-modal-dyn-group-prompt-row">
+          <div class="auto-modal-dyn-group-prompt">Will ask: "${escapeHtml(String(g.prompt))}"</div>
+          ${g.dynamic ? `<button type="button" class="auto-modal-dyn-group-regen-btn">Regenerate</button>` : ''}
+        </div>`
+      : (g.dynamic
+          ? `<div class="auto-modal-dyn-group-prompt-row">
+              <button type="button" class="auto-modal-dyn-group-regen-btn">Regenerate</button>
+            </div>`
+          : '');
+    const hintHtml = g.dynamic
+      ? `<div class="auto-modal-dyn-group-hint">
+          <label>Variable hint (optional)</label>
+          <input type="text" class="auto-modal-dyn-group-hint-input" maxlength="80"
+                 placeholder="e.g. server name, channel, username"
+                 value="${escapeHtml(g.variableHint || '')}">
+        </div>`
+      : '';
+    return `<div class="${cls}" data-gid="${escapeHtml(String(g.gid))}">
+      <div class="auto-modal-dyn-group-head">
+        <span class="auto-modal-step-idx">${i + 1}</span>
+        <span class="auto-modal-dyn-group-label">${escapeHtml(g.label || '')}</span>
+        <span class="auto-modal-dyn-flag">Dynamic</span>
+        <span class="auto-modal-dyn-group-spinner" hidden>Generating prompt…</span>
+        <span class="auto-modal-dyn-group-error" hidden></span>
+      </div>
+      ${promptHtml}
+      ${hintHtml}
+      <ul class="auto-modal-dyn-group-steps">${lis}</ul>
+    </div>`;
+  }).join('');
+  autoReviewDynGroups.innerHTML = bannerHtml + html;
+}
+
+async function enterDynamicTab() {
+  if (!reviewState || !reviewState.dynamic) return;
+  const dyn = reviewState.dynamic;
+  if (reviewState.isError || !Array.isArray(reviewState.steps) || reviewState.steps.length === 0) {
+    dyn.status = 'idle';
+    dyn.groups = [];
+    if (autoReviewDynLoading) autoReviewDynLoading.hidden = true;
+    if (autoReviewDynError) { autoReviewDynError.hidden = true; autoReviewDynError.textContent = ''; autoReviewDynError.classList.remove('visible'); }
+    if (autoReviewDynRetry) autoReviewDynRetry.hidden = true;
+    if (autoReviewDynGroups) autoReviewDynGroups.innerHTML = '';
+    return;
+  }
+  // Already loaded? Just render.
+  if (dyn.status === 'ready' && Array.isArray(dyn.groups) && dyn.groups.length > 0) {
+    if (autoReviewDynLoading) autoReviewDynLoading.hidden = true;
+    if (autoReviewDynError) { autoReviewDynError.hidden = true; autoReviewDynError.textContent = ''; autoReviewDynError.classList.remove('visible'); }
+    if (autoReviewDynRetry) autoReviewDynRetry.hidden = true;
+    renderDynamicGroups();
+    return;
+  }
+  // Saved automation — try sidecar first. Skip when the in-memory steps have
+  // diverged from what's persisted (launcher editor draft edits): a stale
+  // sidecar would carry a stepsHash that no longer matches, so regroup fresh.
+  if (reviewState.id && !reviewStepsDirty() && !reviewState.dynamic.forceRegroup) {
+    try {
+      const res = await window.automation.loadDynamic({ exe: reviewState.meta.exe, id: reviewState.id });
+      if (res && res.sidecar) {
+        dyn.groups = (res.sidecar.groups || []).map(g => ({ ...g, dynamic: !!g.dynamic }));
+        dyn.stepsHash = res.sidecar.stepsHash || null;
+        dyn.status = 'ready';
+        // A sidecar already exists on disk for this id, so eager (pre-commit)
+        // edits may persist in place. Fresh grouping below leaves this false so
+        // that configuring a STATIC automation's dynamic tab never auto-writes a
+        // sidecar onto the original (see dynEagerPersistAllowed).
+        dyn.fromSidecar = true;
+        if (autoReviewDynLoading) autoReviewDynLoading.hidden = true;
+        if (autoReviewDynError) { autoReviewDynError.hidden = true; autoReviewDynError.textContent = ''; autoReviewDynError.classList.remove('visible'); }
+        if (autoReviewDynRetry) autoReviewDynRetry.hidden = true;
+        renderDynamicGroups();
+        return;
+      }
+      // null or {stale:true} → fall through to grouping flow.
+    } catch (_err) { /* fall through to group flow */ }
+  }
+  // Group-steps flow.
+  dyn.status = 'loading';
+  dyn.aborted = false;
+  dyn.errorMsg = '';
+  dyn.jobId = null;
+  if (autoReviewDynGroups) autoReviewDynGroups.innerHTML = '';
+  if (autoReviewDynError) { autoReviewDynError.hidden = true; autoReviewDynError.textContent = ''; autoReviewDynError.classList.remove('visible'); }
+  if (autoReviewDynRetry) autoReviewDynRetry.hidden = true;
+  if (autoReviewDynLoading) autoReviewDynLoading.hidden = false;
+  const stepLabels = reviewState.steps.map((s) => stepText(s, reviewState.steps));
+  try {
+    const out = await window.automation.groupSteps({
+      exe: reviewState.meta.exe,
+      stepLabels,
+      steps: reviewState.steps,
+      backend: reviewState.backend,
+    });
+    // Best-effort cancel: discard result if user navigated away.
+    if (!reviewState || reviewState.dynamic !== dyn || dyn.aborted) return;
+    const groups = (out && out.groups) || [];
+    dyn.groups = groups.map(g => ({ ...g, dynamic: false }));
+    dyn.stepsHash = (out && out.stepsHash) || null;
+    if (out && out.jobId) dyn.jobId = out.jobId;
+    dyn.status = 'ready';
+    // Freshly grouped — no sidecar on disk yet. Suppress eager writes so toggling
+    // groups here can't silently convert a static automation to dynamic. Explicit
+    // Save (persistAutomation) still persists to the correct id.
+    dyn.fromSidecar = false;
+    dyn.forceRegroup = false;
+    if (autoReviewDynLoading) autoReviewDynLoading.hidden = true;
+    renderDynamicGroups();
+  } catch (err) {
+    if (!reviewState || reviewState.dynamic !== dyn || dyn.aborted) return;
+    dyn.status = 'error';
+    dyn.errorMsg = (err && err.message) ? err.message : String(err);
+    if (autoReviewDynLoading) autoReviewDynLoading.hidden = true;
+    if (autoReviewDynError) { autoReviewDynError.textContent = dyn.errorMsg; autoReviewDynError.hidden = false; autoReviewDynError.classList.add('visible'); }
+    if (autoReviewDynRetry) autoReviewDynRetry.hidden = false;
+  }
+}
+
+// Gate for eager (pre-commit) saveDynamic writes fired while the user edits the
+// dynamic tab (toggle group, regen prompt, edit hint). Only allow them once a
+// sidecar already exists on disk for the open automation. Otherwise — i.e. a
+// STATIC automation whose dynamic tab the user is configuring to "Save as new
+// dynamic automation" — eager writes would silently convert the original to
+// dynamic. Explicit Save (persistAutomation) persists regardless, routed to the
+// correct id (existing for in-place save, fresh id for save-as-new).
+function dynEagerPersistAllowed() {
+  return !!(reviewState && reviewState.id && reviewState.dynamic && reviewState.dynamic.fromSidecar);
+}
+
+function switchAutoReviewTab(tab) {
+  if (!reviewState || !reviewState.dynamic) return;
+  if (tab !== 'static' && tab !== 'dynamic') return;
+  const prev = reviewState.dynamic.activeTab;
+  // Cancel in-flight grouping if leaving dynamic mid-load.
+  if (prev === 'dynamic' && tab !== 'dynamic' && reviewState.dynamic.status === 'loading') {
+    reviewState.dynamic.aborted = true;
+    if (reviewState.dynamic.jobId) {
+      try { window.automation.cancelGroup(reviewState.dynamic.jobId); } catch {}
+    }
+    reviewState.dynamic.status = 'idle';
+    if (autoReviewDynLoading) autoReviewDynLoading.hidden = true;
+  }
+  reviewState.dynamic.activeTab = tab;
+  if (autoReviewTabs && autoReviewTabs.forEach) {
+    autoReviewTabs.forEach(b => b.classList.toggle('is-active', b.dataset.tab === tab));
+  }
+  if (autoReviewPaneStatic) autoReviewPaneStatic.hidden = (tab !== 'static');
+  if (autoReviewPaneDynamic) autoReviewPaneDynamic.hidden = (tab !== 'dynamic');
+  if (autoReviewSave) {
+    if (__autoReviewSaveStaticLabel == null) __autoReviewSaveStaticLabel = autoReviewSave.textContent;
+    autoReviewSave.textContent = (tab === 'dynamic') ? 'Save dynamic automation' : (__autoReviewSaveStaticLabel || 'Save automation');
+  }
+  applyEditorSaveLabels();   // override foot labels when editing an existing automation
+  if (tab === 'dynamic') { enterDynamicTab(); }
+}
+
+function invalidateDynamic() {
+  if (!reviewState || !reviewState.dynamic) return;
+  reviewState.dynamic.groups = [];
+  reviewState.dynamic.stepsHash = null;
+  reviewState.dynamic.status = 'idle';
+  reviewState.dynamic.errorMsg = '';
+  if (autoReviewDynGroups) autoReviewDynGroups.innerHTML = '';
+  if (autoReviewDynError) { autoReviewDynError.hidden = true; autoReviewDynError.textContent = ''; autoReviewDynError.classList.remove('visible'); }
+  if (autoReviewDynRetry) autoReviewDynRetry.hidden = true;
+  if (autoReviewDynLoading) autoReviewDynLoading.hidden = true;
+}
+
+// Wire tab buttons + retry button + delegated group click. Attached once at init.
+if (autoReviewTabs && autoReviewTabs.forEach) {
+  autoReviewTabs.forEach(btn => btn.addEventListener('click', () => switchAutoReviewTab(btn.dataset.tab)));
+}
+if (autoReviewDynRetryBtn) {
+  autoReviewDynRetryBtn.addEventListener('click', () => {
+    if (!reviewState || !reviewState.dynamic) return;
+    // Force a fresh grouping: clear cached groups, mark sidecar invalid for this run.
+    reviewState.dynamic.groups = [];
+    reviewState.dynamic.stepsHash = null;
+    reviewState.dynamic.status = 'idle';
+    reviewState.dynamic.errorMsg = '';
+    reviewState.dynamic.fromSidecar = false;
+    reviewState.dynamic.forceRegroup = true;
+    if (autoReviewDynGroups) autoReviewDynGroups.innerHTML = '';
+    if (autoReviewDynError) { autoReviewDynError.hidden = true; autoReviewDynError.textContent = ''; autoReviewDynError.classList.remove('visible'); }
+    if (autoReviewDynRetry) autoReviewDynRetry.hidden = true;
+    enterDynamicTab();
+  });
+}
+if (autoReviewDynGroups) {
+  autoReviewDynGroups.addEventListener('click', async (e) => {
+    const regenBtn = e.target.closest('.auto-modal-dyn-regen-btn');
+    if (regenBtn) {
+      if (!reviewState || !reviewState.dynamic) return;
+      const banner = regenBtn.closest('.auto-modal-dyn-regen-banner');
+      const spinner = banner ? banner.querySelector('.auto-modal-dyn-regen-spinner') : null;
+      const errEl = banner ? banner.querySelector('.auto-modal-dyn-regen-error') : null;
+      const groups = reviewState.dynamic.groups || [];
+      const affected = groups.filter(g => g.dynamic === true && (
+        !g.prompt || !String(g.prompt).trim() || g.isStaleFormat === true
+      ));
+      if (affected.length === 0) return;
+      regenBtn.disabled = true;
+      if (spinner) spinner.hidden = false;
+      if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+      try {
+        const steps = reviewState.steps || [];
+        const appName = (reviewState.meta && reviewState.meta.name) || reviewState.meta.exe;
+        const results = await Promise.all(affected.map(g => window.automation.generateGroupPrompt({
+          exe: reviewState.meta.exe,
+          groupLabel: g.label || '',
+          stepLabels: (g.stepIndices || []).map(idx => stepText(steps[idx], steps)),
+          appName,
+          backend: reviewState.backend,
+          variableHint: g.variableHint || null,
+        })));
+        for (let i = 0; i < affected.length; i++) {
+          affected[i].prompt = (results[i] && results[i].prompt) || '';
+          affected[i].isStaleFormat = false;
+        }
+        if (dynEagerPersistAllowed()) {
+          await window.automation.saveDynamic({
+            exe: reviewState.meta.exe,
+            id: reviewState.id,
+            groups: reviewState.dynamic.groups.map(({ isStaleFormat, ...rest }) => rest),
+            stepsHash: reviewState.dynamic.stepsHash,
+          });
+        }
+        renderDynamicGroups();
+      } catch (err) {
+        if (errEl) {
+          errEl.textContent = `Couldn't regenerate — ${err && err.message ? err.message : err}`;
+          errEl.hidden = false;
+        }
+        regenBtn.disabled = false;
+        if (spinner) spinner.hidden = true;
+      }
+      return;
+    }
+    const groupRegenBtn = e.target.closest('.auto-modal-dyn-group-regen-btn');
+    if (groupRegenBtn) {
+      e.stopPropagation();
+      if (!reviewState || !reviewState.dynamic) return;
+      const card = groupRegenBtn.closest('.auto-modal-dyn-group');
+      if (!card) return;
+      const gid = card.dataset.gid;
+      const g = reviewState.dynamic.groups.find(x => String(x.gid) === gid);
+      if (!g || !g.dynamic) return;
+      const capturedId = reviewState.id;
+      const capturedRev = reviewState;
+      const expectedHint = g.variableHint || '';
+      groupRegenBtn.disabled = true;
+      const spinner = card.querySelector('.auto-modal-dyn-group-spinner');
+      const errEl = card.querySelector('.auto-modal-dyn-group-error');
+      if (spinner) spinner.hidden = false;
+      if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+      try {
+        const steps = reviewState.steps || [];
+        const appName = (reviewState.meta && reviewState.meta.name) || reviewState.meta.exe;
+        const result = await window.automation.generateGroupPrompt({
+          exe: reviewState.meta.exe,
+          groupLabel: g.label || '',
+          stepLabels: (g.stepIndices || []).map(idx => stepText(steps[idx], steps)),
+          appName,
+          backend: reviewState.backend,
+          variableHint: g.variableHint || null,
+        });
+        if (reviewState !== capturedRev || reviewState.id !== capturedId) return;
+        const live = reviewState.dynamic.groups.find(x => String(x.gid) === gid);
+        if (!live || !live.dynamic) return;
+        if ((live.variableHint || '') !== expectedHint) {
+          if (errEl) { errEl.textContent = 'Hint changed during regenerate — click again.'; errEl.hidden = false; }
+          groupRegenBtn.disabled = false;
+          if (spinner) spinner.hidden = true;
+          return;
+        }
+        live.prompt = (result && result.prompt) || '';
+        live.isStaleFormat = false;
+        if (spinner) spinner.hidden = true;
+        renderDynamicGroups();
+        if (dynEagerPersistAllowed()) {
+          await window.automation.saveDynamic({
+            exe: reviewState.meta.exe,
+            id: reviewState.id,
+            groups: reviewState.dynamic.groups.map(({ isStaleFormat, ...rest }) => rest),
+            stepsHash: reviewState.dynamic.stepsHash,
+          });
+        }
+      } catch (err) {
+        if (errEl) { errEl.textContent = 'Regenerate failed — ' + (err && err.message ? err.message : err); errEl.hidden = false; }
+        groupRegenBtn.disabled = false;
+        if (spinner) spinner.hidden = true;
+      }
+      return;
+    }
+    if (e.target.closest('.auto-modal-dyn-group-hint-input')) return;
+    if (e.target.closest('.auto-modal-dyn-group-regen-btn')) return;
+    const card = e.target.closest('.auto-modal-dyn-group');
+    if (!card) return;
+    if (!reviewState || !reviewState.dynamic) return;
+    const gid = card.dataset.gid;
+    const g = reviewState.dynamic.groups.find(x => String(x.gid) === gid);
+    if (!g) return;
+    const wasDynamic = !!g.dynamic;
+    const spinner = card.querySelector('.auto-modal-dyn-group-spinner');
+    const errEl = card.querySelector('.auto-modal-dyn-group-error');
+    if (!wasDynamic) {
+      g.dynamic = true;
+      card.classList.add('is-dynamic');
+      if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+      if (spinner) spinner.hidden = false;
+      try {
+        const steps = reviewState.steps || [];
+        const appName = (reviewState.meta && reviewState.meta.name) || reviewState.meta.exe;
+        const result = await window.automation.generateGroupPrompt({
+          exe: reviewState.meta.exe,
+          groupLabel: g.label || '',
+          stepLabels: (g.stepIndices || []).map(idx => stepText(steps[idx], steps)),
+          appName,
+          backend: reviewState.backend,
+          variableHint: null,
+        });
+        g.prompt = (result && result.prompt) || '';
+        if (spinner) spinner.hidden = true;
+        renderDynamicGroups();
+        if (dynEagerPersistAllowed()) {
+          try {
+            await window.automation.saveDynamic({
+              exe: reviewState.meta.exe,
+              id: reviewState.id,
+              groups: reviewState.dynamic.groups.map(({ isStaleFormat, ...rest }) => rest),
+              stepsHash: reviewState.dynamic.stepsHash,
+            });
+          } catch (saveErr) {
+            g.dynamic = false;
+            g.prompt = null;
+            renderDynamicGroups();
+            const liveCard = autoReviewDynGroups.querySelector(`.auto-modal-dyn-group[data-gid="${CSS.escape(String(gid))}"]`);
+            const liveErr = liveCard ? liveCard.querySelector('.auto-modal-dyn-group-error') : null;
+            if (liveErr) {
+              liveErr.textContent = `Save failed — ${saveErr && saveErr.message ? saveErr.message : saveErr}`;
+              liveErr.hidden = false;
+            }
+          }
+        }
+      } catch (err) {
+        g.dynamic = false;
+        g.prompt = null;
+        card.classList.remove('is-dynamic');
+        if (spinner) spinner.hidden = true;
+        if (errEl) {
+          errEl.textContent = "Couldn't generate prompt — try again";
+          errEl.hidden = false;
+        }
+      }
+    } else {
+      g.dynamic = false;
+      g.prompt = null;
+      card.classList.remove('is-dynamic');
+      renderDynamicGroups();
+      if (dynEagerPersistAllowed()) {
+        try {
+          await window.automation.saveDynamic({
+            exe: reviewState.meta.exe,
+            id: reviewState.id,
+            groups: reviewState.dynamic.groups.map(({ isStaleFormat, ...rest }) => rest),
+            stepsHash: reviewState.dynamic.stepsHash,
+          });
+        } catch (_err) {
+          g.dynamic = true;
+          card.classList.add('is-dynamic');
+          renderDynamicGroups();
+        }
+      }
+    }
+  });
+
+  // Hint input event delegation. Debounced state update on 'input'; on 'change'
+  // (blur), persist to sidecar unless any group is stale-format (then show an
+  // inline tooltip telling the user to regenerate first).
+  const __dynHintTimers = new WeakMap();
+  autoReviewDynGroups.addEventListener('input', (e) => {
+    const inputEl = e.target.closest('.auto-modal-dyn-group-hint-input');
+    if (!inputEl) return;
+    if (!reviewState || !reviewState.dynamic) return;
+    const card = inputEl.closest('.auto-modal-dyn-group');
+    if (!card) return;
+    const gid = card.dataset.gid;
+    const capturedState = reviewState;
+    const capturedDyn = reviewState.dynamic;
+    const prevTimer = __dynHintTimers.get(inputEl);
+    if (prevTimer) clearTimeout(prevTimer);
+    const timer = setTimeout(() => {
+      if (!reviewState || reviewState !== capturedState) return;
+      if (!reviewState.dynamic || reviewState.dynamic !== capturedDyn) return;
+      const live = reviewState.dynamic.groups.find(x => String(x.gid) === gid);
+      if (!live || !live.dynamic) return;
+      const currentValue = inputEl.value;
+      if (currentValue === (live.variableHint || '')) return;
+      live.variableHint = currentValue;
+    }, 250);
+    __dynHintTimers.set(inputEl, timer);
+  });
+  autoReviewDynGroups.addEventListener('change', async (e) => {
+    const inputEl = e.target.closest('.auto-modal-dyn-group-hint-input');
+    if (!inputEl) return;
+    if (!reviewState || !reviewState.dynamic) return;
+    const card = inputEl.closest('.auto-modal-dyn-group');
+    if (!card) return;
+    const gid = card.dataset.gid;
+    const capturedState = reviewState;
+    const capturedDyn = reviewState.dynamic;
+    // Flush any pending debounced update so blur applies the latest value.
+    const prevTimer = __dynHintTimers.get(inputEl);
+    if (prevTimer) clearTimeout(prevTimer);
+    const live = reviewState.dynamic.groups.find(x => String(x.gid) === gid);
+    if (!live || !live.dynamic) return;
+    const currentValue = inputEl.value;
+    if (currentValue !== (live.variableHint || '')) {
+      live.variableHint = currentValue;
+    }
+    // Stale-format gate: skip save, show inline tooltip.
+    const anyStale = (reviewState.dynamic.groups || []).some(g => g.isStaleFormat === true);
+    if (anyStale) {
+      inputEl.title = 'Regenerate first to save hint changes.';
+      const clearTip = () => { inputEl.title = ''; inputEl.removeEventListener('blur', clearTip); };
+      inputEl.addEventListener('blur', clearTip, { once: true });
+      return;
+    }
+    if (!dynEagerPersistAllowed()) return;
+    if (reviewState !== capturedState || reviewState.dynamic !== capturedDyn) return;
+    try {
+      await window.automation.saveDynamic({
+        exe: reviewState.meta.exe,
+        id: reviewState.id,
+        groups: reviewState.dynamic.groups.map(({ isStaleFormat, ...rest }) => rest),
+        stepsHash: reviewState.dynamic.stepsHash,
+      });
+    } catch (_err) { /* swallow — user will re-save via explicit action */ }
+  });
+}
+
 function showCreateError(msg, payload) {
   // Reuse review form layout for error display
   reviewState = { meta: payload.meta, steps: [], userMsg: payload.userMsg, finalReply: payload.finalReply, isError: true };
+  reviewState.dynamic = { activeTab: 'static', status: 'idle', groups: [], stepsHash: null, errorMsg: '', jobId: null, aborted: false };
   autoReviewName.value = '';
   autoReviewName.disabled = false;
   renderReviewSteps();
   autoReviewError.textContent = msg;
   autoReviewError.classList.add('visible');
   autoReviewSave.style.display = 'none';
+  if (autoReviewSaveNew) autoReviewSaveNew.hidden = true;
   autoReviewDiscard.textContent = 'Close';
   autoReviewToggleJson.style.display = 'none';
   resetReviewJsonView();
+  resetReviewTabsToStatic();
+  setReviewTabsVisible(false);
   openAutoPanel('review');
 }
 
 function openRecipeReview({ meta, userMsg, finalReply, steps, backend }) {
   reviewState = { meta, steps, userMsg, finalReply, backend: backend || backendFor(meta), isError: false };
+  reviewState.dynamic = { activeTab: 'static', status: 'idle', groups: [], stepsHash: null, errorMsg: '', jobId: null, aborted: false };
   autoReviewName.value = suggestName(userMsg);
   autoReviewName.disabled = false;
   renderReviewSteps();
   autoReviewError.textContent = '';
   autoReviewError.classList.remove('visible');
   autoReviewSave.style.display = '';
+  if (autoReviewSaveNew) autoReviewSaveNew.hidden = true;
   autoReviewDiscard.textContent = 'Discard';
   autoReviewToggleJson.style.display = '';
   resetReviewJsonView();
+  setReviewTabsVisible(true);
+  resetReviewTabsToStatic();
   openAutoPanel('review');
   setTimeout(() => autoReviewName.focus(), 100);
 }
@@ -4298,25 +5312,99 @@ autoReviewClose.addEventListener('click', closeAutoPanel);              // panel
 autoReviewModalClose.addEventListener('click', closeReviewModal);        // modal head X
 autoReviewDiscard.addEventListener('click', closeActiveReviewSurface);   // form foot Discard
 
-autoReviewSave.addEventListener('click', async () => {
+// True when the in-memory steps differ from what was persisted (launcher editor
+// draft edits). origSteps is only set on the editable launcher-open path.
+function reviewStepsDirty() {
+  return !!(reviewState && reviewState.origSteps != null
+    && JSON.stringify(reviewState.steps) !== reviewState.origSteps);
+}
+
+// Foot button labels/visibility. When EDITING an existing automation (has id,
+// not readOnly, not error) the second "save as new" button is shown and both
+// labels reflect the active tab. Every other open path hides the second button
+// and leaves the primary label to switchAutoReviewTab/resetReviewTabsToStatic.
+function applyEditorSaveLabels() {
+  if (!autoReviewSaveNew) return;
+  const editingExisting = !!(reviewState && reviewState.id && !reviewState.readOnly && !reviewState.isError);
+  if (!editingExisting) { autoReviewSaveNew.hidden = true; return; }
+  const dynTab = reviewState.dynamic && reviewState.dynamic.activeTab === 'dynamic';
+  autoReviewSaveNew.hidden = false;
+  autoReviewSave.textContent    = dynTab ? 'Save as dynamic automation'     : 'Save changes';
+  autoReviewSaveNew.textContent = dynTab ? 'Save as new dynamic automation' : 'Save as new automation';
+}
+
+// Persist the review form. asNew=true always creates a fresh record (new id);
+// otherwise an existing id updates in place. Static name-only edits go through
+// rename (not update) so they don't bust an existing dynamic sidecar.
+async function persistAutomation({ asNew }) {
   if (!reviewState || reviewState.isError) return;
-  try {
-    await window.automation.save({
-      exe: reviewState.meta.exe,
-      name: autoReviewName.value.trim() || suggestName(reviewState.userMsg),
-      steps: reviewState.steps,
-      userMsg: reviewState.userMsg,
-      finalReply: reviewState.finalReply,
-    });
+  const exe = reviewState.meta.exe;
+  const name = autoReviewName.value.trim() || suggestName(reviewState.userMsg);
+  const updating = !asNew && !!reviewState.id && !reviewState.readOnly;
+  const stepsChanged = reviewState.origSteps == null ? true : JSON.stringify(reviewState.steps) !== reviewState.origSteps;
+  const nameChanged  = reviewState.origName  == null ? true : name !== reviewState.origName;
+  const fromLauncher = !!reviewState.fromLauncher;
+  const dynTab = reviewState.dynamic && reviewState.dynamic.activeTab === 'dynamic';
+
+  // Write the static record (create / update / rename). Returns false on error
+  // (caller already surfaced it) so the dynamic branch can abort.
+  async function persistStatic() {
+    if (updating) {
+      if (stepsChanged) await window.automation.update({ exe, id: reviewState.id, name, steps: reviewState.steps });
+      else if (nameChanged) await window.automation.rename({ exe, id: reviewState.id, name });
+    } else {
+      const r = await window.automation.save({
+        exe, name, steps: reviewState.steps,
+        userMsg: reviewState.userMsg, finalReply: reviewState.finalReply,
+      });
+      if (r && r.id) reviewState.id = r.id;
+    }
+  }
+
+  if (dynTab) {
+    const dyn = reviewState.dynamic;
+    if (dyn.status !== 'ready') {
+      if (autoReviewDynError) { autoReviewDynError.textContent = 'Wait for grouping to finish.'; autoReviewDynError.hidden = false; autoReviewDynError.classList.add('visible'); }
+      return;
+    }
+    // Persist steps/name FIRST so saveDynamic's stepsHash check validates
+    // against the steps the grouping was computed from.
+    try { await persistStatic(); }
+    catch (err) { autoReviewError.textContent = err.message || String(err); autoReviewError.classList.add('visible'); return; }
+    if (!reviewState.id) {
+      if (autoReviewDynError) { autoReviewDynError.textContent = 'Saved automation has no id; cannot attach dynamic groups.'; autoReviewDynError.hidden = false; autoReviewDynError.classList.add('visible'); }
+      return;
+    }
+    try {
+      await window.automation.saveDynamic({
+        exe, id: reviewState.id,
+        groups: dyn.groups.map(({ isStaleFormat, ...rest }) => rest),
+        stepsHash: dyn.stepsHash,
+      });
+    } catch (err) {
+      if (autoReviewDynError) { autoReviewDynError.textContent = 'Automation saved. Couldn’t save dynamic grouping — ' + (err.message || String(err)); autoReviewDynError.hidden = false; autoReviewDynError.classList.add('visible'); }
+      return;
+    }
     closeActiveReviewSurface();
-    // Surface a short status in chat
-    addChatMessage('system', 'Automation saved. Find it in the Automations tab.');
-    refreshAutomationsForApp(chatCurrentExe);
+    if (!fromLauncher) addChatMessage('system', 'Automation saved. Find it in the Automations tab.');
+    refreshAutomationsForApp(exe);
+    return;
+  }
+
+  // STATIC tab.
+  try {
+    await persistStatic();
+    closeActiveReviewSurface();
+    if (!fromLauncher) addChatMessage('system', 'Automation saved. Find it in the Automations tab.');
+    refreshAutomationsForApp(exe);
   } catch (err) {
     autoReviewError.textContent = err.message || String(err);
     autoReviewError.classList.add('visible');
   }
-});
+}
+
+autoReviewSave.addEventListener('click', () => persistAutomation({ asNew: false }));
+autoReviewSaveNew.addEventListener('click', () => persistAutomation({ asNew: true }));
 
 // Click a step (text or pencil) to edit it in plain English.
 autoReviewSteps.addEventListener('click', (e) => {
@@ -4363,6 +5451,7 @@ autoReviewJsonSave.addEventListener('click', async () => {
     return;
   }
   reviewState.steps = parsed;
+  invalidateDynamic();
   try {
     await persistReviewSteps();
   } catch (err) {
@@ -4479,15 +5568,20 @@ async function handleAutomationAction(act, id) {
   if (act === 'view') {
     const meta = resolveAppMeta(exe, entry.name);
     reviewState = { meta, steps: entry.steps.slice(), userMsg: entry.userMsg, finalReply: entry.finalReply, backend: backendFor(meta), isError: false, readOnly: true, id: entry.id };
+    reviewState.dynamic = { activeTab: 'static', status: 'idle', groups: [], stepsHash: null, errorMsg: '', jobId: null, aborted: false };
     autoReviewName.value = entry.name;
     autoReviewName.disabled = true;
     renderReviewSteps();
     autoReviewError.textContent = '';
     autoReviewError.classList.remove('visible');
     autoReviewSave.style.display = 'none';
+    if (autoReviewSaveNew) autoReviewSaveNew.hidden = true;
     autoReviewDiscard.textContent = 'Close';
     autoReviewToggleJson.style.display = '';
     resetReviewJsonView();
+    setReviewTabsVisible(true);
+    resetReviewTabsToStatic();
+    if (entry.isDynamic === true) switchAutoReviewTab('dynamic');
     openReviewModal();
     return;
   }
@@ -4731,6 +5825,7 @@ refreshApps();
   const lModeChip       = document.getElementById('launcher-mode-chip');
   const lHint           = document.getElementById('launcher-hint');
   const lSettingsBtn    = document.getElementById('launcher-settings-btn');
+  const lPinBtn         = document.getElementById('launcher-pin-btn');
   const lCloseBtn       = document.getElementById('launcher-close-btn');
   const lFoot           = document.getElementById('launcher-foot');
 
@@ -4934,6 +6029,7 @@ refreshApps();
   let activeIdx = -1;            // highlighted dropdown row
   let autos     = [];            // automation entries for selApp (automation mode)
   let allowOverlayClose = true;  // mirrors top-level config.allowOverlayClose
+  let overlayPinned = false;     // session-only pin: blocks auto-close; resets on each onShow
   // Slash-command palette + arg picker for the launcher task input. Two phases:
   //  palette → user typed `/` and the dropdown lists matching commands.
   //  arg     → cmd committed; `/cmd` text already spliced out, lInput chars
@@ -4991,13 +6087,20 @@ refreshApps();
   }
   let lComposing = false;
 
+  // Single gate for every auto-close path (Esc / backdrop / blur). Pin overrides config.
+  function canOverlayAutoClose() { return allowOverlayClose && !overlayPinned; }
+
   function applyCloseBtnVisibility() {
+    // Show the X escape-hatch whenever auto-close is off (config) OR pinned.
     if (lCloseBtn) lCloseBtn.hidden = allowOverlayClose;
   }
 
   window.overlay.getConfig().then((c) => {
     if (c && c.overlay) { cfg = { ...cfg, ...c.overlay }; WIN_W = cfg.width; }
     if (c) { allowOverlayClose = c.allowOverlayClose !== false; applyCloseBtnVisibility(); }
+    // Pin defaults off on initial load (onShow is the primary session reset).
+    overlayPinned = false;
+    if (lPinBtn) { lPinBtn.classList.remove('is-active'); lPinBtn.setAttribute('aria-pressed', 'false'); }
   }).catch(() => {});
 
   // ── App candidates (selected apps only — matches the workspace view) ──
@@ -5177,8 +6280,12 @@ refreshApps();
     const clarifyVisible = chatClarifyMenuEl && !chatClarifyMenuEl.hidden
       && chatClarifyMenuEl.parentNode === launcherCard;
     const clarifyH = clarifyVisible ? Math.ceil(chatClarifyMenuEl.getBoundingClientRect().height) + 6 : 0;
+    const dynamicRunHostEl = dynRunHost();
+    const dynamicRunVisible = dynamicRunHostEl && !dynamicRunHostEl.hidden
+      && dynamicRunHostEl.parentNode === launcherCard;
+    const dynamicRunH = dynamicRunVisible ? Math.ceil(dynamicRunHostEl.getBoundingClientRect().height) + 6 : 0;
     const screenH = (window.screen && window.screen.availHeight) || 900;
-    const chromeH = lRowH + footH + cwpH + clarifyH + 6;
+    const chromeH = lRowH + footH + cwpH + clarifyH + dynamicRunH + 6;
     const screenCap = Math.floor(screenH * 0.85);
     // Use the lower of (screen-fraction cap) and (what main can actually
     // grant from current window position). Without the main cap we'd ask
@@ -5285,6 +6392,65 @@ refreshApps();
   // Exposed so the autoRun modal close handlers (which live outside this IIFE)
   // can shrink the overlay back to the launcher's natural height after a run.
   window.__overlayResetAfterRun = () => { lastSyncedH = -1; syncLauncherSize(); };
+  // Grow the overlay to host the (tall) review-modal editor when opened from the
+  // launcher. Mirrors sizeForRun but uses the full grantable height.
+  window.__overlaySizeForEditor = async () => {
+    let h;
+    try { h = await window.overlay.maxHeight(); } catch {}
+    h = h || cfg.runHeight || 560;
+    window.overlay.resize(chatWinW(), h, { anchor: 'bottom' });
+    lastSyncedH = -1; // window now differs from launcher card height
+  };
+  // Exposed for closeReviewModal: shrink back, refresh the launcher's automation
+  // list (edits may have changed names / dynamic state), and refocus the input.
+  window.__launcherAfterEditorClose = () => {
+    lastSyncedH = -1;
+    syncLauncherSize();
+    if (selApp && selApp.exe) {
+      window.automation.list(selApp.exe)
+        .then((l) => { autos = l || []; refreshSuggestions(); })
+        .catch(() => {});
+    }
+    try { lInput.focus(); } catch {}
+  };
+  // Open a saved automation from the launcher in the editable review modal.
+  // Editable variant of handleAutomationAction('view'): name enabled, Save +
+  // Save-as-new shown, static→dynamic conversion available. origSteps/origName
+  // drive dirty-tracking (rename vs update, stale-sidecar skip).
+  async function openAutomationEditor(entry) {
+    if (!selApp || !selApp.exe || !entry) return;
+    const exe = selApp.exe;
+    const meta = resolveAppMeta(exe, entry.name);
+    reviewState = {
+      meta,
+      steps: (entry.steps || []).slice(),
+      userMsg: entry.userMsg,
+      finalReply: entry.finalReply,
+      backend: backendFor(meta),
+      isError: false,
+      readOnly: false,
+      id: entry.id,
+      fromLauncher: true,
+      origSteps: JSON.stringify(entry.steps || []),
+      origName: entry.name,
+    };
+    reviewState.dynamic = { activeTab: 'static', status: 'idle', groups: [], stepsHash: null, errorMsg: '', jobId: null, aborted: false };
+    autoReviewName.value = entry.name;
+    autoReviewName.disabled = false;
+    renderReviewSteps();
+    autoReviewError.textContent = '';
+    autoReviewError.classList.remove('visible');
+    autoReviewSave.style.display = '';
+    autoReviewDiscard.textContent = 'Discard';
+    autoReviewToggleJson.style.display = '';
+    resetReviewJsonView();
+    setReviewTabsVisible(true);
+    resetReviewTabsToStatic();
+    applyEditorSaveLabels();
+    if (entry.isDynamic === true) switchAutoReviewTab('dynamic');
+    await window.__overlaySizeForEditor();
+    openReviewModal();
+  }
 
   // ── Inline chat panel: static-composer mode ──
   // The launcher-row at the bottom IS the composer — across both launcher and
@@ -5329,6 +6495,7 @@ refreshApps();
     view = 'chat';
     document.body.dataset.overlayView = 'chat';
     lDropdown.hidden = true;
+    const dynamicRunHostEl = dynRunHost();
     inlineSaved = {
       chatInput: saveAnchor(chatInputEl),
       tabMenu: saveAnchor(chatTabMenuEl),
@@ -5336,6 +6503,7 @@ refreshApps();
       clarifyMenu: saveAnchor(chatClarifyMenuEl),
       chatScroll: saveAnchor(chatScrollEl),
       windowPicker: saveAnchor(chatWindowPickerEl),
+      dynamicRunHost: saveAnchor(dynamicRunHostEl),
     };
     // Slot chat-input into the launcher-input-stack so lRow remains the visible
     // composer; lInput + ghost stay in the DOM but hidden via .has-chat-input.
@@ -5352,6 +6520,13 @@ refreshApps();
     // would constrain width to the middle column only; inserting it BEFORE
     // chat-scroll would put choices above the question, which we don't want.
     if (chatClarifyMenuEl) launcherCard.insertBefore(chatClarifyMenuEl, lRow);
+    // #dynamic-run-host lives inside #page-chat, which is display:none in the
+    // overlay window. Reparent it above lRow so startDynamicRun's host.hidden
+    // = false actually paints. Stays hidden=true until startDynamicRun flips it.
+    if (dynamicRunHostEl) {
+      dynamicRunHostEl.hidden = true;
+      launcherCard.insertBefore(dynamicRunHostEl, lRow);
+    }
     // pageChat still in main tree but its children moved out — keep .active off
     // so chat-empty / chat-header CSS quirks elsewhere don't kick in.
     pageChat.classList.remove('active', 'chat-enter', 'chat-leave', 'inline-enter');
@@ -5399,6 +6574,11 @@ refreshApps();
         restoreAnchor(chatClarifyMenuEl, inlineSaved.clarifyMenu);
         restoreAnchor(chatScrollEl, inlineSaved.chatScroll);
         restoreAnchor(chatWindowPickerEl, inlineSaved.windowPicker);
+        const dynamicRunHostEl = dynRunHost();
+        if (dynamicRunHostEl) {
+          restoreAnchor(dynamicRunHostEl, inlineSaved.dynamicRunHost);
+          dynamicRunHostEl.hidden = true;
+        }
       }
       inlineSaved = null;
       try { delete window.__overlaySizeForChat; } catch { window.__overlaySizeForChat = undefined; }
@@ -5447,7 +6627,8 @@ refreshApps();
     }
     if (mode === 'automation' && stage === 'task') {
       const sub = it.userMsg ? escapeHtml(String(it.userMsg).slice(0, 60)) : `${(it.steps || []).length} steps`;
-      return `<div class="ld-row${active}" role="option" data-i="${i}">
+      const dynCls = it.isDynamic === true ? ' is-dynamic' : '';
+      return `<div class="ld-row${active}${dynCls}" role="option" data-i="${i}">
         <span class="ld-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg></span>
         <span class="ld-text"><span class="ld-name">${escapeHtml(it.name)}</span><span class="ld-sub">${sub}</span></span>
         <span class="ld-enter">hit <kbd>enter</kbd></span>
@@ -5953,7 +7134,7 @@ refreshApps();
       // CDP port captured when the user selected the app. Without this, a
       // racing refreshApps() can land a row with cdpAlive=false → meta.port
       // null → /tab picker silently refuses to open.
-      await openChat(selApp.name, selApp.exe, selApp);
+      await withDynamicRunGuard(() => openChat(selApp.name, selApp.exe, selApp));
     } catch (e) { /* openChat handles its own errors */ }
     const apps = collectLauncherApps(task);
     sendChatMessage(task.trim(), apps);
@@ -5973,7 +7154,17 @@ refreshApps();
     }
     // Grow + center so the run modal fits, then run (reuses runAutomation()).
     sizeForRun();
-    runAutomation(entry, meta);
+    if (entry.isDynamic) {
+      // Dynamic entries route through the chat-panel run host; the per-app
+      // chat is opened inside startDynamicRun. selApp.exe is the source of
+      // truth — automation:list entries don't carry an exe field.
+      // #dynamic-run-host lives inside #page-chat (display:none in overlay);
+      // enterInlineChat reparents it above lRow so the host actually paints.
+      enterInlineChat();
+      startDynamicRun(Object.assign({}, entry, { exe: selApp.exe, meta }));
+    } else {
+      runAutomation(entry, meta);
+    }
   }
 
   // ── Input events ──
@@ -6151,7 +7342,7 @@ refreshApps();
     if (e.key === 'Escape') {
       if (tabHoldStart || tabHoldTimer) { cancelTabHold(); if (lHint && tabPrevHint) { setHint(); tabPrevHint = false; } }
       if (stage === 'task') { e.preventDefault(); popApp(); return; }
-      if (allowOverlayClose) { e.preventDefault(); window.overlay.dismiss(); }
+      if (canOverlayAutoClose()) { e.preventDefault(); window.overlay.dismiss(); }
       return;
     }
     if (e.key === 'Backspace' && lInput.value === '' && stage === 'task') {
@@ -6208,6 +7399,15 @@ refreshApps();
     if (view !== 'chat') { window.overlay.openSettings(); return; }
     if (gearMenuEl && gearMenuEl.hidden) openGearMenu(); else closeGearMenu();
   });
+  // Pin toggle (session-only): blocks auto-close until untoggled or overlay re-shown.
+  if (lPinBtn) lPinBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    overlayPinned = !overlayPinned;
+    lPinBtn.classList.toggle('is-active', overlayPinned);
+    lPinBtn.setAttribute('aria-pressed', overlayPinned ? 'true' : 'false');
+    try { window.overlay.setPinned(overlayPinned); } catch {}
+    applyCloseBtnVisibility();  // surface the X escape-hatch while pinned
+  });
   document.addEventListener('click', (e) => {
     if (!gearMenuEl || gearMenuEl.hidden) return;
     if (gearMenuEl.contains(e.target) || lSettingsBtn.contains(e.target)) return;
@@ -6227,7 +7427,7 @@ refreshApps();
     window.overlay.openSettings();
   });
   lCloseBtn.addEventListener('click', () => window.overlay.dismiss());
-  launcherBackdrop.addEventListener('click', () => { if (allowOverlayClose) window.overlay.dismiss(); });
+  launcherBackdrop.addEventListener('click', () => { if (canOverlayAutoClose()) window.overlay.dismiss(); });
 
   // ── Drag the overlay by its footer/hint bar ──
   // The window is frameless and uses JS-driven dragging (CSS app-region drag
@@ -6255,8 +7455,8 @@ refreshApps();
       window.overlay.setDragging(false);
     }
     lFoot.addEventListener('mousedown', async (e) => {
-      // Ignore drags that start on the settings gear or close X (button clicks).
-      if (e.button !== 0 || (lSettingsBtn && lSettingsBtn.contains(e.target)) || (lCloseBtn && lCloseBtn.contains(e.target))) return;
+      // Ignore drags that start on the settings gear, pin, or close X (button clicks).
+      if (e.button !== 0 || (lSettingsBtn && lSettingsBtn.contains(e.target)) || (lPinBtn && lPinBtn.contains(e.target)) || (lCloseBtn && lCloseBtn.contains(e.target))) return;
       e.preventDefault();
       startScreenX = e.screenX;
       startScreenY = e.screenY;
@@ -6270,7 +7470,7 @@ refreshApps();
   })();
 
   // Chat back button → return to the launcher (instead of the hidden workspace).
-  chatBackBtn.addEventListener('click', () => { if (view === 'chat') { closeAutoPanel(); enterLauncher('chat'); } });
+  chatBackBtn.addEventListener('click', () => { if (view === 'chat') withDynamicRunGuard(() => { closeAutoPanel(); enterLauncher('chat'); }); });
 
   // Chat-view Esc:
   //   - Tap (release < 1s): dismiss the overlay (original behaviour).
@@ -6355,10 +7555,17 @@ refreshApps();
     if (tabSuppressUntilKeyup) { tabSuppressUntilKeyup = false; return; }
     if (!tabHoldStart) return;
     const armed = !tabDeleteFired;
+    const tgt = tabHoldTarget;            // capture before cancelTabHold nulls it
     cancelTabHold();
     if (lHint && tabPrevHint) { setHint(); tabPrevHint = false; }
     tabDeleteFired = false;
-    if (armed) completeGhost();
+    // Quick tap (released before the hold-delete fired): open the highlighted
+    // automation in the editor. Falls back to ghost autocomplete when there's
+    // no saved record under the cursor.
+    if (armed) {
+      if (tgt && tgt.id) openAutomationEditor(tgt);
+      else completeGhost();
+    }
   });
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
@@ -6377,7 +7584,16 @@ refreshApps();
       closeAutoPanel();
       return;
     }
-    if (view !== 'chat' || !allowOverlayClose) return;
+    // Launcher-opened automation editor owns Esc: close it (restores launcher).
+    // The inline step-editor textarea handles its own Esc to close just itself.
+    if (isReviewModalOpen() && reviewState && reviewState.fromLauncher) {
+      if (e.target && e.target.classList && e.target.classList.contains('auto-modal-step-editor')) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      closeReviewModal();
+      return;
+    }
+    if (view !== 'chat' || !canOverlayAutoClose()) return;
     if (e.repeat) { e.preventDefault(); return; }
     if (escHoldTimer) { e.preventDefault(); return; }
     e.preventDefault();
@@ -6418,7 +7634,7 @@ refreshApps();
     // Backend: chat:stop sets the abort flag + req.destroy(); the round loop
     // breaks at the next check and emits chat:done so the renderer clears state.
     if (view === 'chat' && chatBusy) { stopChatMessage(); return; }
-    if (view === 'chat' && !chatBusy && allowOverlayClose) window.overlay.dismiss();
+    if (view === 'chat' && !chatBusy && canOverlayAutoClose()) window.overlay.dismiss();
   }, true);
   // Window losing focus aborts the hold (the user can't see the progress and
   // we should not silently reset on a keyup we'll never receive).
@@ -6443,6 +7659,9 @@ refreshApps();
 
   window.overlay.onShow((data) => {
     document.body.classList.remove('overlay-closing');
+    // Pin is session-only: every fresh summon starts unpinned.
+    overlayPinned = false;
+    if (lPinBtn) { lPinBtn.classList.remove('is-active'); lPinBtn.setAttribute('aria-pressed', 'false'); }
     window.overlay.getConfig().then((c) => {
       if (c) {
         allowOverlayClose = c.allowOverlayClose !== false;
@@ -6462,6 +7681,14 @@ refreshApps();
     if (autoRunModal && autoRunModal.classList.contains('show')) {
       syncAutoModalChrome();
       sizeForRun();
+      lInput.blur();
+      return;
+    }
+    // Same for a launcher-opened automation editor: keep it mounted and resized
+    // rather than rebuilding the launcher underneath its transparent backdrop.
+    if (autoReviewModal && autoReviewModal.classList.contains('show')) {
+      syncAutoModalChrome();
+      window.__overlaySizeForEditor();
       lInput.blur();
       return;
     }
