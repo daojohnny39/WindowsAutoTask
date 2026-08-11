@@ -1,0 +1,26 @@
+{
+  "logging": {
+    "enabled": false,
+    "dir": "logs"
+  },
+  "directChat": {
+    "persistHistory": false
+  },
+  "experimental": {
+    "allowProxyImages": false
+  },
+  "hotkey": "Control+Alt+Space",
+  "allowOverlayClose": true,
+  "overlay": {
+    "width": 600,
+    "collapsedHeight": 90,
+    "dropdownMaxHeight": 280,
+    "chatHeight": 540,
+    "chatWidth": 760,
+    "chatMinHeight": 280,
+    "chatMaxHeightFrac": 0.72,
+    "runHeight": 560,
+    "persistPosition": true
+  },
+  "startMinimized": true
+}

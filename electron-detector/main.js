@@ -120,7 +120,7 @@ const MESSAGE_ID_TOOLS = new Set([
 const ITEM_CAPTURE_TOOLS = new Set(['cdp_get_messages', 'cdp_get_search_results']);
 // A run of 17+ digits — a Discord snowflake (message/channel id). Used to catch
 // hard-coded ids smuggled into a recipe step. "chat-messages-<chan>-<msg>" and a
-// bare "0000000000000000000" both match; a search-result index ("0") and a
+// bare "<id>" both match; a search-result index ("0") and a
 // dynamic ref ("$msgs.images.last") do not.
 const SNOWFLAKE_RE = /\d{17,}/;
 
@@ -1607,7 +1607,7 @@ function buildPinsScrollHarvestExpr(target) {
 // Walk the pins popout scroller from top to bottom, accumulating every pin we
 // encounter. Discord virtualizes the popout so a static read sees only the
 // newest ~25 pins; without this the "oldest" pin is wrong for channels with
-// 26+ pins (example-community/#general had 50+ in May 2026 — true oldest 2019, but the
+// 26+ pins (Example Community/#general had 50+ in May 2026 — true oldest 2019, but the
 // single-read tool returned 2020). Returns either { error } or
 // { open, count, pins:[...], oldest, newest }.
 async function gatherAllPins(port) {
@@ -2130,20 +2130,25 @@ try {
 
 const DEBUG_LOG = path.join(__dirname, '..', 'cdp-debug.log');
 function debugLog(msg) {
-  fs.appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`, 'utf8');
+  if (process.env.WINDOWS_AUTOBOT_DEBUG_LOG !== '1') return;
+  try { fs.appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`, 'utf8'); } catch {}
 }
 
 // Per-session chat transcript logging, toggled in config.json (see chat-logger.js).
 const chatLogger = require('./chat-logger');
 const chatLogSessions = new Map(); // exe -> { file, id, startedAt, turnCount }
 
-// Direct GPT-5.5 chat (no app selected). Persistent single-thread history lives
-// in logs/direct-gpt.json via direct-chat-store; everything else (auth, streaming,
-// retry, ask_user) reuses the app-scoped chat plumbing keyed by DIRECT_CHAT_ID.
+// Direct GPT-5.5 chat (no app selected). Optional single-thread history uses
+// direct-chat-store; everything else reuses the app-scoped chat plumbing.
 const directChatStore = require('./direct-chat-store');
 const DIRECT_CHAT_ID = '__direct__';
 const DIRECT_HOSTED_TOOLS = [{ type: 'web_search' }];
 let directResetEpoch = 0;
+
+function directChatStoreOptions() {
+  const cfg = chatLogger.loadConfig(debugLog);
+  return { enabled: cfg.directChat.persistHistory === true };
+}
 
 // Settle window between scrolling an off-screen click target into view and
 // reading its FINAL coordinates. Discord's virtual scrollers (server rail,
@@ -3831,7 +3836,7 @@ CDP testing — follow them literally.**
   Category headers are \`div[role="button"]\` with an aria-label like
   \`"<emoji> <Category> (category)"\` — clicking them only collapses/expands.
 - **Main content area** — composer is \`div[role="textbox"]\` with
-  \`aria-label\` starting \`"Message "\` (e.g. \`"Message #example-channel"\`).
+  \`aria-label\` starting \`"Message "\` (e.g. \`"Message #screenshots"\`).
   To send a message: \`cdp_paste(<composer ref>, "<text>")\` then
   \`cdp_press_key("Enter")\`. There is NO "Send Message" button in this
   build — Enter is the submit primitive. For N messages, repeat the
@@ -4008,7 +4013,7 @@ You can also pass an arbitrary CSS selector (e.g.
 scope element isn't found, the tool falls back to the full document.
 
 Even better when you already know the label of what you want to click:
-\`cdp_find("example-channel")\` returns only the matching nodes with
+\`cdp_find("screenshots")\` returns only the matching nodes with
 \`f1..fN\` refs, typically 1-5 rows. Use \`cdp_find\` before reaching
 for \`cdp_get_tree\`.
 
@@ -4021,7 +4026,7 @@ last upload, the post with the most reactions, etc.), the contract is:
 
 1. \`cdp_get_messages(limit)\` — locate the target message in the result.
 2. \`cdp_scroll_to_message(id)\` — pass the message's full \`id\` field
-   (e.g. \`"chat-messages-000000000000000000-1374..."\`). This calls
+   (e.g. \`"chat-messages-<id>-1374..."\`). This calls
    \`scrollIntoView({block:'center'})\` on the \`<li>\` and briefly
    outlines it in Discord blurple so the user sees where you landed.
 3. Only after the scroll tool returns \`{ok:true, visible:true}\` may
@@ -4090,7 +4095,7 @@ server, so use the search bar whenever the task is:
 
 - The bar is \`div[class*="searchBar_"]\` in the channel header. Its
   \`textContent\` reads \`"Search <Server Name>"\` (e.g.
-  \`"Search example-community - Screenshot Community"\`). Find it with
+  \`"Search Example Community"\`). Find it with
   \`cdp_find("Search ")\` (note trailing space) or by filtering rows
   where \`tag = div\` and \`text\` starts with \`"Search "\`.
 - After clicking, focus lands on
@@ -4125,7 +4130,7 @@ server, so use the search bar whenever the task is:
    read \`currentUser\` from \`cdp_get_messages\` — and verify it is
    non-empty before substituting; **never** paste a literal \`from:\`
    with no username, \`from:me\`, or a guessed username like
-   \`from:<current-user>\`. If \`currentUser\` is empty, drop the \`from:\`
+   \`from:guessed-user\`. If \`currentUser\` is empty, drop the \`from:\`
    filter entirely and filter messages locally by \`authorId\`
    against \`currentUserId\`. See the "blank currentUser" recovery
    block above.), \`has:image\` / \`has:link\` / \`has:embed\` /
@@ -4145,8 +4150,8 @@ server, so use the search bar whenever the task is:
    #<channel>"\`) or, in an automation run, the **Active channel** line
    in the run context. **NEVER** copy the channel from the automation
    title, the group label, or a prior-step summary — those are human
-   descriptions and are often stale (a title may say \`#example-channel\`
-   while the run actually navigated to \`#example-channel-b\`). If the
+   descriptions and are often stale (a title may say \`#screenshots\`
+   while the run actually navigated to \`#drafts\`). If the
    active channel disagrees with a channel named in the task text, trust
    the active channel.
 4. \`cdp_press_key("Enter")\` — submits the search and opens the
@@ -4433,30 +4438,15 @@ than the currently active in-app tab.
 - **"What pages do you see?"** → \`cdp_get_tree("nav")\` → list every
   \`role="treeitem"\` (skip the \`sidebar-tab-*\` nav buttons). Group
   by section if the user asks for a breakdown.
-- **"Open page X"** — PREFERRED: call
-  \`cdp_open_notion_page\` with the page id (32 hex chars, with or
-  without hyphens). This bypasses the sidebar entirely and works
-  even when the sidebar is collapsed or off-screen. Sidebar treeitem
-  clicking is a fallback only.
-
-  **Known page ids in this workspace** (use these directly — do NOT
-  search the sidebar for them):
-  - \`TEST TASKLIST\` → \`00000000000000000000000000000000\`
-  - \`TEST CALENDAR\` → \`00000000000000000000000000000000\`
-
-  Fallback for unknown pages: \`cdp_find("X")\` scoped to the treeitem
+- **"Open page X"** — if the user supplied its page id, call
+  \`cdp_open_notion_page\` with that id (32 hex chars, with or without
+  hyphens). This bypasses the sidebar and works even when it is collapsed.
+  Otherwise, use \`cdp_find("X")\` scoped to the treeitem
   label, then \`cdp_click\` the matching ref. If the page is nested
   inside a collapsed group, click the group's "Open" toggle first,
   re-fetch the tree, then click the page.
-
-- **NEVER call \`ask_user\` for a page name that is one of the known
-  ids above.** The sidebar render truncates titles (e.g. "EST
-  TASKLIST" instead of "TEST TASKLIST") because of column width — that
-  is NOT a different page. Use the known page id directly via
-  \`cdp_open_notion_page\` and skip the sidebar entirely.
 - **"Open page X in a new tab"** — PREFERRED: call
-  \`cdp_open_in_new_tab({ pageId })\` for known ids (e.g. \`TEST
-  TASKLIST\`, \`TEST CALENDAR\` above) or \`cdp_open_in_new_tab({
+  \`cdp_open_in_new_tab({ pageId })\` when the user supplied an id, or \`cdp_open_in_new_tab({
   pageName: "X" })\` for sidebar pages whose id you do not know. The
   tool tries three paths in order — Ctrl+T to the active Notion
   page (fires Notion's accelerator), the Tab Bar "+" button click,
@@ -4976,17 +4966,17 @@ const CDP_TOOLS = [
   { type: 'function', name: 'cdp_type', description: 'Focus an input/textarea/contenteditable by ref and set its text.', parameters: { type: 'object', properties: { ref: { type: 'string' }, text: { type: 'string' } }, required: ['ref', 'text'], additionalProperties: false } },
   { type: 'function', name: 'cdp_get_text', description: 'Return textContent (or value) of a DOM element by ref. Use to read what is currently displayed.', parameters: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'], additionalProperties: false } },
   { type: 'function', name: 'cdp_get_tree', description: 'Re-inspect the DOM and return a fresh element snapshot table with new refs. Use after the UI changes. Optional region narrows the scope and slashes snapshot size.', parameters: { type: 'object', properties: { region: { type: 'string', description: 'Optional scope to narrow the snapshot. Discord-aware keys: "servers" (left rail), "channels" (channel sidebar), "composer" (message input area), "messages" (chat scroller). Or pass any CSS selector to scope manually. Omit for full document.' } }, additionalProperties: false } },
-  { type: 'function', name: 'cdp_find', description: 'Search the live DOM for elements matching a substring (case-insensitive across text/aria-label/id/role) and return a small focused snapshot with new refs (f1..fN). Much cheaper than cdp_get_tree — prefer this when you know what you are looking for (e.g. "example-channel", "Send", "Direct Messages"). Returns up to 20 matches by default, max 50.', parameters: { type: 'object', properties: { query: { type: 'string', description: 'Substring to match against element text/aria-label/id/role. Case-insensitive.' }, limit: { type: 'integer', description: 'Max matches to return (1-50, default 20).' } }, required: ['query'], additionalProperties: false } },
+  { type: 'function', name: 'cdp_find', description: 'Search the live DOM for elements matching a substring (case-insensitive across text/aria-label/id/role) and return a small focused snapshot with new refs (f1..fN). Much cheaper than cdp_get_tree — prefer this when you know what you are looking for (e.g. "screenshots", "Send", "Direct Messages"). Returns up to 20 matches by default, max 50.', parameters: { type: 'object', properties: { query: { type: 'string', description: 'Substring to match against element text/aria-label/id/role. Case-insensitive.' }, limit: { type: 'integer', description: 'Max matches to return (1-50, default 20).' } }, required: ['query'], additionalProperties: false } },
   { type: 'function', name: 'cdp_get_messages', description: 'Discord-aware: return { currentUser, currentUserId, count, requested, collected, reachedTop, messages[] } for the N most-recent chat messages relative to the current scroll position. Discord virtualizes the list, so this tool AUTO-SCROLLS UP and unions rows until it has `limit` distinct messages (or hits the top, reachedTop:true) — one call returns the true last-N, you do NOT need to loop cdp_scroll_messages + cdp_get_messages yourself for reaction/most-of/ranking tasks. IMPORTANT: it accumulates UPWARD from where you are, so to get the channel\'s genuine newest N (e.g. "most reactions in the last 50"), call cdp_scroll_messages("bottom") FIRST, then cdp_get_messages(50). currentUser is the logged-in Discord username from the bottom-left panel (use it + currentUserId to filter "my uploads"-style requests by author). Each message has { id, author, authorId, time, text, images, reactions, reactionTotal, hasReply, repliedToAuthor, repliedToText }. A message with hasReply===true is a reply — the newest such is the "most recent reply"; pass its id to cdp_jump_to_reply_source to reach the original it replied to. messages are chronological ascending (newest last). Much cheaper than cdp_get_tree for content-reading tasks.', parameters: { type: 'object', properties: { limit: { type: 'integer', description: 'Number of most-recent messages to collect (1-100, default 25). The tool scrolls up to gather this many; for the channel\'s newest N, scroll to bottom first.' } }, additionalProperties: false } },
   { type: 'function', name: 'cdp_react', description: 'Discord-only: add an emoji reaction to a specific message in ONE atomic step. Pass message_id (the "id" field from cdp_get_messages, e.g. "chat-messages-<chan>-<msg>", or just the trailing message snowflake) and emoji (the name WITHOUT colons, e.g. "example-emoji-typo"). This is the ONLY reliable way to react: the per-message "Add Reaction" button is hover-only and never appears in cdp_get_tree/cdp_find snapshots, so cdp_click cannot reach it. The tool hovers the row at the CDP mouse layer, clicks Add Reaction, types the name into the picker search, clicks the first matching emoji, and verifies. Returns { ok, added, id, picked, me }. ok/added=true means the reaction is on the message. To react to N messages, get their ids from cdp_get_messages once, then call cdp_react once per id — do NOT cdp_get_tree between reactions.', parameters: { type: 'object', properties: { message_id: { type: 'string', description: 'Message id from cdp_get_messages "id" (full "chat-messages-..." id or the trailing numeric snowflake).' }, emoji: { type: 'string', description: 'Emoji name without colons, e.g. "example-emoji-typo", "fire", "thumbsup".' } }, required: ['message_id', 'emoji'], additionalProperties: false } },
-  { type: 'function', name: 'cdp_scroll_to_message', description: 'Discord-aware: scroll the chat viewport so a specific message is centered in view. REQUIRED whenever the user asks you to "scroll to", "show me", "take me to", "jump to", or "find" a specific message — reading the DOM via cdp_get_messages does NOT move the viewport. Pass the full message id from cdp_get_messages (looks like "chat-messages-<channel>-<message>"). Returns { ok, id, top, visible } after a synchronous scrollIntoView, with a brief outline flash on the target.', parameters: { type: 'object', properties: { message_id: { type: 'string', description: 'Full DOM id of the message li (from cdp_get_messages "id" field), e.g. "chat-messages-000000000000000000-1374...". The trailing numeric message id alone is also accepted as a fallback.' } }, required: ['message_id'], additionalProperties: false } },
+  { type: 'function', name: 'cdp_scroll_to_message', description: 'Discord-aware: scroll the chat viewport so a specific message is centered in view. REQUIRED whenever the user asks you to "scroll to", "show me", "take me to", "jump to", or "find" a specific message — reading the DOM via cdp_get_messages does NOT move the viewport. Pass the full message id from cdp_get_messages (looks like "chat-messages-<channel>-<message>"). Returns { ok, id, top, visible } after a synchronous scrollIntoView, with a brief outline flash on the target.', parameters: { type: 'object', properties: { message_id: { type: 'string', description: 'Full DOM id of the message li (from cdp_get_messages "id" field), e.g. "chat-messages-<id>-1374...". The trailing numeric message id alone is also accepted as a fallback.' } }, required: ['message_id'], additionalProperties: false } },
   { type: 'function', name: 'cdp_scroll', description: 'Generic scroll for any app. Auto-detects the largest scrollable container (or use `container` selector) and scrolls up/down/top/bottom. **Required for any "first / earliest / oldest / original" query on a lazy-loaded conversation (ChatGPT, Slack, etc.)** — the conversation is virtualized and the DOM only contains messages near the current scroll position, so cdp_find / cdp_get_tree see a partial view. Recipe: cdp_scroll("top") repeatedly until {atTop:true, heightChanged:false}, then cdp_find / cdp_get_tree to enumerate. For "latest / newest" use cdp_scroll("bottom") first. For Discord specifically, prefer cdp_scroll_messages (it knows Discord\'s message list selector). Returns {ok, direction, scrollTopBefore, scrollTopAfter, scrollHeightBefore, scrollHeightAfter, atTop, atBottom, heightChanged, topChanged, containerTag, containerClass}.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'], description: '"up" loads older content (most common for history dives), "down" newer, "top" jumps to the very top to force-load earliest history, "bottom" jumps to latest. Default "up".' }, pages: { type: 'integer', description: 'Viewport heights to scroll (1-50, default 3). Ignored for top/bottom.' }, container: { type: 'string', description: 'Optional CSS selector for the scroll container. Omit to auto-detect the largest visible scrollable on the page.' } }, additionalProperties: false } },
   { type: 'function', name: 'cdp_scroll_messages', description: 'Discord-aware: scroll the message list to load older/newer messages. Use this INSTEAD of asking the user to scroll. After scrolling, re-call cdp_get_messages to read the newly mounted rows. Returns { ok, direction, scrollTopBefore, scrollTopAfter, loadedMessages, loadedBefore, firstChanged, atTop, atBottom }. Loop: call cdp_scroll_messages("up", 3) → cdp_get_messages → check for target → repeat until found OR atTop is true (already at oldest message in channel).', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'], description: '"up" loads older messages (most common), "down" newer, "top" jumps to the very top to load earliest history, "bottom" jumps to latest. Default "up".' }, pages: { type: 'integer', description: 'How many viewport heights to scroll (1-20, default 3). Larger values cover more history per call but may overshoot a target. Ignored for top/bottom.' } }, additionalProperties: false } },
   { type: 'function', name: 'cdp_paste', description: 'Focus a text editor by ref and insert text via CDP-level keyboard input (Input.insertText). REQUIRED for rich-text editors that ignore cdp_type — DraftJS, Slate, Lexical, Quill, Discord\'s channel-header search bar, ChatGPT\'s composer when it acts up. cdp_type sets `textContent` and dispatches an InputEvent, which silently does nothing on editors that own their state model; cdp_paste clicks the element via CDP Input.* events (isTrusted=true) and then uses Input.insertText, which every editor accepts. If unsure whether cdp_type will work, prefer cdp_paste. Optional `clear` first selects-all and deletes existing content before inserting.', parameters: { type: 'object', properties: { ref: { type: 'string', description: 'Element ref from the snapshot.' }, text: { type: 'string', description: 'Text to insert at the current caret position.' }, clear: { type: 'boolean', description: 'If true, select-all + delete before inserting. Default false.' } }, required: ['ref', 'text'], additionalProperties: false } },
   { type: 'function', name: 'cdp_press_key', description: 'Dispatch a single key event (keyDown + keyUp) at CDP level via Input.dispatchKeyEvent. REQUIRED to submit forms (Enter), dismiss popouts/modals (Escape), navigate autocomplete (ArrowUp/ArrowDown), tab to next field, etc. Keys recognized: Enter, Escape, Tab, Backspace, Delete, ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, Space, plus any single character (a-z, 0-9, punctuation). Modifiers are passed as an array — e.g. ["ctrl"] for Ctrl+A, ["ctrl","shift"] for Ctrl+Shift+K. After cdp_paste-ing into Discord\'s search bar, call cdp_press_key("Enter") to submit the search.', parameters: { type: 'object', properties: { key: { type: 'string', description: 'Key name (Enter, Escape, Tab, Backspace, Delete, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Space) or a single character.' }, modifiers: { type: 'array', items: { type: 'string', enum: ['alt', 'ctrl', 'shift', 'meta'] }, description: 'Optional modifier keys held during the press.' } }, required: ['key'], additionalProperties: false } },
   { type: 'function', name: 'cdp_get_search_results', description: 'Discord-only: scrape the channel-header Search Results panel and return structured per-row data { messageId, author, authorId, time, text, images, guildId, channelId } plus sort mode and pagination info. REQUIRED for any "find / jump to / show me" task that uses the search bar — cdp_get_tree("[aria-label=\'Search Results\']") drops the <li role="listitem"> rows from the snapshot filter, so the model never sees row ids without this tool. Pair with cdp_jump_to_search_result(messageId) to navigate to a chosen result.', parameters: { type: 'object', properties: { limit: { type: 'integer', description: 'Max rows to return (1-100, default 25).' } }, additionalProperties: false } },
   { type: 'function', name: 'cdp_set_search_sort', description: 'Discord-only: set the sort order of the open Search Results panel. REQUIRED before trusting results[0] for any "first / earliest / oldest" (use "oldest") or "latest / newest" (use "newest") request — Discord defaults to Newest-first, so without this, cdp_get_search_results.results[0] is the MOST RECENT match, not the oldest. The sort control is a dropdown button (aria-label="Sort"); cdp_find("Old") finds nothing because the options live in a popup menu. This tool opens the menu and clicks the right radio option at the CDP mouse layer, then verifies by reading the result-row timestamps. Returns { ok, requested, sortMode, order ("ascending"=oldest-first / "descending"=newest-first), firstTime, lastTime, count }. After it returns ok with the expected order, re-call cdp_get_search_results and use results[0] as the first/oldest (or newest) match.', parameters: { type: 'object', properties: { order: { type: 'string', enum: ['oldest', 'newest', 'relevant'], description: '"oldest" = oldest-first (for first/earliest queries), "newest" = newest-first (default; for latest queries), "relevant" = most relevant.' } }, required: ['order'], additionalProperties: false } },
-  { type: 'function', name: 'cdp_jump_to_search_result', description: 'Discord-only: navigate to a search result message by its messageId (from cdp_get_search_results). Atomic: hovers the search-result row at CDP layer to reveal the hover-only "Jump" button, locates the button, and dispatches a real CDP click on it. Use this INSTEAD of cdp_click on a search-result row child — clicking inner divs/imgs of the row opens the image lightbox or does nothing because the Jump button is the only navigation target and it is hidden until hover. After a successful jump the channel scrolls to the message and the search panel may stay open — follow with cdp_press_key("Escape") if you want it closed before replying.', parameters: { type: 'object', properties: { message_id: { type: 'string', description: 'Message snowflake id from cdp_get_search_results.messageId (e.g. "0000000000000000000"). The full row id "search-results-<msgId>" is also accepted.' } }, required: ['message_id'], additionalProperties: false } },
+  { type: 'function', name: 'cdp_jump_to_search_result', description: 'Discord-only: navigate to a search result message by its messageId (from cdp_get_search_results). Atomic: hovers the search-result row at CDP layer to reveal the hover-only "Jump" button, locates the button, and dispatches a real CDP click on it. Use this INSTEAD of cdp_click on a search-result row child — clicking inner divs/imgs of the row opens the image lightbox or does nothing because the Jump button is the only navigation target and it is hidden until hover. After a successful jump the channel scrolls to the message and the search panel may stay open — follow with cdp_press_key("Escape") if you want it closed before replying.', parameters: { type: 'object', properties: { message_id: { type: 'string', description: 'Message snowflake id from cdp_get_search_results.messageId (e.g. "<id>"). The full row id "search-results-<msgId>" is also accepted.' } }, required: ['message_id'], additionalProperties: false } },
   { type: 'function', name: 'cdp_get_pins', description: 'Discord-only: scrape the OPEN pinned-messages popout and return { open, count, pins:[{messageId,time,author,text}], oldest, newest }. pins are newest-first; `oldest` is the pin with the earliest time (the "oldest pinned message"). REQUIRED for "oldest/first/newest pinned" tasks — the popout rows are not standard chat <li> and a snapshot drops them. Open the popout first: cdp_find("Pinned Messages") then cdp_click it. Then call cdp_get_pins, pick oldest.messageId, and cdp_jump_to_pin(that id).', parameters: { type: 'object', properties: { limit: { type: 'integer', description: 'Max pins to return (1-100, default 50).' } }, additionalProperties: false } },
   { type: 'function', name: 'cdp_jump_to_pin', description: 'Discord-only: from the open pinned-messages popout, jump the channel to a specific pinned message and center it. Pass message_id = the pin\'s messageId from cdp_get_pins (the trailing snowflake). Clicks that pin\'s hover-revealed "Jump" button and verifies the message is centered in the channel. Use after cdp_get_pins to go to e.g. the oldest pin.', parameters: { type: 'object', properties: { message_id: { type: 'string' } }, required: ['message_id'], additionalProperties: false } },
   { type: 'function', name: 'cdp_open_image', description: 'Discord-only: open a specific image message FULL-SCREEN (the Media Viewer lightbox). Pass message_id = the image message id from cdp_get_messages (a message whose images[] is non-empty; the trailing snowflake is fine). Clicks that message\'s image attachment (NOT the author avatar) and verifies the Media Viewer opened on the attachment. Returns { ok, messageId, opened, lightboxImg }. For "open the most recent image full-screen": cdp_scroll_messages("bottom") → cdp_get_messages(50) → take the newest entry with images.length>0 → cdp_open_image(its id).', parameters: { type: 'object', properties: { message_id: { type: 'string', description: 'The image message id (full chat-messages-… id or trailing snowflake).' } }, required: ['message_id'], additionalProperties: false } },
@@ -7240,11 +7230,14 @@ async function runDirectChat(event, payload) {
     if (aborted) errorReason = 'Stopped by user';
     // Release owned image attachments
     for (const { id } of ownedImages) imageAttachments.delete(id);
-    // Persist the turn to disk (skip if aborted before any reply or on hard error
-    // with no content). Append-only, atomic write inside the store.
+    // Persist only when directChat.persistHistory is explicitly enabled.
     if (!resetDuringTurn && lastUserMsg && (fullContent || !errorReason)) {
       try {
-        directChatStore.appendTurn({ userContent: redactImageContentForLog(lastUserMsg), assistantContent: fullContent }, debugLog);
+        directChatStore.appendTurn(
+          { userContent: redactImageContentForLog(lastUserMsg), assistantContent: fullContent },
+          debugLog,
+          directChatStoreOptions(),
+        );
       } catch (err) {
         debugLog(`[chat:send-direct] persist failed: ${err.message}`);
       }
@@ -7256,7 +7249,7 @@ async function runDirectChat(event, payload) {
 
 ipcMain.handle('chat:send', runChatSend);
 ipcMain.handle('chat:send-direct', runDirectChat);
-ipcMain.handle('chat:load-direct', () => directChatStore.load(debugLog));
+ipcMain.handle('chat:load-direct', () => directChatStore.load(debugLog, directChatStoreOptions()));
 
 // ── Screenshot capture ──
 
@@ -7820,10 +7813,10 @@ function buildGroupingPrompt(stepLabels) {
     '- Prefer MORE smaller groups over fewer compound ones when in doubt — a compound label like "Open the target channel" that hides two named entities (server AND channel) is always wrong.',
     '',
     'EXAMPLE — given these step labels:',
-    '  0: Find the example-community server in the sidebar',
-    '  1: Open the example-community server',
-    '  2: Find the #example-channel channel',
-    '  3: Open the #example-channel channel',
+    '  0: Find the Example Community server in the sidebar',
+    '  1: Open the Example Community server',
+    '  2: Find the #screenshots channel',
+    '  3: Open the #screenshots channel',
     '  4: Focus the search box',
     '  5: Search for example-user images in the channel',
     'CORRECT grouping (server, channel, query are three distinct variables):',
@@ -7858,7 +7851,7 @@ function buildGroupPromptPrompt(groupLabel, stepLabelsInGroup, appName, variable
     `- If sub-steps refine the noun (e.g. "message" in label but steps mention "image"), prefer the refined noun.`,
     `- If the user provides a variableHint below, treat that as authoritative for which token is variable.`,
     `- Output ONE short question. No quotes, no markdown, no prefix, no trailing period.`,
-    `- Examples: "Open the example-community server" -> "Which server?"  |  "Show example-user's latest message" (steps mention images) -> "Show who's latest image?"`,
+    `- Examples: "Open the Example Community server" -> "Which server?"  |  "Show example-user's latest message" (steps mention images) -> "Show who's latest image?"`,
   ].join('\n');
   const numbered = (Array.isArray(stepLabelsInGroup) ? stepLabelsInGroup : [])
     .map((lbl, i) => `${i + 1}. ${lbl}`)
@@ -8364,7 +8357,7 @@ function extractJsonArray(text) {
 // inspectCdpElements / cdp_get_messages sanitize at the source, but trail
 // strings can be re-derived from rendered snapshots whose downstream rendering
 // occasionally smuggles raw 0x00–0x1F / 0x7F–0x9F bytes through. Garbled
-// queries like `Example User [TAG]` come from this leak — strip defensively.
+// queries like `Example User�[TAG]` come from this leak — strip defensively.
 function cleanCtrl(v) {
   if (typeof v !== 'string') return v;
   return v.replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -8430,20 +8423,20 @@ function buildCodexPrompt({ meta, backend, userMsg, finalReply, trail }) {
     : '`cdp_find`, `cdp_click`, `cdp_type`, `cdp_paste`, `cdp_press_key`, `cdp_get_text`, `cdp_get_tree`, `cdp_get_messages`, `cdp_react`, `cdp_scroll_to_message`, `cdp_scroll_messages`, `cdp_scroll`, `cdp_get_search_results`, `cdp_set_search_sort`, `cdp_jump_to_search_result`, `cdp_get_pins`, `cdp_jump_to_pin`, `cdp_jump_to_reply_source`, `cdp_open_image`, `cdp_open_notion_page`, `cdp_open_in_new_tab`, `notion_tasklist_read`, `notion_task_toggle`';
   const refRule = backend === 'uia'
     ? 'Refs (u1, u47, ...) expire between UIA snapshots. Insert a `uia_get_tree` step before each `uia_invoke` / `uia_set_value` that needs a fresh ref, and reference the element by `automationId` or `name` in the args.'
-    : 'Refs (e12, f3, ...) expire between snapshots. Replace ref-based clicks with a `cdp_find` step that captures the lookup, then reference `$<capture-name>.fN` in later steps. Prefer `cdp_find` over `cdp_get_tree` for targeted lookups.\n- NOTION-AWARE PRIMITIVES (use in preference to cdp_find/cdp_click + tree-walking for Notion):\n  * `cdp_open_notion_page({"pageId":"<32 hex>"})` — direct nav to any Notion page by stable page id; works even when sidebar collapsed. SINGLE-STEP recipes for "go to page X" are valid and expected — emit just this one step. ALSO use this for ANY recipe that must open TEST TASKLIST or TEST CALENDAR before doing further work — NEVER cdp_find the sidebar entry and cdp_click it; that pattern hits child spans/icons, fails to navigate, and breaks downstream cdp_find lookups for elements that only mount once the target page renders. Page ids are stable workspace constants, OK to bake literally.\n  * `notion_tasklist_read({})` — read current page\'s task rows as { rowId, content, checked, displayIndex }. Prefer over cdp_get_tree when the goal needs row identity. CAPTURE its output under a name (e.g. `"capture":"tasks"`) so later steps can reference `$tasks.<filter>.rowId` at run time — NEVER bake row ids from the trail.\n  * `notion_task_toggle({"rowId":"<32 hex>", "checked":<bool>?})` — flip a specific row\'s checkbox by stable row id. Reference the row id via `$<capture>.first.rowId` etc. — row ids are TRANSIENT per workspace state; never literal.';
+    : 'Refs (e12, f3, ...) expire between snapshots. Replace ref-based clicks with a `cdp_find` step that captures the lookup, then reference `$<capture-name>.fN` in later steps. Prefer `cdp_find` over `cdp_get_tree` for targeted lookups.\n- NOTION-AWARE PRIMITIVES (use in preference to cdp_find/cdp_click + tree-walking for Notion):\n  * `cdp_open_notion_page({"pageId":"<32 hex>"})` — direct navigation to a Notion page when the user supplied its stable page id; works even when the sidebar is collapsed. Never bake a page id observed in a prior trail into a reusable recipe.\n  * `notion_tasklist_read({})` — read current page\'s task rows as { rowId, content, checked, displayIndex }. Prefer over cdp_get_tree when the goal needs row identity. CAPTURE its output under a name (e.g. `"capture":"tasks"`) so later steps can reference `$tasks.<filter>.rowId` at run time — NEVER bake row ids from the trail.\n  * `notion_task_toggle({"rowId":"<32 hex>", "checked":<bool>?})` — flip a specific row\'s checkbox by stable row id. Reference the row id via `$<capture>.first.rowId` etc. — row ids are TRANSIENT per workspace state; never literal.';
   const example = backend === 'uia' ? '' : `
-EXAMPLE — user asked "go to example-community then #example-channel". Successful trail had cdp_get_tree → cdp_find("example-community ...") result_summary.matches { f1: svg(Unread, example-community ...), f2: svg(Unread, example-community ...), f3: div(treeitem, example-community ...) } → cdp_click(f3, targetElement.role=treeitem) → cdp_find("example-channel") result_summary.matches { f1: ul(channel list wrapper), f2: a(link, "Text (Active Threads)example-channel") } → cdp_click(f2, targetElement.tag=A, role=link) → cdp_get_messages.
+EXAMPLE — user asked "go to Example Community then #screenshots". Successful trail had cdp_get_tree → cdp_find("Example Community ...") result_summary.matches { f1: svg(Unread, Example Community ...), f2: svg(Unread, Example Community ...), f3: div(treeitem, Example Community ...) } → cdp_click(f3, targetElement.role=treeitem) → cdp_find("screenshots") result_summary.matches { f1: ul(channel list wrapper), f2: a(link, "Text (Active Threads)screenshots") } → cdp_click(f2, targetElement.tag=A, role=link) → cdp_get_messages.
 HOW TO PICK \`.fN\` (load-bearing — wrong fN clicks the wrong row at replay):
 - The index N in \`$capture.fN\` must point at the SAME row the original click landed on. fN is RELATIVE to whatever query you actually emit, so it depends on the query.
-- PREFERRED PATH: emit the trail's cdp_find query VERBATIM (don't re-word it), then write the trail's click ref index verbatim. In the example below, the server click landed on row 3 of the broad "example-community ..." query → write \`$server.f3\`; the channel click landed on row 2 of the broad "example-channel" query (row 1 was the channel-list wrapper UL) → write \`$channel.f2\`. This path is robust because the live cdp_find returns the same row set as the trail's, so the trail's row index is the correct row index. Pick this path whenever the trail's query is unambiguous (no other server/channel in the workspace shares the same name).
+- PREFERRED PATH: emit the trail's cdp_find query VERBATIM (don't re-word it), then write the trail's click ref index verbatim. In the example below, the server click landed on row 3 of the broad "Example Community ..." query → write \`$server.f3\`; the channel click landed on row 2 of the broad "screenshots" query (row 1 was the channel-list wrapper UL) → write \`$channel.f2\`. This path is robust because the live cdp_find returns the same row set as the trail's, so the trail's row index is the correct row index. Pick this path whenever the trail's query is unambiguous (no other server/channel in the workspace shares the same name).
 - ALTERNATE PATH (only when the trail's broad query would match a sibling at replay): emit a MORE SPECIFIC query. A more specific query collapses the match set to a single row (the navigable element only — the wrapper UL and unread-indicator SVGs drop out). In that case write \`.f1\` — it is the ONLY valid index. Do NOT write \`.f2\` or higher for a specialized query; there is no f2 to click and the step will error with "ref f2 not in capture".
 - ANTI-PATTERN: writing \`.f1\` while EMITTING THE TRAIL'S BROAD QUERY. The broad query usually returns the wrapper / unread-SVG as f1, and the navigable element at f2/f3 — clicking f1 lands on the wrapper and the channel/server never opens. Either keep the broad query AND use the trail's click ref, or specialize the query AND use .f1; never mix "broad query + .f1".
 Correct distilled recipe (this one mirrors the trail verbatim, so each \`fN\` mirrors the trail's click index):
 [
-  {"tool":"cdp_find","args":{"query":"example-community - Screenshot Community"},"capture":"server","description":"Find the example-community server in the sidebar"},
-  {"tool":"cdp_click","args":{"ref":"$server.f3"},"description":"Open the example-community server"},
-  {"tool":"cdp_find","args":{"query":"example-channel"},"capture":"channel","description":"Find the #example-channel channel"},
-  {"tool":"cdp_click","args":{"ref":"$channel.f2"},"description":"Open the #example-channel channel"},
+  {"tool":"cdp_find","args":{"query":"Example Community"},"capture":"server","description":"Find the Example Community server in the sidebar"},
+  {"tool":"cdp_click","args":{"ref":"$server.f3"},"description":"Open the Example Community server"},
+  {"tool":"cdp_find","args":{"query":"screenshots"},"capture":"channel","description":"Find the #screenshots channel"},
+  {"tool":"cdp_click","args":{"ref":"$channel.f2"},"description":"Open the #screenshots channel"},
   {"tool":"cdp_get_messages","args":{"limit":25},"description":"Read the 25 most recent messages"}
 ]
 `;
@@ -8468,7 +8461,7 @@ OUTPUT REQUIREMENTS
 
 PLAIN-ENGLISH DESCRIPTION (required on EVERY step — a non-programmer reads this)
 - Every step MUST include a "description": one short sentence, in plain English, describing what the step does in terms of the app and the user's goal.
-- Write it for someone who does not code. Say what happens on screen — "Open the example-community server", "Type \\"sunset\\" into the search box", "Press Enter to run the search", "Read the 25 most recent messages".
+- Write it for someone who does not code. Say what happens on screen — "Open the Example Community server", "Type \\"sunset\\" into the search box", "Press Enter to run the search", "Read the 25 most recent messages".
 - NEVER put tool names (cdp_find, cdp_click, …), refs (e12, f3, $server.f1), selectors, or JSON in the description. Those belong only in "tool"/"args".
 - Keep it to ~10 words where possible. Start with a verb.
 
@@ -8479,7 +8472,7 @@ CHOOSING cdp_find QUERIES (load-bearing — most recipe failures come from gener
   2. Exact non-empty \`text\` (full string, trimmed; preserve case).
   3. \`role\` + \`name\` combo when text/aria are empty.
   4. Tag + the most distinguishing visible word in text/aria as a fallback.
-- DO NOT use the user's natural-language wording ("example-community", "example-channel") as the query if a more specific attribute exists ("example-community - Screenshot Community", "example-channel (text channel)"). Generic substrings match many siblings and the wrong \`.fN\` gets clicked.
+- DO NOT use the user's natural-language wording ("Example Community", "screenshots") as the query if a more specific attribute exists ("Example Community", "screenshots (text channel)"). Generic substrings match many siblings and the wrong \`.fN\` gets clicked.
 - After a \`cdp_find\` returns multiple matches, look at the corresponding step's \`result_summary.matches\` table to choose the \`.fN\` whose label matches \`targetElement\`. If the original click landed on the second row, use \`.f2\`, not \`.f1\`.
 
 ${MESSAGE_REF_RULES}
@@ -8631,7 +8624,7 @@ function summariseResult(r) {
     // the right one when emitting a cdp_click step.
     // Defensive: strip control chars before slicing. The snapshot table is
     // rebuilt from element data that *should* already be clean, but garbled
-    // queries in saved recipes (`Example User [TAG]`) prove a leak exists
+    // queries in saved recipes (`Example User�[TAG]`) prove a leak exists
     // somewhere downstream. Sanitize at the sink so the Codex prompt is safe.
     const snap = String(r.snapshot || '').replace(/[\x00-\x1F\x7F-\x9F]+/g, ' ');
     return {
@@ -9531,8 +9524,8 @@ const RESUME_RULES_BLOCK = [
 
 // Always-present (every group, first and resumed). The automation title / group
 // label / prior-step summaries are human descriptions and routinely name a
-// channel or user that is NOT where the run actually is — see the example-community
-// "#example-channel vs #example-channel-b" incident in SPEC.md. Treat them as
+// channel or user that is NOT where the run actually is — see the Example Community
+// "#screenshots vs #drafts" incident in SPEC.md. Treat them as
 // labels, never as navigation/filter source-of-truth.
 const GROUND_TRUTH_BLOCK =
   'The `[Automation title: …]` label, the `[Group: …]` label, and the prior-step summaries are human descriptions and may be STALE or generic. Do NOT extract server, channel, or user names from them to drive navigation or to build a search filter (e.g. a Discord `in:<channel>` or `from:<user>` filter). Ground truth = the dynamic group inputs + the Active channel above + the live snapshot.';

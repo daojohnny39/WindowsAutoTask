@@ -1,4 +1,4 @@
-// Persisted history for the direct GPT-5.5 chat (no app context).
+// Optional persisted history for the direct GPT-5.5 chat (no app context).
 //
 // Single global thread stored at logs/direct-gpt.json. Schema:
 //   { messages: [{ role:'user'|'assistant', content:string, ts:number }], updated:number }
@@ -16,14 +16,24 @@ const REPO_ROOT = path.join(__dirname, '..');
 const STORE_DIR = path.join(REPO_ROOT, 'logs');
 const STORE_PATH = path.join(STORE_DIR, 'direct-gpt.json');
 
-function ensureDir() {
-  try { fs.mkdirSync(STORE_DIR, { recursive: true }); } catch {}
+function emptyState() {
+  return { messages: [], updated: 0 };
 }
 
-function readStore(debugLog) {
+function storePath(options) {
+  return options && typeof options.storePath === 'string' ? options.storePath : STORE_PATH;
+}
+
+function ensureDir(file) {
+  try { fs.mkdirSync(path.dirname(file), { recursive: true }); } catch {}
+}
+
+function readStore(debugLog, options) {
+  if (!options || options.enabled !== true) return emptyState();
+  const file = storePath(options);
   try {
-    if (!fs.existsSync(STORE_PATH)) return { messages: [], updated: 0 };
-    const raw = fs.readFileSync(STORE_PATH, 'utf8');
+    if (!fs.existsSync(file)) return emptyState();
+    const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw);
     const messages = Array.isArray(parsed && parsed.messages) ? parsed.messages : [];
     const clean = messages
@@ -32,16 +42,18 @@ function readStore(debugLog) {
     return { messages: clean, updated: Number(parsed && parsed.updated) || 0 };
   } catch (err) {
     try { if (typeof debugLog === 'function') debugLog(`[direct-chat-store] read failed: ${err.message} — starting empty`); } catch {}
-    return { messages: [], updated: 0 };
+    return emptyState();
   }
 }
 
-function writeStoreAtomic(state, debugLog) {
+function writeStoreAtomic(state, debugLog, options) {
+  if (!options || options.enabled !== true) return false;
+  const file = storePath(options);
   try {
-    ensureDir();
-    const tmp = STORE_PATH + '.' + process.pid + '.tmp';
+    ensureDir(file);
+    const tmp = file + '.' + process.pid + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
-    fs.renameSync(tmp, STORE_PATH);
+    fs.renameSync(tmp, file);
     return true;
   } catch (err) {
     try { if (typeof debugLog === 'function') debugLog(`[direct-chat-store] write failed: ${err.message}`); } catch {}
@@ -49,12 +61,13 @@ function writeStoreAtomic(state, debugLog) {
   }
 }
 
-function load(debugLog) {
-  return readStore(debugLog);
+function load(debugLog, options) {
+  return readStore(debugLog, options);
 }
 
-function appendTurn({ userContent, assistantContent }, debugLog) {
-  const state = readStore(debugLog);
+function appendTurn({ userContent, assistantContent }, debugLog, options) {
+  if (!options || options.enabled !== true) return emptyState();
+  const state = readStore(debugLog, options);
   const now = Date.now();
   if (typeof userContent === 'string' && userContent.length) {
     state.messages.push({ role: 'user', content: userContent, ts: now });
@@ -63,18 +76,18 @@ function appendTurn({ userContent, assistantContent }, debugLog) {
     state.messages.push({ role: 'assistant', content: assistantContent, ts: now });
   }
   state.updated = now;
-  writeStoreAtomic(state, debugLog);
+  writeStoreAtomic(state, debugLog, options);
   return state;
 }
 
-function reset(debugLog) {
+function reset(debugLog, options) {
+  const file = storePath(options);
   try {
-    ensureDir();
-    if (fs.existsSync(STORE_PATH)) fs.unlinkSync(STORE_PATH);
+    if (fs.existsSync(file)) fs.unlinkSync(file);
   } catch (err) {
     try { if (typeof debugLog === 'function') debugLog(`[direct-chat-store] reset failed: ${err.message}`); } catch {}
   }
-  return { messages: [], updated: 0 };
+  return emptyState();
 }
 
 module.exports = { load, appendTurn, reset, STORE_PATH };

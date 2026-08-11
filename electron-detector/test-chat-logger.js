@@ -16,6 +16,11 @@ try {
   let c = L.loadConfig();
   ok(c.logging.enabled === true, 'enabled:true honored');
   ok(c.logging.dir === 'logs', 'dir read');
+  ok(c.directChat.persistHistory === false, 'direct chat persistence defaults off');
+
+  fs.writeFileSync(L.CONFIG_PATH, JSON.stringify({ directChat: { persistHistory: true } }), 'utf8');
+  c = L.loadConfig();
+  ok(c.directChat.persistHistory === true, 'direct chat persistence requires explicit opt-in');
 
   fs.writeFileSync(L.CONFIG_PATH, JSON.stringify({ logging: { enabled: false } }), 'utf8');
   c = L.loadConfig();
@@ -28,12 +33,12 @@ try {
 
   fs.writeFileSync(L.CONFIG_PATH, 'not json{', 'utf8');
   c = L.loadConfig();
-  ok(c.logging.enabled === true, 'malformed config falls back to default (rewritten)');
-  ok(JSON.parse(fs.readFileSync(L.CONFIG_PATH, 'utf8')).logging.enabled === true, 'default config rewritten on parse fail');
+  ok(c.logging.enabled === false, 'malformed config falls back to disabled default (rewritten)');
+  ok(JSON.parse(fs.readFileSync(L.CONFIG_PATH, 'utf8')).logging.enabled === false, 'disabled default rewritten on parse fail');
 
   fs.rmSync(L.CONFIG_PATH);
   c = L.loadConfig();
-  ok(c.logging.enabled === true && fs.existsSync(L.CONFIG_PATH), 'missing config recreated with default');
+  ok(c.logging.enabled === false && fs.existsSync(L.CONFIG_PATH), 'missing config recreated with disabled default');
 
   // ── chatLogsDir ──
   ok(L.chatLogsDir({ logging: { dir: tmp } }) === tmp, 'absolute dir passes through');
@@ -133,6 +138,7 @@ try {
 
 } finally {
   if (cfgOrig !== null) fs.writeFileSync(L.CONFIG_PATH, cfgOrig, 'utf8');
+  else fs.rmSync(L.CONFIG_PATH, { force: true });
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
 }
 
