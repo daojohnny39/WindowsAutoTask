@@ -28,12 +28,12 @@ try {
 
   fs.writeFileSync(L.CONFIG_PATH, 'not json{', 'utf8');
   c = L.loadConfig();
-  ok(c.logging.enabled === true, 'malformed config falls back to default (rewritten)');
-  ok(JSON.parse(fs.readFileSync(L.CONFIG_PATH, 'utf8')).logging.enabled === true, 'default config rewritten on parse fail');
+  ok(c.logging.enabled === false, 'malformed config falls back to logging off');
+  ok(JSON.parse(fs.readFileSync(L.CONFIG_PATH, 'utf8')).logging.enabled === false, 'rewritten default keeps logging off');
 
   fs.rmSync(L.CONFIG_PATH);
   c = L.loadConfig();
-  ok(c.logging.enabled === true && fs.existsSync(L.CONFIG_PATH), 'missing config recreated with default');
+  ok(c.logging.enabled === false && fs.existsSync(L.CONFIG_PATH), 'missing config recreated with logging off');
 
   // ── chatLogsDir ──
   ok(L.chatLogsDir({ logging: { dir: tmp } }) === tmp, 'absolute dir passes through');
@@ -133,6 +133,7 @@ try {
 
 } finally {
   if (cfgOrig !== null) fs.writeFileSync(L.CONFIG_PATH, cfgOrig, 'utf8');
+  else fs.rmSync(L.CONFIG_PATH, { force: true });
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
 }
 

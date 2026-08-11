@@ -12,7 +12,7 @@ const path = require('path');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const CONFIG_PATH = path.join(REPO_ROOT, 'config.json');
-const DEFAULT_CONFIG = { logging: { enabled: true, dir: 'logs' } };
+const DEFAULT_CONFIG = { logging: { enabled: false, dir: 'logs' } };
 
 function noop() {}
 

@@ -1,0 +1,6 @@
+{
+  "logging": {
+    "enabled": false,
+    "dir": "logs"
+  }
+}

@@ -2267,7 +2267,7 @@ function truncateText(s, n = 40) {
 }
 
 // What did a $capture.fN ref point at? Resolve back to the capturing step's
-// query so a "Click it" reads as "Click 'example-community - Screenshot Community'".
+// query so a "Click it" reads as "Click 'Example Community'".
 function refTargetLabel(ref, steps) {
   const m = /^\$([A-Za-z0-9_]+)\.[efu]\d+$/.exec(String(ref || ''));
   if (m) {

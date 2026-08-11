@@ -1,0 +1,64 @@
+# Dependencies and packaged output
+node_modules/
+dist/
+out/
+build/
+release/
+*.asar
+
+# Local agent, environment, and editor state
+.claude/
+.agents/
+CLAUDE.md
+/skills-lock.json
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.code-workspace
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Machine-local configuration and runtime state
+/config.json
+/cdp-state.json
+/cdp-shortcut-backup.json
+/.overlay-pos.json
+/cdp-watch-launch.vbs
+/app-agents/
+/automations/
+/loop/
+/logs/
+direct-gpt.json
+direct-chat*.json
+**/direct-gpt.json
+**/direct-chat*.json
+/debug/
+/snapshots/
+/screenshots/
+/captures/
+/tmp/
+/temp/
+/.shim/
+
+# Runtime output and generated snapshots
+*.log
+*.snapshot.md
+*.trace
+*.pid
+debug*.json
+debug*.txt
+
+# Backups
+*.bak
+*.orig
+*.rej
+*~
+*.HEAD-bak
+*-bak
